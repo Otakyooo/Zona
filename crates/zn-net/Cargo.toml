@@ -1,0 +1,12 @@
+[package]
+name = "zn-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA wire protocol: shared client/server message types and codecs (M3 transport lands here)"
+
+[dependencies]
+bincode = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "zn-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA launcher: channel selection, manifest-driven updates and game bootstrap (M6)"
+
+[[bin]]
+name = "zn-launcher"
+path = "src/main.rs"
+
+[dependencies]
+log = { workspace = true }

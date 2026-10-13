@@ -1,0 +1,13 @@
+[package]
+name = "zn-content"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA content: RON data schemas for the Zone (anomalies, artifacts, items, quests)"
+
+[dependencies]
+log = { workspace = true }
+ron = { workspace = true }
+serde = { workspace = true }

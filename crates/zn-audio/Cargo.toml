@@ -1,0 +1,12 @@
+[package]
+name = "zn-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA audio: kira-backed 3D spatial mixer (headless-safe)"
+
+[dependencies]
+kira = { workspace = true }
+log = { workspace = true }

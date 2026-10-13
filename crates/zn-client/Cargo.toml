@@ -1,0 +1,25 @@
+[package]
+name = "zn-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA game client: winit application shell driving render, input, physics and the simulation"
+
+[[bin]]
+name = "zn-client"
+path = "src/main.rs"
+
+[dependencies]
+env_logger = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+rapier3d = { workspace = true }
+winit = { workspace = true }
+zn-core = { path = "../zn-core" }
+zn-input = { path = "../zn-input" }
+zn-physics = { path = "../zn-physics" }
+zn-render = { path = "../zn-render" }
+zn-scene = { path = "../zn-scene" }
+zn-sim = { path = "../../game/zn-sim" }

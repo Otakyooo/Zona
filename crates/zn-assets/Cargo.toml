@@ -1,0 +1,8 @@
+[package]
+name = "zn-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA asset pipeline: source format detection and import reports (glTF/ktx2 importers land in M2)"

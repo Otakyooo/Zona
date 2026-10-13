@@ -1,0 +1,12 @@
+[package]
+name = "zn-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA core: ECS layer over hecs, system scheduler, fixed timestep and events"
+
+[dependencies]
+hecs = { workspace = true }
+log = { workspace = true }

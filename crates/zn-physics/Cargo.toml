@@ -1,0 +1,12 @@
+[package]
+name = "zn-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA physics: rapier3d world wrappers and kinematic character controller"
+
+[dependencies]
+log = { workspace = true }
+rapier3d = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "zn-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA scene description: RON-serializable scene objects for the engine and tools"
+
+[dependencies]
+glam = { workspace = true, features = ["serde"] }
+ron = { workspace = true }
+serde = { workspace = true }

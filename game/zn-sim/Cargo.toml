@@ -1,0 +1,14 @@
+[package]
+name = "zn-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZONA shared simulation: authoritative game state used by both client and server"
+
+[dependencies]
+glam = { workspace = true }
+log = { workspace = true }
+zn-core = { path = "../../crates/zn-core" }
+zn-net = { path = "../../crates/zn-net" }
