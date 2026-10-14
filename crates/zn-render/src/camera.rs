@@ -1,4 +1,4 @@
-use glam::camera::rh::proj::vulkan::perspective;
+use glam::camera::rh::proj::directx::perspective;
 use glam::camera::rh::view::look_at_mat4;
 use glam::{Mat4, Quat, Vec3};
 
@@ -18,7 +18,15 @@ impl Camera {
     const MAX_PITCH: f32 = 89.0f32.to_radians();
 
     pub fn new(position: Vec3, yaw: f32, aspect: f32) -> Self {
-        Self { position, yaw, pitch: 0.0, fov_y: Self::DEFAULT_FOV_Y, near: 0.1, far: 500.0, aspect }
+        Self {
+            position,
+            yaw,
+            pitch: 0.0,
+            fov_y: Self::DEFAULT_FOV_Y,
+            near: 0.1,
+            far: 500.0,
+            aspect,
+        }
     }
 
     pub fn forward(&self) -> Vec3 {

@@ -1,9 +1,10 @@
 #[cfg(test)]
 mod tests {
-use zn_core::ecs::World;
-use zn_core::events::{event_count, send_event, take_events};
-use zn_core::schedule::Schedule;
-use zn_core::time::{duration_from_hz, FixedStep, SIMULATION_HZ, SIMULATION_STEP};
+    use std::time::Duration;
+    use zn_core::ecs::World;
+    use zn_core::events::{event_count, send_event, take_events};
+    use zn_core::schedule::Schedule;
+    use zn_core::time::{duration_from_hz, FixedStep, SIMULATION_HZ, SIMULATION_STEP};
 
     #[derive(Default, Debug, PartialEq)]
     struct Counter(u32);
@@ -54,7 +55,10 @@ use zn_core::time::{duration_from_hz, FixedStep, SIMULATION_HZ, SIMULATION_STEP}
             world.get_mut::<Counter>(entity).unwrap().0 *= 2;
         });
         assert_eq!(schedule.len(), 2);
-        assert_eq!(schedule.system_names().collect::<Vec<_>>(), vec!["increment", "double"]);
+        assert_eq!(
+            schedule.system_names().collect::<Vec<_>>(),
+            vec!["increment", "double"]
+        );
 
         schedule.run(&mut world);
         assert_eq!(world.get::<Counter>(entity).as_deref(), Some(&Counter(2)));
@@ -64,12 +68,17 @@ use zn_core::time::{duration_from_hz, FixedStep, SIMULATION_HZ, SIMULATION_STEP}
     fn fixed_step_accumulates_and_clamps() {
         let mut fixed = FixedStep::new(SIMULATION_STEP);
         assert_eq!(fixed.accumulate(SIMULATION_STEP), 1);
-        assert_eq!(fixed.accumulate(SIMULATION_STEP / 2), 0);
-        assert_eq!(fixed.accumulate(SIMULATION_STEP / 2), 1);
+        assert_eq!(fixed.accumulator(), Duration::ZERO);
+
+        let half = SIMULATION_STEP / 2;
+        assert_eq!(fixed.accumulate(half), 0);
+        assert_eq!(fixed.accumulate(half), 0);
+        assert_eq!(fixed.accumulate(Duration::from_nanos(1)), 1);
 
         fixed.set_max_steps_per_frame(3);
         let steps = fixed.accumulate(SIMULATION_STEP * 10);
         assert_eq!(steps, 3);
+        assert_eq!(fixed.accumulator(), Duration::ZERO);
     }
 
     #[test]

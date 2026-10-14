@@ -16,7 +16,11 @@ struct ServerArgs {
 
 impl Default for ServerArgs {
     fn default() -> Self {
-        Self { port: 7700, max_players: MAX_PLAYERS_PER_SESSION, tick_hz: 60 }
+        Self {
+            port: 7700,
+            max_players: MAX_PLAYERS_PER_SESSION,
+            tick_hz: 60,
+        }
     }
 }
 
@@ -24,13 +28,25 @@ fn parse_args() -> Result<ServerArgs, String> {
     let mut args = ServerArgs::default();
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
-        let value = iter.next().ok_or_else(|| format!("missing value for {flag}"))?;
+        let value = iter
+            .next()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
-            "--port" => args.port = value.parse().map_err(|_| format!("invalid port: {value}"))?,
-            "--max-players" => {
-                args.max_players = value.parse().map_err(|_| format!("invalid max players: {value}"))?
+            "--port" => {
+                args.port = value
+                    .parse()
+                    .map_err(|_| format!("invalid port: {value}"))?
             }
-            "--tick-hz" => args.tick_hz = value.parse().map_err(|_| format!("invalid tick hz: {value}"))?,
+            "--max-players" => {
+                args.max_players = value
+                    .parse()
+                    .map_err(|_| format!("invalid max players: {value}"))?
+            }
+            "--tick-hz" => {
+                args.tick_hz = value
+                    .parse()
+                    .map_err(|_| format!("invalid tick hz: {value}"))?
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }

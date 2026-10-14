@@ -12,6 +12,15 @@ name = "zn-editor"
 path = "src/main.rs"
 
 [dependencies]
+bytemuck = { workspace = true }
 env_logger = { workspace = true }
+egui = { workspace = true }
+egui-winit = "0.36"
+glam = { workspace = true }
 log = { workspace = true }
+ron = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }
+zn-assets = { path = "../../zn-assets" }
+zn-render = { path = "../../zn-render" }
 zn-scene = { path = "../../zn-scene" }

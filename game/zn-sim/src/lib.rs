@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use glam::Vec3;
 use zn_core::{FixedStep, Schedule, World, SIMULATION_HZ, SIMULATION_STEP};
-pub use zn_net::{ClientInput, FLAG_GROUNDED, FLAG_SPRINTING, PlayerSnapshot};
+pub use zn_net::{ClientInput, PlayerSnapshot, FLAG_GROUNDED, FLAG_SPRINTING};
 
 pub const WALK_SPEED: f32 = 5.5;
 pub const SPRINT_SPEED: f32 = 8.5;
@@ -24,7 +24,15 @@ pub struct PlayerState {
 
 impl PlayerState {
     pub fn new(id: u64, spawn: Vec3) -> Self {
-        Self { id, position: spawn, velocity: Vec3::ZERO, yaw: 0.0, pitch: 0.0, grounded: false, sprinting: false }
+        Self {
+            id,
+            position: spawn,
+            velocity: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            grounded: true,
+            sprinting: false,
+        }
     }
 
     pub fn snapshot(&self, entity_id: u32) -> PlayerSnapshot {
@@ -174,7 +182,10 @@ fn build_schedule() -> Schedule {
 }
 
 fn apply_input(world: &mut World) {
-    let dt = world.get_resource::<TickInfo>().map(|info| info.dt).unwrap_or(1.0 / 60.0);
+    let dt = world
+        .get_resource::<TickInfo>()
+        .map(|info| info.dt)
+        .unwrap_or(1.0 / 60.0);
     let inputs = world
         .get_resource::<InputBuffer>()
         .map(|buffer| buffer.commands.clone())
@@ -182,7 +193,9 @@ fn apply_input(world: &mut World) {
 
     let mut query = world.query::<&mut PlayerState>();
     for state in query.iter() {
-        let Some(command) = inputs.get(&state.id) else { continue };
+        let Some(command) = inputs.get(&state.id) else {
+            continue;
+        };
         state.yaw = (state.yaw + command.yaw_delta).rem_euclid(std::f32::consts::TAU);
         state.pitch = (state.pitch + command.pitch_delta).clamp(-MAX_PITCH, MAX_PITCH);
 
@@ -190,7 +203,11 @@ fn apply_input(world: &mut World) {
         let forward = Vec3::new(cos_yaw, 0.0, sin_yaw);
         let right = Vec3::new(sin_yaw, 0.0, -cos_yaw);
         let move_dir = forward * command.move_forward + right * command.move_right;
-        let speed = if command.buttons & FLAG_SPRINTING != 0 { SPRINT_SPEED } else { WALK_SPEED };
+        let speed = if command.buttons & FLAG_SPRINTING != 0 {
+            SPRINT_SPEED
+        } else {
+            WALK_SPEED
+        };
         state.sprinting = command.buttons & FLAG_SPRINTING != 0 && move_dir.length_squared() > 1e-6;
 
         state.velocity.x = move_dir.x * speed;
@@ -207,7 +224,10 @@ fn apply_input(world: &mut World) {
 }
 
 fn integrate(world: &mut World) {
-    let dt = world.get_resource::<TickInfo>().map(|info| info.dt).unwrap_or(1.0 / 60.0);
+    let dt = world
+        .get_resource::<TickInfo>()
+        .map(|info| info.dt)
+        .unwrap_or(1.0 / 60.0);
     let mut query = world.query::<&mut PlayerState>();
     for state in query.iter() {
         state.position += state.velocity * dt;

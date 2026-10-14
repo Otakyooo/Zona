@@ -26,7 +26,7 @@ repository = "https://github.com/zona-project/zona"
 description = "ZONA — own game engine, launcher and an extraction FPS in a Strugatsky-style setting"
 
 [workspace.dependencies]
-bytemuck = "1"
+bytemuck = { version = "1", features = ["derive"] }
 egui = "0.36"
 env_logger = "0.11"
 glam = "0.34"
@@ -34,6 +34,7 @@ gltf = "1.4"
 hecs = "0.11"
 image = "0.25"
 kira = "0.11"
+ktx2 = "0.5"
 log = "0.4"
 mlua = "0.12"
 pollster = "1"

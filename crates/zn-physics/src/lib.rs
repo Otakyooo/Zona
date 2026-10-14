@@ -1,11 +1,13 @@
 use rapier3d::control::{EffectiveCharacterMovement, KinematicCharacterController};
 use rapier3d::pipeline::{PhysicsPipeline, QueryFilter};
 use rapier3d::prelude::*;
+use zn_scene::{ColliderShape, SceneObject};
 
 pub const PLAYER_RADIUS: f32 = 0.3;
 pub const PLAYER_HALF_HEIGHT: f32 = 0.6;
 pub const PLAYER_TOTAL_HEIGHT: f32 = 2.0 * (PLAYER_HALF_HEIGHT + PLAYER_RADIUS);
 pub const PLAYER_EYE_HEIGHT: f32 = 1.62;
+pub const DEFAULT_FRICTION: f32 = 0.8;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CharacterMove {
@@ -44,14 +46,18 @@ pub struct PhysicsWorld {
 
 impl PhysicsWorld {
     pub fn new(gravity: Vector, fixed_dt: f32) -> Self {
-        let mut integration_parameters = IntegrationParameters::default();
-        integration_parameters.dt = fixed_dt;
+        let integration_parameters = IntegrationParameters {
+            dt: fixed_dt,
+            ..Default::default()
+        };
 
-        let mut controller = KinematicCharacterController::default();
-        controller.slide = true;
-        controller.max_slope_climb_angle = (45.0f32).to_radians();
-        controller.min_slope_slide_angle = (30.0f32).to_radians();
-        controller.normal_nudge_factor = 0.002;
+        let controller = KinematicCharacterController {
+            slide: true,
+            max_slope_climb_angle: (45.0f32).to_radians(),
+            min_slope_slide_angle: (30.0f32).to_radians(),
+            normal_nudge_factor: 0.002,
+            ..KinematicCharacterController::default()
+        };
 
         let character_shape = ColliderBuilder::capsule_y(PLAYER_HALF_HEIGHT, PLAYER_RADIUS).build();
 
@@ -79,7 +85,7 @@ impl PhysicsWorld {
     }
 
     pub fn add_static_box(&mut self, half_extents: Vector, position: Vector) -> ColliderHandle {
-        self.add_static_box_with_friction(half_extents, position, 0.8)
+        self.add_static_box_with_friction(half_extents, position, DEFAULT_FRICTION)
     }
 
     pub fn add_static_box_with_friction(
@@ -95,6 +101,40 @@ impl PhysicsWorld {
         let handle = self.colliders.insert(collider);
         self.static_colliders += 1;
         handle
+    }
+
+    /// Статический прокси-коллайдер формы `shape`: размеры берутся из полного
+    /// `scale` объекта сцены (не half-extents).
+    pub fn add_static_shape(
+        &mut self,
+        shape: ColliderShape,
+        position: Vector,
+        scale: Vector,
+        friction: f32,
+    ) -> ColliderHandle {
+        let builder = match shape {
+            ColliderShape::Box => {
+                ColliderBuilder::cuboid(scale.x / 2.0, scale.y / 2.0, scale.z / 2.0)
+            }
+            // Цилиндр выровнен по Y; радиус — консервативно по наибольшей стороне.
+            ColliderShape::Cylinder => {
+                ColliderBuilder::cylinder(scale.y / 2.0, scale.x.max(scale.z) / 2.0)
+            }
+            // Сфера вписывается по наибольшему радиусу.
+            ColliderShape::Sphere => ColliderBuilder::ball(scale.x.max(scale.y).max(scale.z) / 2.0),
+        };
+        let collider = builder.translation(position).friction(friction).build();
+        let handle = self.colliders.insert(collider);
+        self.static_colliders += 1;
+        handle
+    }
+
+    /// Добавляет коллайдер по объекту сцены (эффективная форма); `None` — не solid.
+    pub fn add_scene_object(&mut self, object: &SceneObject) -> Option<ColliderHandle> {
+        let shape = object.effective_collider()?;
+        let position = Vector::new(object.position.x, object.position.y, object.position.z);
+        let scale = Vector::new(object.scale.x, object.scale.y, object.scale.z);
+        Some(self.add_static_shape(shape, position, scale, DEFAULT_FRICTION))
     }
 
     pub fn static_collider_count(&self) -> usize {
@@ -162,7 +202,9 @@ impl PhysicsWorld {
 
     pub fn cast_ray_down(&self, origin: Vector, max_distance: f32) -> bool {
         let ray = Ray::new(origin, Vector::new(0.0, -1.0, 0.0));
-        self.query_pipeline().cast_ray(&ray, max_distance, true).is_some()
+        self.query_pipeline()
+            .cast_ray(&ray, max_distance, true)
+            .is_some()
     }
 
     pub fn move_character(&mut self, origin: Vector, desired_translation: Vector) -> CharacterMove {
