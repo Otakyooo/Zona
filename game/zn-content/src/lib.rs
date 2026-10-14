@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const CONTENT_VERSION: u32 = 1;
 pub const CONTENT_FORMAT: &str = "ron";
 
-pub const SUPPORTED_SCHEMAS: &[&str] = &["scene", "anomaly", "artifact", "item", "quest", "creature"];
+pub const SUPPORTED_SCHEMAS: &[&str] =
+    &["scene", "anomaly", "artifact", "item", "quest", "creature"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Anomaly {

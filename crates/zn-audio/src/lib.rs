@@ -30,7 +30,9 @@ impl AudioEngine {
 
 impl std::fmt::Debug for AudioEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AudioEngine").field("enabled", &self.enabled()).finish()
+        f.debug_struct("AudioEngine")
+            .field("enabled", &self.enabled())
+            .finish()
     }
 }
 

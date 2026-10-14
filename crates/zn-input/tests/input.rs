@@ -1,6 +1,6 @@
-use zn_input::InputState;
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
+use zn_input::InputState;
 
 #[test]
 fn pressed_keys_track_until_released_and_end_frame() {

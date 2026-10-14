@@ -10,7 +10,10 @@ pub struct EventQueue<E> {
 
 impl<E> Default for EventQueue<E> {
     fn default() -> Self {
-        Self { current: VecDeque::new(), previous: VecDeque::new() }
+        Self {
+            current: VecDeque::new(),
+            previous: VecDeque::new(),
+        }
     }
 }
 
@@ -46,7 +49,9 @@ impl<E> EventQueue<E> {
 }
 
 pub fn send_event<E: 'static + Send + Sync>(world: &mut World, event: E) {
-    world.get_resource_or_insert_with(EventQueue::default).send(event);
+    world
+        .get_resource_or_insert_with(EventQueue::default)
+        .send(event);
 }
 
 pub fn take_events<E: 'static + Send + Sync>(world: &mut World) -> Vec<E> {

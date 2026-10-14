@@ -27,16 +27,25 @@ impl Resources {
     }
 
     pub fn get<R: 'static + Send + Sync>(&self) -> Option<&R> {
-        self.map.get(&TypeId::of::<R>()).and_then(|b| b.downcast_ref::<R>())
+        self.map
+            .get(&TypeId::of::<R>())
+            .and_then(|b| b.downcast_ref::<R>())
     }
 
     pub fn get_mut<R: 'static + Send + Sync>(&mut self) -> Option<&mut R> {
-        self.map.get_mut(&TypeId::of::<R>()).and_then(|b| b.downcast_mut::<R>())
+        self.map
+            .get_mut(&TypeId::of::<R>())
+            .and_then(|b| b.downcast_mut::<R>())
     }
 
-    pub fn get_or_insert_with<R: 'static + Send + Sync>(&mut self, f: impl FnOnce() -> R) -> &mut R {
+    pub fn get_or_insert_with<R: 'static + Send + Sync>(
+        &mut self,
+        f: impl FnOnce() -> R,
+    ) -> &mut R {
         let entry = self.entry::<R>().or_insert_with(|| Box::new(f()));
-        entry.downcast_mut::<R>().expect("resource type id mismatch")
+        entry
+            .downcast_mut::<R>()
+            .expect("resource type id mismatch")
     }
 
     pub fn contains<R: 'static + Send + Sync>(&self) -> bool {
@@ -44,7 +53,10 @@ impl Resources {
     }
 
     pub fn remove<R: 'static + Send + Sync>(&mut self) -> Option<R> {
-        self.map.remove(&TypeId::of::<R>()).and_then(|b| b.downcast::<R>().ok()).map(|b| *b)
+        self.map
+            .remove(&TypeId::of::<R>())
+            .and_then(|b| b.downcast::<R>().ok())
+            .map(|b| *b)
     }
 
     pub fn len(&self) -> usize {
@@ -55,7 +67,9 @@ impl Resources {
         self.map.is_empty()
     }
 
-    fn entry<R: 'static + Send + Sync>(&mut self) -> std::collections::hash_map::Entry<'_, TypeId, Box<dyn Any + Send + Sync>> {
+    fn entry<R: 'static + Send + Sync>(
+        &mut self,
+    ) -> std::collections::hash_map::Entry<'_, TypeId, Box<dyn Any + Send + Sync>> {
         self.map.entry(TypeId::of::<R>())
     }
 }
@@ -74,7 +88,11 @@ impl Default for World {
 
 impl World {
     pub fn new() -> Self {
-        Self { entities: hecs::World::new(), resources: Resources::new(), tick: 0 }
+        Self {
+            entities: hecs::World::new(),
+            resources: Resources::new(),
+            tick: 0,
+        }
     }
 
     pub fn spawn(&mut self, components: impl DynamicBundle) -> Entity {
@@ -91,12 +109,21 @@ impl World {
         self.tick = 0;
     }
 
-    pub fn insert_on<T: Component>(&mut self, entity: Entity, component: T) -> Result<(), NoSuchEntity> {
-        self.entities.insert_one(entity, component).map_err(|_| NoSuchEntity)
+    pub fn insert_on<T: Component>(
+        &mut self,
+        entity: Entity,
+        component: T,
+    ) -> Result<(), NoSuchEntity> {
+        self.entities
+            .insert_one(entity, component)
+            .map_err(|_| NoSuchEntity)
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> Option<T> {
-        self.entities.remove::<(T,)>(entity).ok().map(|(component,)| component)
+        self.entities
+            .remove::<(T,)>(entity)
+            .ok()
+            .map(|(component,)| component)
     }
 
     pub fn get<T: Component>(&self, entity: Entity) -> Option<hecs::Ref<'_, T>> {
@@ -135,7 +162,10 @@ impl World {
         self.resources.get_mut::<R>()
     }
 
-    pub fn get_resource_or_insert_with<R: 'static + Send + Sync>(&mut self, f: impl FnOnce() -> R) -> &mut R {
+    pub fn get_resource_or_insert_with<R: 'static + Send + Sync>(
+        &mut self,
+        f: impl FnOnce() -> R,
+    ) -> &mut R {
         self.resources.get_or_insert_with(f)
     }
 

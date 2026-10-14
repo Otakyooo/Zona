@@ -44,7 +44,11 @@ pub struct FixedStep {
 
 impl FixedStep {
     pub fn new(fixed_dt: Duration) -> Self {
-        Self { fixed_dt, accumulator: Duration::ZERO, max_steps_per_frame: 8 }
+        Self {
+            fixed_dt,
+            accumulator: Duration::ZERO,
+            max_steps_per_frame: 8,
+        }
     }
 
     pub fn from_hz(hz: u32) -> Self {

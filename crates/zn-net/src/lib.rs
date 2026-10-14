@@ -18,7 +18,10 @@ pub struct ClientInput {
 
 impl ClientInput {
     pub fn new(tick: u64) -> Self {
-        Self { tick, ..Self::default() }
+        Self {
+            tick,
+            ..Self::default()
+        }
     }
 }
 

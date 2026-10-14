@@ -14,7 +14,9 @@ impl Default for Schedule {
 
 impl Schedule {
     pub fn new() -> Self {
-        Self { systems: Vec::new() }
+        Self {
+            systems: Vec::new(),
+        }
     }
 
     pub fn add<S: Into<String>>(&mut self, name: S, system: impl FnMut(&mut World) + 'static) {

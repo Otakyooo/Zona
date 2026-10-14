@@ -5,7 +5,13 @@ use zn_net::ClientInput;
 use zn_sim::{InputBuffer, Simulation};
 
 fn input(tick: u64, forward: f32, right: f32, jump: bool) -> ClientInput {
-    ClientInput { tick, move_forward: forward, move_right: right, jump, ..ClientInput::default() }
+    ClientInput {
+        tick,
+        move_forward: forward,
+        move_right: right,
+        jump,
+        ..ClientInput::default()
+    }
 }
 
 #[test]
@@ -19,8 +25,16 @@ fn players_move_forward_relative_to_yaw() {
     }
 
     let state = sim.player_state(id).unwrap();
-    assert!(state.position.x > 4.0, "player did not move: {:?}", state.position);
-    assert!(state.position.y.abs() < 0.01, "player left the ground: {}", state.position.y);
+    assert!(
+        state.position.x > 4.0,
+        "player did not move: {:?}",
+        state.position
+    );
+    assert!(
+        state.position.y.abs() < 0.01,
+        "player left the ground: {}",
+        state.position.y
+    );
     assert!(state.grounded);
 }
 

@@ -19,7 +19,10 @@ pub struct InputState {
 
 impl InputState {
     pub fn new() -> Self {
-        Self { focused: true, ..Self::default() }
+        Self {
+            focused: true,
+            ..Self::default()
+        }
     }
 
     pub fn handle_event(&mut self, event: &WindowEvent) -> bool {
@@ -170,9 +173,17 @@ impl InputState {
         negative - positive
     }
 
-    pub fn move_axis(&self, forward: KeyCode, left: KeyCode, back: KeyCode, right: KeyCode) -> [f32; 2] {
-        let right_axis = self.is_key_down(right) as i32 as f32 - self.is_key_down(left) as i32 as f32;
-        let forward_axis = self.is_key_down(forward) as i32 as f32 - self.is_key_down(back) as i32 as f32;
+    pub fn move_axis(
+        &self,
+        forward: KeyCode,
+        left: KeyCode,
+        back: KeyCode,
+        right: KeyCode,
+    ) -> [f32; 2] {
+        let right_axis =
+            self.is_key_down(right) as i32 as f32 - self.is_key_down(left) as i32 as f32;
+        let forward_axis =
+            self.is_key_down(forward) as i32 as f32 - self.is_key_down(back) as i32 as f32;
         [right_axis, forward_axis]
     }
 
