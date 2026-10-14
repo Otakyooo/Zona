@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use egui::{Color32, Pos2, RichText, Stroke};
 use glam::{Vec2, Vec3};
@@ -9,7 +10,6 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowId;
 
-use zn_assets::{CpuImage, CpuMaterial};
 use zn_render::{Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer};
 use zn_scene::{ColliderShape, Scene, SceneObject};
 
@@ -20,8 +20,21 @@ use crate::picking::{cursor_ray, pick_object, placement_point};
 
 const DEFAULT_CONTENT_ROOT: &str = "game/content";
 const CLICK_MOVE_TOLERANCE_PX: f32 = 4.0;
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(350);
+const DOUBLE_CLICK_DISTANCE_PX: f32 = 4.0;
 const FLY_SPEED: f32 = 12.0;
 const PLACE_SCALE_DEFAULT: f32 = 1.0;
+
+/// Двойной клик: тот же участок экрана в пределах `DOUBLE_CLICK_INTERVAL`.
+fn is_double_click(last: Option<(Instant, Vec2)>, now: Instant, cursor: Vec2) -> bool {
+    match last {
+        Some((time, position)) => {
+            now.duration_since(time) <= DOUBLE_CLICK_INTERVAL
+                && position.distance(cursor) <= DOUBLE_CLICK_DISTANCE_PX
+        }
+        None => false,
+    }
+}
 
 /// Загруженный в GPU ассет редактора.
 pub struct LoadedAsset {
@@ -52,6 +65,7 @@ pub struct EditorApp {
     gizmo: GizmoState,
     drag: Option<CameraDrag>,
     cursor_px: Option<Vec2>,
+    last_click: Option<(Instant, Vec2)>,
     keys_down: HashSet<KeyCode>,
     pending_place: Option<String>,
     assets: HashMap<String, LoadedAsset>,
@@ -89,6 +103,7 @@ impl EditorApp {
             gizmo: GizmoState::new(GizmoMode::Translate),
             drag: None,
             cursor_px: None,
+            last_click: None,
             keys_down: HashSet::new(),
             pending_place: None,
             assets: HashMap::new(),
@@ -246,15 +261,20 @@ impl EditorApp {
 
     fn pick_at_cursor(&mut self) {
         let Some(cursor) = self.cursor_px else { return };
+        let now = Instant::now();
+        let double_click = is_double_click(self.last_click, now, cursor);
+        self.last_click = Some((now, cursor));
         let (origin, dir) = cursor_ray(&self.camera, cursor, self.viewport_px());
         let bounds: Vec<_> = self.scene.objects.iter().map(scene_bounds).collect();
         self.selected = pick_object(bounds.iter(), origin, dir).map(|(index, _)| index);
         match self.selected {
             Some(index) => {
                 self.status = format!("выделен объект {index}");
-                // Двойное выделение центрирует орбиту на объекте.
-                if let Some(object) = self.scene.objects.get(index) {
-                    self.orbit.focus(scene_bounds(object).center());
+                // Двойной клик центрирует орбиту на объекте (одиночный — только выделяет).
+                if double_click {
+                    if let Some(object) = self.scene.objects.get(index) {
+                        self.orbit.focus(scene_bounds(object).center());
+                    }
                 }
             }
             None => self.status = "выделение снято".into(),
@@ -436,7 +456,7 @@ impl EditorApp {
                         } else {
                             let path = self.path_buffer.clone();
                             if path.is_empty() {
-                                self.status = "��� ���� � ����������� ���������� ���".into();
+                                self.status = "путь не задан — используйте «Сохранить как»".into();
                             } else {
                                 self.save_scene(Path::new(&path));
                             }
@@ -1140,8 +1160,8 @@ fn draw_gizmo(
 
 fn material_images<'a>(
     asset: &'a zn_assets::ImportedAsset,
-    material: &'a CpuMaterial,
-) -> [Option<&'a CpuImage>; 5] {
+    material: &'a zn_assets::CpuMaterial,
+) -> [Option<&'a zn_assets::CpuImage>; 5] {
     let get = |index: Option<usize>| index.and_then(|index| asset.images.get(index));
     [
         get(material.base_color_texture),
@@ -1150,4 +1170,30 @@ fn material_images<'a>(
         get(material.occlusion_texture),
         get(material.emissive_texture),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn double_click_requires_recent_same_spot() {
+        let now = Instant::now();
+        let cursor = Vec2::new(100.0, 200.0);
+
+        // Первый клик — не двойной.
+        assert!(!is_double_click(None, now, cursor));
+
+        // Быстрый клик в том же месте — двойной.
+        let recent = (now - Duration::from_millis(100), cursor);
+        assert!(is_double_click(Some(recent), now, cursor));
+
+        // Слишком далеко по времени — нет.
+        let old = (now - Duration::from_secs(1), cursor);
+        assert!(!is_double_click(Some(old), now, cursor));
+
+        // Слишком далеко по расстоянию — нет.
+        let far = (now - Duration::from_millis(50), Vec2::new(140.0, 200.0));
+        assert!(!is_double_click(Some(far), now, cursor));
+    }
 }

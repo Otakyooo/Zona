@@ -160,6 +160,7 @@ pub fn axis_endpoint(
 }
 
 /// Ближайшая ось под курсором (0=X, 1=Y, 2=Z) или None.
+/// Из осей в пределах допуска выбирается ближайшая по экранной дистанции.
 pub fn pick_axis(
     camera: &zn_render::Camera,
     viewport_px: Vec2,
@@ -168,13 +169,20 @@ pub fn pick_axis(
 ) -> Option<usize> {
     let start = world_to_screen(camera, viewport_px, center)?;
     let axes = [Vec3::X, Vec3::Y, Vec3::Z];
+    let mut best: Option<(usize, f32)> = None;
     for (index, axis) in axes.into_iter().enumerate() {
-        let end = axis_endpoint(camera, viewport_px, center, axis)?;
-        if point_segment_distance(cursor, start, end) <= GIZMO_HIT_TOLERANCE_PX {
-            return Some(index);
+        let Some(end) = axis_endpoint(camera, viewport_px, center, axis) else {
+            continue;
+        };
+        let distance = point_segment_distance(cursor, start, end);
+        if distance <= GIZMO_HIT_TOLERANCE_PX {
+            match best {
+                Some((_, best_distance)) if best_distance <= distance => {}
+                _ => best = Some((index, distance)),
+            }
         }
     }
-    None
+    best.map(|(index, _)| index)
 }
 
 /// Перевод экранной дельты drag в мировое смещение вдоль оси `axis`.
@@ -270,6 +278,19 @@ mod tests {
         assert_eq!(pick_axis(&camera, viewport, center, near_y), Some(1));
         let outside = origin + Vec2::new(300.0, 300.0);
         assert!(pick_axis(&camera, viewport, center, outside).is_none());
+    }
+
+    #[test]
+    fn pick_axis_prefers_nearest_of_overlapping() {
+        // Обе оси в пределах допуска у центра, но Y отрезко: ближе → выбран Y.
+        let camera = test_camera(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO);
+        let viewport = Vec2::new(1600.0, 900.0);
+        let center = Vec3::ZERO;
+        let origin = world_to_screen(&camera, viewport, center).unwrap();
+        // Экранный Y вверх → смещение (2, -6): до вертикальной оси 2px,
+        // до горизонтальной 6px — обе в допуске, но вертикальная ближе.
+        let cursor = origin + Vec2::new(2.0, -6.0);
+        assert_eq!(pick_axis(&camera, viewport, center, cursor), Some(1));
     }
 
     #[test]
