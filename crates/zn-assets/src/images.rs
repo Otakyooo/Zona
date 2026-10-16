@@ -3,7 +3,8 @@ use crate::types::CpuImage;
 use std::path::Path;
 
 /// Декодирует изображение с диска в RGBA8. PNG/JPEG — через `image`, KTX2 —
-/// через `ktx2` (uncompressed; BasisU не поддерживается — см. README).
+/// через `ktx2`, Basis Universal (ETC1S/UASTC) — через `basisu` (RGBA8 на CPU,
+/// BCn-форматы не поддерживаются — см. README).
 ///
 /// `srgb` помечает base-color/emissive карты (glTF-конвенция); вызывающий код
 /// решает, какой смысл несёт текстура.
@@ -26,7 +27,7 @@ pub fn decode_image_bytes(bytes: &[u8], srgb: bool) -> Result<CpuImage, AssetErr
     let image = image::load_from_memory(bytes)?;
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
-    Ok(CpuImage::new(width, height, rgba.into_raw(), srgb))
+    Ok(CpuImage::new(width, height, rgba.into_raw(), srgb).with_mips())
 }
 
 fn decode_ktx2(bytes: &[u8], srgb: bool) -> Result<CpuImage, AssetError> {
@@ -34,10 +35,10 @@ fn decode_ktx2(bytes: &[u8], srgb: bool) -> Result<CpuImage, AssetError> {
         .map_err(|error| AssetError::UnsupportedFormat(format!("некорректный KTX2: {error}")))?;
     let header = reader.header();
 
-    if header.supercompression_scheme.is_some() {
-        return Err(AssetError::UnsupportedFormat(
-            "KTX2 с суперкомпрессией (BasisU/Zstandard/ZLIB) не поддерживается".into(),
-        ));
+    // Basis Universal: ETC1S всегда с суперкомпрессией BasisLZ, UASTC может
+    // лежать без неё (тогда format тоже UNDEFINED). Транскодируем уровень 0.
+    if header.supercompression_scheme.is_some() || header.format.is_none() {
+        return decode_basisu(bytes, srgb);
     }
 
     let channels = match header.format {
@@ -56,7 +57,7 @@ fn decode_ktx2(bytes: &[u8], srgb: bool) -> Result<CpuImage, AssetError> {
         }
         None => {
             return Err(AssetError::UnsupportedFormat(
-                "KTX2 без формата (BasisU) не поддерживается".into(),
+                "KTX2 без формата (не Basis Universal)".into(),
             ));
         }
     };
@@ -80,14 +81,35 @@ fn decode_ktx2(bytes: &[u8], srgb: bool) -> Result<CpuImage, AssetError> {
     for texel in data[..expected].chunks_exact(channels) {
         let (r, g, b) = match channels {
             1 => (texel[0], texel[0], texel[0]),
-            2 => (texel[0], texel[0], texel[0]),
+            2 => (texel[0], texel[1], texel[0]),
             3 => (texel[0], texel[1], texel[2]),
             _ => (texel[0], texel[1], texel[2]),
         };
         pixels.extend_from_slice(&[r, g, b, if channels == 4 { texel[3] } else { 255 }]);
     }
 
-    Ok(CpuImage::new(width, height, pixels, srgb))
+    Ok(CpuImage::new(width, height, pixels, srgb).with_mips())
+}
+
+/// Basis Universal (ETC1S/UASTC) через `basisu`: транскод уровня 0 в RGBA8.
+fn decode_basisu(bytes: &[u8], srgb: bool) -> Result<CpuImage, AssetError> {
+    let transcoder = basisu::Transcoder::new(bytes).map_err(|error| {
+        AssetError::UnsupportedFormat(format!("KTX2 BasisU не читается: {error:?}"))
+    })?;
+    let (width, height) = transcoder.base_dimensions();
+    let pixels = transcoder
+        .transcode(0, basisu::TargetFormat::Rgba32, basisu::DecodeFlags::NONE)
+        .map_err(|error| {
+            AssetError::UnsupportedFormat(format!("KTX2 BasisU не транскодируется: {error:?}"))
+        })?;
+    let expected = width as usize * height as usize * 4;
+    if pixels.len() < expected {
+        return Err(AssetError::UnsupportedFormat(format!(
+            "KTX2 BasisU: данных {actual} < {expected}",
+            actual = pixels.len()
+        )));
+    }
+    Ok(CpuImage::new(width, height, pixels, srgb).with_mips())
 }
 
 /// Сканирует директорию ассетов: glTF-источники и изображения.
@@ -187,7 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn ktx2_supercompressed_rejected() {
+    fn ktx2_r8g8_expands_to_rgba() {
+        let bytes = ktx2_fixture(2, 1, ktx2::Format::R8G8_UNORM, &[10, 20, 30, 40]);
+        let image = decode_image_bytes(&bytes, false).unwrap();
+        assert_eq!((image.width, image.height), (2, 1));
+        assert_eq!(image.pixels, vec![10, 20, 10, 255, 30, 40, 30, 255]);
+    }
+
+    #[test]
+    fn ktx2_fake_basisu_payload_is_rejected() {
+        // Флаг BasisLZ не делает файл Basis Universal: транскодер обязан
+        // отвергнуть фиктивные байты без паники.
         let mut bytes = ktx2_fixture(1, 1, ktx2::Format::R8G8B8A8_UNORM, &[1, 2, 3, 4]);
         // supercompression_scheme = BasisLZ (1) в байтах [44..48]
         bytes[44..48].copy_from_slice(&1u32.to_le_bytes());
@@ -196,12 +228,51 @@ mod tests {
     }
 
     #[test]
-    fn ktx2_undefined_format_rejected() {
-        let bytes = ktx2_fixture(1, 1, ktx2::Format::R8G8B8A8_UNORM, &[1, 2, 3, 4]);
-        let mut bytes = bytes;
+    fn ktx2_undefined_format_without_basisu_is_rejected() {
+        // Format=UNDEFINED и не Basis Universal внутри — декодировать нечего.
+        let mut bytes = ktx2_fixture(1, 1, ktx2::Format::R8G8B8A8_UNORM, &[1, 2, 3, 4]);
         bytes[12..16].copy_from_slice(&0u32.to_le_bytes()); // VK_FORMAT_UNDEFINED
         let error = decode_image_bytes(&bytes, false).unwrap_err();
         assert!(matches!(error, AssetError::UnsupportedFormat(_)));
+    }
+
+    fn fixtures_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    /// Фикстуры Basis Universal из репозитория крейта `basisu` (Apache-2.0):
+    /// ETC1S с BasisLZ-суперкомпрессией и UASTC без неё (см. tests/fixtures/README).
+    #[test]
+    fn ktx2_basisu_etc1s_fixture_decodes() {
+        let bytes = std::fs::read(fixtures_dir().join("etc1s.ktx2")).unwrap();
+        let image = decode_image_bytes(&bytes, true).unwrap();
+        assert_eq!((image.width, image.height), (40, 40));
+        assert!(image.srgb);
+        assert_eq!(image.mips.len(), 5);
+        assert_eq!(image.mips[0].len(), 20 * 20 * 4);
+        assert_eq!(image.mips[4].len(), 4);
+        // Золотые значения: bit-exact выход транскодера 0.1.0.
+        assert_eq!(&image.pixels[0..4], &[181, 148, 16, 255]);
+        assert_eq!(&image.pixels[1600..1604], &[175, 151, 10, 255]);
+        assert_eq!(&image.pixels[6396..], &[184, 151, 0, 255]);
+        assert_eq!(&image.mips[0][0..4], &[181, 148, 16, 255]);
+        assert_eq!(image.mips[4], vec![191, 165, 34, 255]);
+    }
+
+    #[test]
+    fn ktx2_basisu_uastc_fixture_decodes() {
+        let bytes = std::fs::read(fixtures_dir().join("uastc.ktx2")).unwrap();
+        let image = decode_image_bytes(&bytes, false).unwrap();
+        assert_eq!((image.width, image.height), (40, 40));
+        assert!(!image.srgb);
+        assert_eq!(image.mips.len(), 5);
+        assert_eq!(image.mips[4].len(), 4);
+        // Золотые значения: bit-exact выход транскодера 0.1.0.
+        assert_eq!(&image.pixels[0..4], &[186, 151, 0, 255]);
+        assert_eq!(&image.pixels[1600..1604], &[186, 151, 0, 255]);
+        assert_eq!(&image.pixels[6396..], &[186, 151, 0, 255]);
+        assert_eq!(&image.mips[0][0..4], &[186, 151, 0, 255]);
+        assert_eq!(image.mips[4], vec![194, 164, 35, 255]);
     }
 
     #[test]

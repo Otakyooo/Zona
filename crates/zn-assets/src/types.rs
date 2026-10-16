@@ -86,6 +86,8 @@ pub struct CpuMesh {
     pub vertices: Vec<AssetVertex>,
     pub indices: Vec<u32>,
     pub bounds: Bounds,
+    /// Индекс материала примитива в `ImportedAsset::materials` (None — дефолтный).
+    pub material: Option<usize>,
 }
 
 impl CpuMesh {
@@ -96,6 +98,7 @@ impl CpuMesh {
             vertices,
             indices,
             bounds,
+            material: None,
         }
     }
 
@@ -107,7 +110,7 @@ impl CpuMesh {
     /// Пересчитывает flat-нормали по граням (для мешей без атрибута нормалей).
     pub fn recompute_flat_normals(&mut self) {
         let mut normals = vec![Vec3::ZERO; self.vertices.len()];
-        for triangle in self.indices.chunks_exact(3) {
+        for triangle in self.indices.as_chunks::<3>().0 {
             let [i0, i1, i2] = [
                 triangle[0] as usize,
                 triangle[1] as usize,
@@ -143,6 +146,8 @@ pub struct CpuImage {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    /// Мип-уровни 1..N (RGBA8, каждый вдвое меньше предыдущего, последний — 1×1).
+    pub mips: Vec<Vec<u8>>,
     /// true — sRGB-кодировка (base-color/emissive), false — линейные данные.
     pub srgb: bool,
 }
@@ -154,6 +159,7 @@ impl CpuImage {
             width,
             height,
             pixels,
+            mips: Vec::new(),
             srgb,
         }
     }
@@ -162,6 +168,52 @@ impl CpuImage {
         self.name = Some(name.into());
         self
     }
+
+    /// Досчитывает мип-цепочку box-фильтром (если она ещё не построена).
+    pub fn with_mips(mut self) -> Self {
+        if self.mips.is_empty() {
+            self.mips = generate_mip_chain(self.width, self.height, &self.pixels);
+        }
+        self
+    }
+}
+
+/// Строит мип-цепочку box-фильтром 2×2 для RGBA8-изображения.
+///
+/// Каждый следующий уровень — не менее 1×1; нечётные размеры округляются
+/// вниз (последняя строка/столбец не участвуют). Возвращает уровни 1..N.
+pub fn generate_mip_chain(width: u32, height: u32, pixels: &[u8]) -> Vec<Vec<u8>> {
+    let mut mips = Vec::new();
+    let mut current = pixels.to_vec();
+    let (mut w, mut h) = (width.max(1), height.max(1));
+    while w > 1 || h > 1 {
+        let nw = (w / 2).max(1);
+        let nh = (h / 2).max(1);
+        let mut next = vec![0u8; nw as usize * nh as usize * 4];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut sum = [0u32; 4];
+                for (dy, dx) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+                    // Сторона 1: 2×2-блок вырождается, тексель дублируется.
+                    let sx = (x * 2 + dx).min(w - 1);
+                    let sy = (y * 2 + dy).min(h - 1);
+                    let base = ((sy * w + sx) * 4) as usize;
+                    for (channel, value) in sum.iter_mut().enumerate() {
+                        *value += current[base + channel] as u32;
+                    }
+                }
+                let out = ((y * nw + x) * 4) as usize;
+                for (channel, value) in next[out..out + 4].iter_mut().enumerate() {
+                    *value = (sum[channel] / 4) as u8;
+                }
+            }
+        }
+        mips.push(next.clone());
+        current = next;
+        w = nw;
+        h = nh;
+    }
+    mips
 }
 
 /// Режим альфы материала (glTF alphaMode).
@@ -326,9 +378,71 @@ mod tests {
         );
         assert_eq!(mesh.bounds.min, Vec3::new(-1.0, -1.0, -1.0));
         assert_eq!(mesh.bounds.max, Vec3::new(1.0, 1.0, 1.0));
+        assert_eq!(mesh.material, None);
         assert_eq!(
             mesh.vertex_bytes().len(),
             2 * std::mem::size_of::<AssetVertex>()
         );
+    }
+
+    #[test]
+    fn mip_chain_halves_until_one_texel() {
+        let pixels = vec![128u8; 4 * 4 * 4];
+        let mips = generate_mip_chain(4, 4, &pixels);
+        assert_eq!(mips.len(), 2);
+        assert_eq!(mips[0].len(), 2 * 2 * 4);
+        assert_eq!(mips[1].len(), 4);
+        assert!(mips.iter().flatten().all(|&value| value == 128));
+    }
+
+    #[test]
+    fn mip_chain_averages_2x2_blocks() {
+        // Красный, зелёный, синий, белый → средние (127, 127, 127, 255).
+        #[rustfmt::skip]
+        let pixels = vec![
+            255, 0, 0, 255,      // (0,0)
+            0, 255, 0, 255,      // (1,0)
+            0, 0, 255, 255,      // (0,1)
+            255, 255, 255, 255,  // (1,1)
+        ];
+        let mips = generate_mip_chain(2, 2, &pixels);
+        assert_eq!(mips.len(), 1);
+        assert_eq!(mips[0], vec![127, 127, 127, 255]);
+    }
+
+    #[test]
+    fn mip_chain_supports_non_pow2() {
+        // 3×3 → 1×1: усредняются первые 2×2 текселя, край отбрасывается.
+        let mut pixels = vec![0u8; 3 * 3 * 4];
+        for (x, y) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+            pixels[(y * 3 + x) * 4] = 255;
+        }
+        let mips = generate_mip_chain(3, 3, &pixels);
+        assert_eq!(mips, vec![vec![255, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn mip_chain_of_one_texel_is_empty() {
+        assert!(generate_mip_chain(1, 1, &[1, 2, 3, 4]).is_empty());
+    }
+
+    #[test]
+    fn mip_chain_handles_single_row_and_column() {
+        // 2×1 → 1×1 и 1×2 → 1×1: тексели усредняются, вырожденная сторона дублируется.
+        let pixels = vec![0u8, 0, 0, 0, 200, 0, 0, 0];
+        assert_eq!(generate_mip_chain(2, 1, &pixels), vec![vec![100, 0, 0, 0]]);
+        let pixels = vec![40u8, 0, 0, 0, 80, 0, 0, 0];
+        assert_eq!(generate_mip_chain(1, 2, &pixels), vec![vec![60, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn image_with_mips_builds_chain_once() {
+        let image = CpuImage::new(2, 2, vec![0; 16], true).with_mips();
+        assert_eq!(image.mips.len(), 1);
+        assert_eq!(image.mips[0].len(), 4);
+        // Уже построенная цепочка не пересчитывается.
+        let mut manual = CpuImage::new(2, 2, vec![0; 16], true);
+        manual.mips = vec![vec![9, 9, 9, 9]];
+        assert_eq!(manual.with_mips().mips, vec![vec![9, 9, 9, 9]]);
     }
 }

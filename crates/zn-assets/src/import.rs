@@ -159,6 +159,7 @@ fn convert_primitive(
     }
 
     let mut mesh = CpuMesh::new(vertices, indices);
+    mesh.material = primitive.material().index();
     if normals.is_none() {
         mesh.recompute_flat_normals();
     }
@@ -170,7 +171,7 @@ fn convert_primitive(
 fn convert_image(image: &gltf::image::Data) -> CpuImage {
     let pixels = to_rgba8(image);
     // srgb проставляется только base-color картам — см. apply_base_color_srgb.
-    CpuImage::new(image.width, image.height, pixels, false)
+    CpuImage::new(image.width, image.height, pixels, false).with_mips()
 }
 
 fn to_rgba8(image: &gltf::image::Data) -> Vec<u8> {
@@ -182,44 +183,60 @@ fn to_rgba8(image: &gltf::image::Data) -> Vec<u8> {
             .collect(),
         gltf::image::Format::R8G8 => image
             .pixels
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[0], texel[0], texel[0], 255])
             .collect(),
         gltf::image::Format::R8G8B8 => image
             .pixels
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[0], texel[1], texel[2], 255])
             .collect(),
         gltf::image::Format::R8G8B8A8 => image.pixels.clone(),
         // 16/32-битные форматы: оставляем старший байт канала.
         gltf::image::Format::R16 => image
             .pixels
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[1], texel[1], texel[1], 255])
             .collect(),
         gltf::image::Format::R16G16 => image
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[1], texel[1], texel[1], 255])
             .collect(),
         gltf::image::Format::R16G16B16 => image
             .pixels
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[1], texel[3], texel[5], 255])
             .collect(),
         gltf::image::Format::R16G16B16A16 => image
             .pixels
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[1], texel[3], texel[5], texel[7]])
             .collect(),
         gltf::image::Format::R32G32B32FLOAT => image
             .pixels
-            .chunks_exact(12)
+            .as_chunks::<12>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[3], texel[7], texel[11], 255])
             .collect(),
         gltf::image::Format::R32G32B32A32FLOAT => image
             .pixels
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .flat_map(|texel| [texel[3], texel[7], texel[11], texel[15]])
             .collect(),
     }

@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "ZONA asset pipeline: glTF/KTX2 importers, builtin procedural meshes, CPU asset types"
 
 [dependencies]
+basisu = { workspace = true }
 bytemuck = { workspace = true }
 glam = { workspace = true }
 gltf = { workspace = true }

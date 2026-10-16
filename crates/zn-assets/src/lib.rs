@@ -13,7 +13,10 @@ pub use builtin::{
 pub use error::AssetError;
 pub use images::{decode_image, decode_image_bytes, scan_asset_directory, IMAGE_EXTENSIONS};
 pub use import::{apply_base_color_srgb, import_gltf};
-pub use types::{AlphaMode, AssetVertex, Bounds, CpuImage, CpuMaterial, CpuMesh, ImportedAsset};
+pub use types::{
+    generate_mip_chain, AlphaMode, AssetVertex, Bounds, CpuImage, CpuMaterial, CpuMesh,
+    ImportedAsset,
+};
 
 pub const SUPPORTED_SOURCE_FORMATS: &[&str] = &["gltf", "glb"];
 
@@ -239,6 +242,109 @@ mod tests {
             (first - Vec3::new(1.0, 2.0, 0.0)).length() < 1e-4,
             "{first}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gltf_primitives_keep_material_index() {
+        let positions: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut buffer = Vec::new();
+        for vertex in &positions {
+            for component in vertex {
+                buffer.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let encoded = base64_encode(&buffer);
+        let json = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [ {{ "nodes": [0] }} ],
+  "nodes": [ {{ "mesh": 0 }} ],
+  "materials": [
+    {{ "name": "Первый", "pbrMetallicRoughness": {{ "baseColorFactor": [1, 0, 0, 1] }} }},
+    {{ "name": "Второй", "pbrMetallicRoughness": {{ "baseColorFactor": [0, 0, 1, 1] }} }}
+  ],
+  "meshes": [
+    {{ "primitives": [
+      {{ "attributes": {{ "POSITION": 0 }}, "material": 0 }},
+      {{ "attributes": {{ "POSITION": 0 }}, "material": 1 }}
+    ] }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+      "min": [0,0,0], "max": [1,1,0] }}
+  ],
+  "bufferViews": [ {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }} ],
+  "buffers": [ {{ "byteLength": 36, "uri": "data:application/octet-stream;base64,{encoded}" }} ]
+}}"#
+        );
+
+        let dir = std::env::temp_dir().join(format!("zn-assets-materials-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("materials.gltf");
+        std::fs::write(&path, json).unwrap();
+
+        let asset = import_gltf(&path).unwrap();
+        assert_eq!(asset.meshes.len(), 2);
+        assert_eq!(asset.meshes[0].material, Some(0));
+        assert_eq!(asset.meshes[1].material, Some(1));
+        assert_eq!(asset.materials.len(), 2);
+        assert_eq!(asset.materials[0].name.as_deref(), Some("Первый"));
+        assert_eq!(asset.materials[1].name.as_deref(), Some("Второй"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn imported_images_get_mip_chain_and_srgb() {
+        // 2×2 PNG (data-uri) как base-color карта: 1 мип + флаг sRGB.
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let png_base64 = base64_encode(&png.into_inner());
+
+        let positions: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut buffer = Vec::new();
+        for vertex in &positions {
+            for component in vertex {
+                buffer.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        let positions_base64 = base64_encode(&buffer);
+        let json = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "scene": 0,
+  "scenes": [ {{ "nodes": [0] }} ],
+  "nodes": [ {{ "mesh": 0 }} ],
+  "images": [ {{ "uri": "data:image/png;base64,{png_base64}" }} ],
+  "textures": [ {{ "source": 0 }} ],
+  "materials": [ {{ "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 0 }} }} }} ],
+  "meshes": [
+    {{ "primitives": [ {{ "attributes": {{ "POSITION": 0 }}, "material": 0 }} ] }}
+  ],
+  "accessors": [
+    {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+      "min": [0,0,0], "max": [1,1,0] }}
+  ],
+  "bufferViews": [ {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }} ],
+  "buffers": [ {{ "byteLength": 36, "uri": "data:application/octet-stream;base64,{positions_base64}" }} ]
+}}"#
+        );
+
+        let dir = std::env::temp_dir().join(format!("zn-assets-mips-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("textured.gltf");
+        std::fs::write(&path, json).unwrap();
+
+        let asset = import_gltf(&path).unwrap();
+        assert_eq!(asset.images.len(), 1);
+        let image = &asset.images[0];
+        assert_eq!((image.width, image.height), (2, 2));
+        assert_eq!(image.mips.len(), 1);
+        assert_eq!(image.mips[0], vec![10, 20, 30, 255]);
+        assert!(image.srgb);
         std::fs::remove_dir_all(&dir).ok();
     }
 

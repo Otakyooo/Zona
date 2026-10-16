@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/zona-project/zona"
 description = "ZONA — own game engine, launcher and an extraction FPS in a Strugatsky-style setting"
@@ -28,6 +28,7 @@ description = "ZONA — own game engine, launcher and an extraction FPS in a Str
 [workspace.dependencies]
 bytemuck = { version = "1", features = ["derive"] }
 egui = "0.36"
+egui-wgpu = "0.36"
 env_logger = "0.11"
 glam = "0.34"
 gltf = "1.4"
@@ -42,7 +43,8 @@ rapier3d = "0.36"
 ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
-wgpu = { version = "24", default-features = false, features = ["wgsl"] }
+basisu = { version = "0.1", features = ["zstd"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan"] }
 winit = "0.30"
 
 [profile.dev]

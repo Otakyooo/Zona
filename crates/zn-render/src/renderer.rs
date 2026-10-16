@@ -51,6 +51,10 @@ struct DrawRange {
     material: MaterialId,
     instance_offset: u32,
     instance_count: u32,
+    /// Blend-материал: рисуется вторым проходом back-to-front.
+    blend: bool,
+    /// Позиция первого инстанса — ключ сортировки blend-прохода.
+    first_position: [f32; 3],
 }
 
 pub struct Renderer {
@@ -62,6 +66,7 @@ pub struct Renderer {
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
+    blend_pipeline: wgpu::RenderPipeline,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -94,15 +99,15 @@ impl Renderer {
     fn init(window: Arc<Window>) -> Self {
         let size = window.inner_size();
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..Default::default()
-        });
+        // Backend'ы в wgpu 25+ за cargo-фичами: vulkan+wgsl включены в Cargo.toml.
+        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = wgpu::Backends::VULKAN;
+        let instance = wgpu::Instance::new(instance_descriptor);
 
         let display_handle = window.display_handle().expect("display handle");
         let window_handle = window.window_handle().expect("window handle");
         let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: display_handle.as_raw(),
+            raw_display_handle: Some(display_handle.as_raw()),
             raw_window_handle: window_handle.as_raw(),
         };
         let surface: wgpu::Surface<'static> =
@@ -112,18 +117,18 @@ impl Renderer {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("no compatible gpu adapter found");
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("zn-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-            },
-            None,
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("zn-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            trace: wgpu::Trace::Off,
+        }))
         .expect("failed to request device");
 
         let capabilities = surface.get_capabilities(&adapter);
@@ -147,6 +152,7 @@ impl Renderer {
                 .unwrap_or(wgpu::CompositeAlphaMode::Opaque),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
@@ -282,7 +288,7 @@ impl Renderer {
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -293,27 +299,37 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("zn-pipeline-layout"),
-            bind_group_layouts: &[&camera_bind_group_layout, &material_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                Some(&camera_bind_group_layout),
+                Some(&material_bind_group_layout),
+            ],
+            immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let opaque_targets = [Some(wgpu::ColorTargetState {
+            format: config.format,
+            blend: Some(wgpu::BlendState::REPLACE),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+        let blend_targets = [Some(wgpu::ColorTargetState {
+            format: config.format,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+
+        let opaque_descriptor = wgpu::RenderPipelineDescriptor {
             label: Some("zn-pbr-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc(), InstanceRaw::desc()],
+                buffers: &[Some(Vertex::desc()), Some(InstanceRaw::desc())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &opaque_targets,
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -327,15 +343,34 @@ impl Renderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
+        };
+        let pipeline = device.create_render_pipeline(&opaque_descriptor);
+
+        // Blend-конвейер: без записи глубины, альфа-блендинг вторым проходом.
+        let mut blend_descriptor = opaque_descriptor.clone();
+        blend_descriptor.label = Some("zn-pbr-pipeline-blend");
+        blend_descriptor.fragment = Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &blend_targets,
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
+        blend_descriptor.depth_stencil = Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24Plus,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+        let blend_pipeline = device.create_render_pipeline(&blend_descriptor);
 
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zn-instances"),
@@ -353,6 +388,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             pipeline,
+            blend_pipeline,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -458,6 +494,23 @@ impl Renderer {
 
     pub fn material_count(&self) -> usize {
         self.material_cache.len()
+    }
+
+    /// Bounds меша из кэша — для фрустум-culling'а на стороне клиента.
+    pub fn mesh_bounds(&self, mesh: MeshId) -> Option<zn_assets::Bounds> {
+        self.mesh_cache.peek(mesh).map(|entry| entry.bounds)
+    }
+
+    /// Помечает ресурсы всех батчей списка использованными до куллинга:
+    /// отсечённые инстансы не должны выселять видимые LRU-записи.
+    pub fn touch_scene(&mut self, list: &DrawList) {
+        for batch in &list.batches {
+            if batch.is_empty() {
+                continue;
+            }
+            self.mesh_cache.touch(batch.mesh);
+            self.material_cache.touch(batch.material);
+        }
     }
 
     /// Регистрирует CPU-меш в GPU-кэше, возвращает ID.
@@ -601,47 +654,75 @@ impl Renderer {
         } else {
             wgpu::TextureFormat::Rgba8Unorm
         };
+        let width = image.width.max(1);
+        let height = image.height.max(1);
         debug_assert_eq!(
             image.pixels.len(),
-            image.width as usize * image.height as usize * 4,
+            width as usize * height as usize * 4,
             "CpuImage должен быть RGBA8"
         );
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("zn-material-texture"),
             size: wgpu::Extent3d {
-                width: image.width.max(1),
-                height: image.height.max(1),
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: 1 + image.mips.len() as u32,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        self.write_texture_level(&texture, 0, &image.pixels, width, height);
+        let mut level_width = width;
+        let mut level_height = height;
+        for (index, mip) in image.mips.iter().enumerate() {
+            level_width = (level_width / 2).max(1);
+            level_height = (level_height / 2).max(1);
+            debug_assert_eq!(
+                mip.len(),
+                level_width as usize * level_height as usize * 4,
+                "размер мип-уровня {index} не совпал"
+            );
+            self.write_texture_level(&texture, index as u32 + 1, mip, level_width, level_height);
+        }
+        let _ = material_name;
+        // Бюджет LRU честный: base level + все мипы (≈×4/3).
+        let bytes =
+            (image.pixels.len() + image.mips.iter().map(|mip| mip.len()).sum::<usize>()) as u64;
+        (texture, bytes)
+    }
+
+    /// Грузит один мип-уровень RGBA8-текстуры.
+    fn write_texture_level(
+        &self,
+        texture: &wgpu::Texture,
+        level: u32,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+    ) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
+                texture,
+                mip_level: level,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &image.pixels,
+            pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(image.width * 4),
-                rows_per_image: Some(image.height),
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
             },
             wgpu::Extent3d {
-                width: image.width.max(1),
-                height: image.height.max(1),
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
         );
-        let _ = material_name;
-        let bytes = image.width as u64 * image.height as u64 * 4;
-        (texture, bytes)
     }
 
     fn create_default_texture(&self, pixels: &[u8; 4]) -> (wgpu::Texture, u64) {
@@ -708,6 +789,17 @@ impl Renderer {
             if batch.is_empty() {
                 continue;
             }
+            let blend = self
+                .material_cache
+                .peek(batch.material)
+                .is_some_and(|material| {
+                    material.params.flags & crate::renderer::material::FLAG_BLEND != 0
+                });
+            let first_position = batch
+                .instances
+                .first()
+                .map(|instance| [instance.model[12], instance.model[13], instance.model[14]])
+                .unwrap_or([0.0; 3]);
             let offset = flattened.len() as u32;
             flattened.extend_from_slice(&batch.instances);
             self.draw_ranges.push(DrawRange {
@@ -715,6 +807,8 @@ impl Renderer {
                 material: batch.material,
                 instance_offset: offset,
                 instance_count: batch.instances.len() as u32,
+                blend,
+                first_position,
             });
             self.mesh_cache.touch(batch.mesh);
             self.material_cache.touch(batch.material);
@@ -743,13 +837,19 @@ impl Renderer {
         self.update_camera(camera);
 
         let texture = match self.surface.get_current_texture() {
-            Ok(texture) => texture,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                log::debug!("surface suboptimal — переконфигурация");
+                self.surface.configure(&self.device, &self.config);
+                texture
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
-            Err(error) => {
-                log::warn!("surface error: {error}");
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => {
                 return;
             }
         };
@@ -769,6 +869,7 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
@@ -784,13 +885,47 @@ impl Renderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
+            // Порядок двух проходов: opaque — как есть, blend — back-to-front
+            // по дистанции до камеры (ключ — позиция первого инстанса).
+            let mut order: Vec<usize> = Vec::with_capacity(self.draw_ranges.len());
+            let mut blend_indices: Vec<usize> = Vec::new();
+            for (index, range) in self.draw_ranges.iter().enumerate() {
+                if range.blend {
+                    blend_indices.push(index);
+                } else {
+                    order.push(index);
+                }
+            }
+            let camera_position = camera.position;
+            blend_indices.sort_by(|&a, &b| {
+                let distance_a = (glam::Vec3::from_array(self.draw_ranges[a].first_position)
+                    - camera_position)
+                    .length_squared();
+                let distance_b = (glam::Vec3::from_array(self.draw_ranges[b].first_position)
+                    - camera_position)
+                    .length_squared();
+                distance_b.total_cmp(&distance_a)
+            });
+            order.extend(blend_indices);
+
+            let mut blend_pass_active = false;
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            for index in 0..self.draw_ranges.len() {
+            for &index in &order {
                 let range = self.draw_ranges[index];
+                if range.blend != blend_pass_active {
+                    blend_pass_active = range.blend;
+                    if blend_pass_active {
+                        pass.set_pipeline(&self.blend_pipeline);
+                    } else {
+                        pass.set_pipeline(&self.pipeline);
+                    }
+                    pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                }
                 let mesh = self.mesh_cache.peek(range.mesh);
                 let material = self.material_cache.peek(range.material);
                 let (Some(mesh), Some(material)) = (mesh, material) else {
@@ -816,6 +951,6 @@ impl Renderer {
         }
 
         self.queue.submit(Some(encoder.finish()));
-        texture.present();
+        self.queue.present(texture);
     }
 }

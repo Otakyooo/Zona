@@ -4,7 +4,7 @@ use crate::renderer::cache::MaterialId;
 use zn_assets::{AlphaMode, CpuMaterial};
 
 /// Параметры материала для uniform-буфера (совпадает со структурой Material
-/// в pbr.wgsl; флаги: 1 = alpha mask, 2 = double sided).
+/// в pbr.wgsl; флаги: 1 = alpha mask, 2 = double sided, 4 = blend).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
 pub struct MaterialParams {
@@ -25,13 +25,7 @@ impl From<&CpuMaterial> for MaterialParams {
         let flags = match material.alpha_mode {
             AlphaMode::Opaque => 0u32,
             AlphaMode::Mask => 1,
-            AlphaMode::Blend => {
-                log::warn!(
-                    "Blend-материал {:?}: blend-конвейер M2 не реализован, рисуем как opaque",
-                    material.name
-                );
-                0
-            }
+            AlphaMode::Blend => FLAG_BLEND,
         } | if material.double_sided { 2 } else { 0 };
         Self {
             base_color_factor: material.base_color_factor,
@@ -54,6 +48,9 @@ impl From<&CpuMaterial> for MaterialParams {
 
 /// Порог discard для alpha-mask материалов.
 pub const ALPHA_CUTOFF: f32 = 0.5;
+
+/// Флаг blend-конвейера: инстансы рисуются вторым проходом с альфа-блендингом.
+pub const FLAG_BLEND: u32 = 4;
 
 /// Число текстурных слотов материала.
 pub const TEXTURE_SLOTS: usize = 5;
@@ -140,9 +137,16 @@ mod tests {
             double_sided: true,
             ..Default::default()
         };
+        let blend_double = CpuMaterial {
+            alpha_mode: AlphaMode::Blend,
+            double_sided: true,
+            ..Default::default()
+        };
         assert_eq!(MaterialParams::from(&opaque).flags, 0);
         assert_eq!(MaterialParams::from(&mask).flags, 1);
         assert_eq!(MaterialParams::from(&masked_double).flags, 3);
+        // Blend больше не понижается до opaque — флаг для второго прохода.
+        assert_eq!(MaterialParams::from(&blend_double).flags, FLAG_BLEND | 2);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::renderer::cache::{MaterialId, MeshId};
 use crate::renderer::types::InstanceRaw;
+use glam::Vec3;
 
 /// Батч отрисовки: один меш + один материал + список инстансов.
 #[derive(Clone, Debug, PartialEq)]
@@ -77,6 +78,32 @@ impl DrawList {
         }
         list
     }
+
+    /// Сортирует инстансы blend-батчей back-to-front по дистанции до камеры:
+    /// полупрозрачность должна рисоваться от дальних к ближним. Opaque-батчи
+    /// не трогаются; `is_blend` отвечает за материал. Клиент вызывает перед
+    /// `update_draw_list` — детерминированный порядок внутри батча.
+    pub fn sort_blended_back_to_front(
+        &mut self,
+        camera_position: Vec3,
+        is_blend: impl Fn(MaterialId) -> bool,
+    ) {
+        for batch in &mut self.batches {
+            if !is_blend(batch.material) {
+                continue;
+            }
+            batch.instances.sort_by(|a, b| {
+                let distance_a = (instance_position(a) - camera_position).length_squared();
+                let distance_b = (instance_position(b) - camera_position).length_squared();
+                distance_b.total_cmp(&distance_a)
+            });
+        }
+    }
+}
+
+/// Позиция инстанса — колонка переноса мировой матрицы.
+fn instance_position(instance: &InstanceRaw) -> Vec3 {
+    Vec3::new(instance.model[12], instance.model[13], instance.model[14])
 }
 
 #[cfg(test)]
@@ -120,5 +147,42 @@ mod tests {
         let list = DrawList::new();
         assert!(list.is_empty());
         assert_eq!(list.instance_count(), 0);
+    }
+
+    fn positions(list: &DrawList) -> Vec<f32> {
+        list.batches[0]
+            .instances
+            .iter()
+            .map(|instance| instance.model[12])
+            .collect()
+    }
+
+    #[test]
+    fn blended_instances_sorted_back_to_front() {
+        let mut list = DrawList::new();
+        list.push(1, 7, instance(1.0));
+        list.push(1, 7, instance(5.0));
+        list.push(1, 7, instance(3.0));
+        list.sort_blended_back_to_front(glam::Vec3::ZERO, |_| true);
+        assert_eq!(positions(&list), vec![5.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn opaque_batches_keep_insertion_order() {
+        let mut list = DrawList::new();
+        list.push(1, 7, instance(1.0));
+        list.push(1, 7, instance(5.0));
+        list.sort_blended_back_to_front(glam::Vec3::ZERO, |_| false);
+        assert_eq!(positions(&list), vec![1.0, 5.0]);
+    }
+
+    #[test]
+    fn sort_is_stable_for_equal_distances() {
+        let mut list = DrawList::new();
+        list.push(1, 7, instance(-2.0));
+        list.push(1, 7, instance(2.0));
+        // Камера равноудалена: порядок вставки сохраняется (стабильная сортировка).
+        list.sort_blended_back_to_front(glam::Vec3::ZERO, |_| true);
+        assert_eq!(positions(&list), vec![-2.0, 2.0]);
     }
 }

@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn sphere_is_closed_and_normalized() {
         let mesh = builtin_mesh("sphere").unwrap();
-        assert!(mesh.indices.len() % 3 == 0);
+        assert!(mesh.indices.len().is_multiple_of(3));
         for vertex in &mesh.vertices {
             let p = Vec3::from_array(vertex.position);
             let n = Vec3::from_array(vertex.normal);
