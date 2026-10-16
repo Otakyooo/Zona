@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use glam::Vec3;
 use zn_core::{Entity, FixedStep, Schedule, World, SIMULATION_HZ, SIMULATION_STEP};
-pub use zn_net::{ClientInput, PlayerNetState, FLAG_GROUNDED, FLAG_SPRINTING};
-use zn_physics::PhysicsWorld;
+use zn_net::GameEvent;
+pub use zn_net::{ClientInput, PlayerNetState, FLAG_FIRE, FLAG_GROUNDED, FLAG_SPRINTING};
+use zn_physics::{PhysicsWorld, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_scene::Scene;
 
 pub const WALK_SPEED: f32 = 5.5;
@@ -13,6 +14,28 @@ pub const JUMP_SPEED: f32 = 6.5;
 pub const GRAVITY: f32 = 18.0;
 pub const MAX_FALL_SPEED: f32 = 45.0;
 pub const MAX_PITCH: f32 = 89.0f32.to_radians();
+
+// ── Бой (M4a) ───────────────────────────────────────────────────────────
+/// Полное здоровье игрока.
+pub const MAX_HEALTH: u16 = 100;
+/// Высота глаз над ступнями — точка вылета выстрела.
+pub const EYE_HEIGHT: f32 = 1.62;
+/// Дальность выстрела винтовки.
+pub const RIFLE_RANGE: f32 = 100.0;
+/// Границы зон попадания по высоте от ступней (рост игрока 1.8 м): ниже
+/// `ZONE_TORSO_MIN` — ноги, до `ZONE_HEAD_MIN` — торс, выше — голова.
+pub const ZONE_TORSO_MIN: f32 = 0.8;
+pub const ZONE_HEAD_MIN: f32 = 1.5;
+
+/// Урон винтовки в торс.
+const RIFLE_DAMAGE: f32 = 25.0;
+/// Множители урона головы/ног к базовому.
+const HEAD_DAMAGE_MULT: f32 = 2.0;
+const LEGS_DAMAGE_MULT: f32 = 0.6;
+/// Интервал между выстрелами (60 Гц → ~7.5 выстрелов/с).
+const FIRE_INTERVAL_TICKS: u64 = 8;
+/// Задержка респавна после смерти (3 с).
+const RESPAWN_DELAY_TICKS: u64 = 180;
 
 /// Максимум отложенных инпутов на игрока (защита от переполнения при джиттере).
 pub const INPUT_QUEUE_CAP: usize = 64;
@@ -30,6 +53,14 @@ pub struct PlayerState {
     pub pitch: f32,
     pub grounded: bool,
     pub sprinting: bool,
+    /// Здоровье; 0 — мёртв до респавна.
+    pub health: u16,
+    /// Удержание огня текущим инпутом (`FLAG_FIRE`); мёртвые не стреляют.
+    pub firing: bool,
+    /// Tick респавна после смерти; 0 — игрок жив.
+    pub respawn_at: u64,
+    /// Раньше этого tick стрелять нельзя (кулдаун оружия).
+    pub next_fire_tick: u64,
 }
 
 impl PlayerState {
@@ -42,6 +73,10 @@ impl PlayerState {
             pitch: 0.0,
             grounded: true,
             sprinting: false,
+            health: MAX_HEALTH,
+            firing: false,
+            respawn_at: 0,
+            next_fire_tick: 0,
         }
     }
 
@@ -59,6 +94,7 @@ impl PlayerState {
             velocity: self.velocity.to_array(),
             yaw: self.yaw,
             pitch: self.pitch,
+            health: self.health,
             flags,
         }
     }
@@ -68,6 +104,7 @@ impl PlayerState {
         self.velocity = Vec3::from_array(state.velocity);
         self.yaw = state.yaw;
         self.pitch = state.pitch;
+        self.health = state.health;
         self.grounded = state.flags & FLAG_GROUNDED != 0;
         self.sprinting = state.flags & FLAG_SPRINTING != 0;
     }
@@ -78,6 +115,19 @@ pub struct TickInfo {
     pub dt: f32,
     pub tick: u64,
 }
+
+/// Точка респавна уровня (ступни и yaw). Ставится из сцены в `build`,
+/// обновляется при `rebuild_static`.
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnPoint {
+    pub position: Vec3,
+    pub yaw: f32,
+}
+
+/// Очередь событий боя (выстрелы, смерти) с прошлого снапшота; забирает
+/// серверная сессия. Имена в `Death` заполняет сессия — симуляция их не знает.
+#[derive(Clone, Debug, Default)]
+pub struct CombatEvents(pub Vec<GameEvent>);
 
 /// Очереди клиентских инпутов по игрокам.
 ///
@@ -176,6 +226,10 @@ impl Simulation {
     pub fn rebuild_static(&mut self, scene: &Scene) {
         self.spawn = scene.spawn;
         self.spawn_yaw = scene.spawn_yaw;
+        if let Some(spawn_point) = self.world.get_resource_mut::<SpawnPoint>() {
+            spawn_point.position = scene.spawn;
+            spawn_point.yaw = scene.spawn_yaw;
+        }
         let physics = self
             .world
             .get_resource_mut::<PhysicsWorld>()
@@ -187,6 +241,11 @@ impl Simulation {
         let mut world = World::new();
         world.insert_resource(TickInfo::default());
         world.insert_resource(InputBuffer::default());
+        world.insert_resource(SpawnPoint {
+            position: spawn,
+            yaw: spawn_yaw,
+        });
+        world.insert_resource(CombatEvents::default());
 
         let mut physics = PhysicsWorld::with_gravity_y(-GRAVITY, SIMULATION_STEP.as_secs_f32());
         if ground_plate {
@@ -335,6 +394,14 @@ impl Simulation {
             .cloned()
     }
 
+    /// Забирает накопленные события боя (сервер кладёт их в снапшоты).
+    pub fn take_events(&mut self) -> Vec<GameEvent> {
+        self.world
+            .get_resource_mut::<CombatEvents>()
+            .map(|events| std::mem::take(&mut events.0))
+            .unwrap_or_default()
+    }
+
     /// Число статических коллайдеров физики (для тестов и диагностики).
     pub fn static_collider_count(&self) -> usize {
         self.world
@@ -348,6 +415,8 @@ fn build_schedule() -> Schedule {
     let mut schedule = Schedule::new();
     schedule.add("player_apply_input", apply_input);
     schedule.add("player_move", move_players);
+    schedule.add("player_combat", player_combat);
+    schedule.add("player_respawn", player_respawn);
     schedule
 }
 
@@ -382,6 +451,14 @@ fn apply_input(world: &mut World) {
             state.yaw = (state.yaw + command.yaw_delta).rem_euclid(std::f32::consts::TAU);
             state.pitch = (state.pitch + command.pitch_delta).clamp(-MAX_PITCH, MAX_PITCH);
 
+            if state.health == 0 {
+                // Мёртвый может осматриваться, но не двигаться и не стрелять.
+                state.firing = false;
+                state.sprinting = false;
+                continue;
+            }
+            state.firing = command.buttons & FLAG_FIRE != 0;
+
             let (sin_yaw, cos_yaw) = state.yaw.sin_cos();
             let forward = Vec3::new(cos_yaw, 0.0, sin_yaw);
             // «Вправо» — правая половина экрана (при yaw = 0 это +Z,
@@ -405,7 +482,7 @@ fn apply_input(world: &mut World) {
             }
         }
 
-        if !state.grounded {
+        if state.health > 0 && !state.grounded {
             state.velocity.y = (state.velocity.y - GRAVITY * dt).max(-MAX_FALL_SPEED);
         }
     }
@@ -418,6 +495,7 @@ fn move_players(world: &mut World) {
         let mut query = world.query::<(Entity, &PlayerState)>();
         query
             .iter()
+            .filter(|(_, state)| state.health > 0)
             .map(|(entity, state)| (entity, state.position, state.velocity * dt))
             .collect()
     };
@@ -451,6 +529,223 @@ fn move_players(world: &mut World) {
         state.grounded = *grounded;
         if *grounded && state.velocity.y < 0.0 {
             state.velocity.y = 0.0;
+        }
+    }
+}
+
+/// Направление прицела по yaw/pitch — та же конвенция, что у камеры клиента
+/// (`zn_render::Camera::forward`): yaw = 0 — +X, положительный pitch — вверх.
+pub fn aim_forward(yaw: f32, pitch: f32) -> Vec3 {
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    Vec3::new(cos_yaw * cos_pitch, sin_pitch, sin_yaw * cos_pitch)
+}
+
+/// Урон выстрела по высоте попадания от ступней: голова/торс/ноги.
+pub fn zone_damage(hit_height: f32) -> u16 {
+    let multiplier = if hit_height >= ZONE_HEAD_MIN {
+        HEAD_DAMAGE_MULT
+    } else if hit_height >= ZONE_TORSO_MIN {
+        1.0
+    } else {
+        LEGS_DAMAGE_MULT
+    };
+    (RIFLE_DAMAGE * multiplier).round() as u16
+}
+
+/// Пересечение луча с вертикальной капсулой игрока (радиус `PLAYER_RADIUS`,
+/// ядро — отрезок на высотах r..2·half_height+r от ступней). Возвращает
+/// параметр `t` ближайшего входа или `None`, если попадания в `max_t` нет.
+fn ray_capsule(feet: Vec3, origin: Vec3, dir: Vec3, max_t: f32) -> Option<f32> {
+    let radius = PLAYER_RADIUS;
+    let core_low = feet.y + radius;
+    let core_high = feet.y + 2.0 * PLAYER_HALF_HEIGHT + radius;
+    let ox = origin.x - feet.x;
+    let oz = origin.z - feet.z;
+    let mut best = f32::INFINITY;
+
+    // Цилиндрическая часть: квадратичное уравнение в плоскости XZ.
+    let a = dir.x * dir.x + dir.z * dir.z;
+    if a > 1e-8 {
+        let b = ox * dir.x + oz * dir.z;
+        let c = ox * ox + oz * oz - radius * radius;
+        let disc = b * b - a * c;
+        if disc >= 0.0 {
+            let sqrt = disc.sqrt();
+            for t in [(-b - sqrt) / a, (-b + sqrt) / a] {
+                let y = origin.y + dir.y * t;
+                if t >= 0.0 && y >= core_low && y <= core_high {
+                    best = best.min(t);
+                }
+            }
+        }
+    }
+
+    // Полусферы на концах ядра.
+    for (center_y, low_end) in [(core_low, true), (core_high, false)] {
+        let oy = origin.y - center_y;
+        let b = ox * dir.x + oy * dir.y + oz * dir.z;
+        let c = ox * ox + oy * oy + oz * oz - radius * radius;
+        let disc = b * b - c;
+        if disc >= 0.0 {
+            let sqrt = disc.sqrt();
+            for t in [-b - sqrt, -b + sqrt] {
+                let y = origin.y + dir.y * t;
+                let in_cap = if low_end {
+                    y <= core_low
+                } else {
+                    y >= core_high
+                };
+                if t >= 0.0 && in_cap {
+                    best = best.min(t);
+                }
+            }
+        }
+    }
+
+    (best <= max_t).then_some(best)
+}
+
+/// Бой: выстрелы живых игроков с `FLAG_FIRE` не чаще `FIRE_INTERVAL_TICKS`,
+/// рейкаст по стенам сцены и капсулам игроков, урон по зонам, смерть с
+/// отложенным респавном. События (трейсеры, килл-фид) кладутся в
+/// `CombatEvents` — их забирает серверная сессия.
+fn player_combat(world: &mut World) {
+    let tick = world
+        .get_resource::<TickInfo>()
+        .map(|info| info.tick)
+        .unwrap_or(0);
+
+    // Фаза 1: выстрелы и попадания (иммутабельные заимствования).
+    let shooters: Vec<(u64, Vec3, Vec3)> = world
+        .query::<&PlayerState>()
+        .iter()
+        .filter(|state| state.health > 0 && state.firing && tick >= state.next_fire_tick)
+        .map(|state| {
+            (
+                state.id,
+                state.position + Vec3::new(0.0, EYE_HEIGHT, 0.0),
+                aim_forward(state.yaw, state.pitch),
+            )
+        })
+        .collect();
+    if shooters.is_empty() {
+        return;
+    }
+
+    let targets: Vec<(u64, Vec3)> = world
+        .query::<&PlayerState>()
+        .iter()
+        .filter(|state| state.health > 0)
+        .map(|state| (state.id, state.position))
+        .collect();
+
+    let mut events: Vec<GameEvent> = Vec::new();
+    let mut fired: Vec<u64> = Vec::new();
+    let mut hits: Vec<(u64, u64, u16)> = Vec::new(); // (жертва, стрелок, урон)
+
+    {
+        let physics = world.get_resource::<PhysicsWorld>();
+        for (shooter, origin, dir) in &shooters {
+            fired.push(*shooter);
+            events.push(GameEvent::Shot {
+                shooter: *shooter,
+                origin: origin.to_array(),
+                dir: dir.to_array(),
+            });
+
+            let wall =
+                physics.and_then(|physics| physics.cast_ray_glam(*origin, *dir, RIFLE_RANGE));
+            let mut closest: Option<(f32, u64, Vec3)> = None;
+            for (victim, feet) in &targets {
+                if victim == shooter {
+                    continue;
+                }
+                if let Some(t) = ray_capsule(*feet, *origin, *dir, RIFLE_RANGE) {
+                    if closest.is_none_or(|(best, _, _)| t < best) {
+                        closest = Some((t, *victim, *feet));
+                    }
+                }
+            }
+
+            // Стена ближе цели — выстрел уходит в неё.
+            let blocked = match (closest, wall) {
+                (Some((t, _, _)), Some(wall_toi)) => wall_toi <= t,
+                _ => false,
+            };
+            if blocked {
+                continue;
+            }
+            if let Some((t, victim, feet)) = closest {
+                let hit_point = *origin + *dir * t;
+                hits.push((victim, *shooter, zone_damage(hit_point.y - feet.y)));
+            }
+        }
+    }
+
+    // Фаза 2: кулдаун, урон, смерти (мутабельные заимствования).
+    let mut deaths: Vec<(u64, u64)> = Vec::new(); // (жертва, убийца)
+    {
+        let mut query = world.query::<&mut PlayerState>();
+        for state in query.iter() {
+            if fired.contains(&state.id) {
+                state.next_fire_tick = tick + FIRE_INTERVAL_TICKS;
+            }
+            for (_, killer, damage) in hits.iter().filter(|(victim, _, _)| *victim == state.id) {
+                if state.health == 0 {
+                    // Добивание в том же тике смертью не считается.
+                    continue;
+                }
+                state.health = state.health.saturating_sub(*damage);
+                if state.health == 0 {
+                    state.velocity = Vec3::ZERO;
+                    state.sprinting = false;
+                    state.firing = false;
+                    state.respawn_at = tick + RESPAWN_DELAY_TICKS;
+                    deaths.push((state.id, *killer));
+                }
+            }
+        }
+    }
+
+    for (victim, killer) in deaths {
+        events.push(GameEvent::Death {
+            victim,
+            victim_name: String::new(),
+            killer,
+            killer_name: String::new(),
+        });
+    }
+
+    if let Some(queue) = world.get_resource_mut::<CombatEvents>() {
+        queue.0.extend(events);
+    }
+}
+
+/// Респавн: через `RESPAWN_DELAY_TICKS` после смерти — полное здоровье и точка
+/// спавна уровня.
+fn player_respawn(world: &mut World) {
+    let tick = world
+        .get_resource::<TickInfo>()
+        .map(|info| info.tick)
+        .unwrap_or(0);
+    let Some(spawn) = world.get_resource::<SpawnPoint>().copied() else {
+        return;
+    };
+
+    let mut query = world.query::<&mut PlayerState>();
+    for state in query.iter() {
+        if state.health == 0 && tick >= state.respawn_at {
+            state.position = spawn.position;
+            state.velocity = Vec3::ZERO;
+            state.yaw = spawn.yaw;
+            state.pitch = 0.0;
+            state.grounded = true;
+            state.sprinting = false;
+            state.firing = false;
+            state.health = MAX_HEALTH;
+            state.respawn_at = 0;
+            state.next_fire_tick = 0;
         }
     }
 }

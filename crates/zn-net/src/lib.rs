@@ -2,9 +2,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Версия протокола M3 — первая «сетевая» версия: handshake, input-пакеты с
-/// redundancy, персональные снапшоты, ping. Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Версия протокола. v2 — сетевое движение (M3): handshake, input-пакеты с
+/// redundancy, персональные снапшоты, ping; v3 — бой (M4a): здоровье в
+/// состояниях, события выстрелов/смертей. Несовпадение версий отвергается.
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -57,11 +58,36 @@ pub struct PlayerNetState {
     pub velocity: [f32; 3],
     pub yaw: f32,
     pub pitch: f32,
+    /// Здоровье (0 — мёртв до респавна; максимум — `zn_sim::MAX_HEALTH`).
+    pub health: u16,
     pub flags: u32,
 }
 
 pub const FLAG_GROUNDED: u32 = 1 << 0;
 pub const FLAG_SPRINTING: u32 = 1 << 1;
+/// Удержание огня: бит `ClientInput.buttons`; в `PlayerNetState.flags` не
+/// используется.
+pub const FLAG_FIRE: u32 = 1 << 2;
+
+/// События матча, накопленные между снапшотами: визуальная обратная связь и
+/// килл-фид. Игровая логика уже применена в симуляции — события нужны только
+/// для представления.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GameEvent {
+    /// Выстрел; клиенты рисуют трейсер и вспышку.
+    Shot {
+        shooter: u64,
+        origin: [f32; 3],
+        dir: [f32; 3],
+    },
+    /// Смерть игрока (имена заполняет серверная сессия).
+    Death {
+        victim: u64,
+        victim_name: String,
+        killer: u64,
+        killer_name: String,
+    },
+}
 
 /// Причина отказа в подключении (`ServerReject`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +136,8 @@ pub enum Message {
         /// Максимальный tick инпута, учтённого в этом снапшоте (reconciliation).
         acked_input_tick: u64,
         players: Vec<PlayerNetState>,
+        /// События с прошлого снапшота (выстрелы, смерти) — всем клиентам.
+        events: Vec<GameEvent>,
     },
     Pong {
         nonce: u32,

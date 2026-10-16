@@ -8,7 +8,7 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Instant;
 
 use zn_net::{
-    decode_message, encode_message, ClientInput, Message, PlayerNetState, RejectReason,
+    decode_message, encode_message, ClientInput, GameEvent, Message, PlayerNetState, RejectReason,
     CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL, PROTOCOL_VERSION,
 };
 
@@ -25,6 +25,8 @@ pub enum NetEvent {
         server_tick: u64,
         acked_input_tick: u64,
         players: Vec<PlayerNetState>,
+        /// События боя с прошлого снапшота (трейсеры, килл-фид).
+        events: Vec<GameEvent>,
     },
 }
 
@@ -243,6 +245,7 @@ impl NetClient {
                 server_tick,
                 acked_input_tick,
                 players,
+                events,
             } => {
                 if self.status != NetStatus::Connected {
                     return None;
@@ -252,6 +255,7 @@ impl NetClient {
                     server_tick,
                     acked_input_tick,
                     players,
+                    events,
                 })
             }
             Message::Pong { nonce, .. } => {
@@ -492,6 +496,7 @@ mod tests {
                 server_tick: 30,
                 acked_input_tick: 12,
                 players: vec![],
+                events: vec![],
             },
         );
         let events = client.poll(silent);
@@ -501,6 +506,7 @@ mod tests {
                 server_tick: 30,
                 acked_input_tick: 12,
                 players: vec![],
+                events: vec![],
             }]
         );
         assert!(!client.timed_out(silent));

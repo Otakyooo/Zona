@@ -233,6 +233,26 @@ impl PhysicsWorld {
             .is_some()
     }
 
+    /// Луч в произвольном направлении (единичный вектор): дистанция до первого
+    /// статического коллайдера. Broad-phase обновляется в движении игроков
+    /// (`move_players`), бой вызывается после него — луч видит стены.
+    pub fn cast_ray(&self, origin: Vector, dir: Vector, max_distance: f32) -> Option<f32> {
+        let ray = Ray::new(origin, dir);
+        self.query_pipeline()
+            .cast_ray(&ray, max_distance, true)
+            .map(|(_, toi)| toi)
+    }
+
+    /// Луч в glam-координатах (обёртка для симуляции, чтобы не тянуть
+    /// rapier-типы в `zn-sim`): `dir` — единичный вектор.
+    pub fn cast_ray_glam(&self, origin: GlamVec3, dir: GlamVec3, max_distance: f32) -> Option<f32> {
+        self.cast_ray(
+            Vector::new(origin.x, origin.y, origin.z),
+            Vector::new(dir.x, dir.y, dir.z),
+            max_distance,
+        )
+    }
+
     pub fn move_character(&mut self, origin: Vector, desired_translation: Vector) -> CharacterMove {
         let Self {
             integration_parameters,

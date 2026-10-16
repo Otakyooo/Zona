@@ -4,8 +4,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use zn_net::{
-    check_client_hello, decode_message, encode_message, ClientInput, Message, RejectReason,
-    INPUT_REDUNDANCY, MAX_NAME_LEN, SERVER_TIMEOUT, SIMULATION_HZ, SNAPSHOT_HZ,
+    check_client_hello, decode_message, encode_message, ClientInput, GameEvent, Message,
+    RejectReason, INPUT_REDUNDANCY, MAX_NAME_LEN, SERVER_TIMEOUT, SIMULATION_HZ, SNAPSHOT_HZ,
 };
 use zn_scene::Scene;
 use zn_sim::Simulation;
@@ -333,6 +333,8 @@ impl Session {
     fn send_snapshots(&mut self) {
         let players = self.simulation.snapshot();
         let server_tick = self.simulation.tick();
+        let events = self.simulation.take_events();
+        let events = self.enrich_events(events);
         let addrs: Vec<SocketAddr> = self.clients.keys().copied().collect();
         for addr in addrs {
             let Some(client) = self.clients.get(&addr) else {
@@ -349,9 +351,32 @@ impl Session {
                     server_tick,
                     acked_input_tick,
                     players: players.clone(),
+                    events: events.clone(),
                 },
             );
         }
+    }
+
+    /// Подставляет имена в события смертей: симуляция знает только id, а
+    /// клиентам нужен килл-фид.
+    fn enrich_events(&self, events: Vec<GameEvent>) -> Vec<GameEvent> {
+        let names: HashMap<u64, &str> = self
+            .clients
+            .values()
+            .map(|client| (client.player_id, client.name.as_str()))
+            .collect();
+        events
+            .into_iter()
+            .map(|event| match event {
+                GameEvent::Death { victim, killer, .. } => GameEvent::Death {
+                    victim,
+                    victim_name: names.get(&victim).unwrap_or(&"").to_string(),
+                    killer,
+                    killer_name: names.get(&killer).unwrap_or(&"").to_string(),
+                },
+                other => other,
+            })
+            .collect()
     }
 
     fn check_timeouts(&mut self) {

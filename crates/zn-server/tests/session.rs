@@ -6,8 +6,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use zn_net::{
-    decode_message, encode_message, ClientInput, Message, PlayerNetState, RejectReason,
-    FLAG_GROUNDED, PROTOCOL_VERSION,
+    decode_message, encode_message, ClientInput, GameEvent, Message, PlayerNetState, RejectReason,
+    FLAG_FIRE, FLAG_GROUNDED, PROTOCOL_VERSION,
 };
 use zn_scene::Scene;
 use zn_server::{Session, SessionConfig};
@@ -54,6 +54,7 @@ impl TestClient {
                 server_tick,
                 acked_input_tick,
                 players,
+                ..
             } = message
             {
                 last = Some((server_tick, acked_input_tick, players));
@@ -410,4 +411,70 @@ fn snapshots_contain_both_players_and_positions_converge() {
             (left[0] - right[0]).abs() + (left[1] - right[1]).abs() + (left[2] - right[2]).abs();
         assert!(delta < 0.5, "позиции разошлись: {left:?} vs {right:?}");
     }
+}
+
+#[test]
+fn shooting_replicates_events_and_named_death() {
+    let (mut session, addr) = test_session(10);
+    let shooter = TestClient::connect(addr);
+    let victim = TestClient::connect(addr);
+    let hash = Scene::demo_zone().content_hash();
+
+    shooter.hello(hash);
+    let shooter_id = expect_welcome(&mut session, &shooter);
+    victim.hello(hash);
+    let victim_id = expect_welcome(&mut session, &victim);
+    assert_ne!(shooter_id, victim_id);
+
+    // Оба стоят на спавне уровня (капсулы в одной точке), стрелок удерживает
+    // огонь. Выстрел из глаз проходит «сквозь» капсулу жертвы и попадает в
+    // зону головы — двух попаданий достаточно.
+    let mut next_tick = 0u64;
+    let mut saw_shot = false;
+    let mut death: Option<(u64, u64, String, String)> = None;
+
+    for _ in 0..30 {
+        let inputs: Vec<ClientInput> = (0..2)
+            .map(|_| {
+                let mut input = ClientInput::new(next_tick);
+                input.buttons = FLAG_FIRE;
+                next_tick += 1;
+                input
+            })
+            .collect();
+        shooter.send(&Message::InputPacket { inputs });
+        session.poll(Duration::from_millis(33));
+
+        while let Some(message) = shooter.try_recv() {
+            if let Message::Snapshot { events, .. } = message {
+                for event in events {
+                    match event {
+                        GameEvent::Shot { shooter: id, .. } if id == shooter_id => {
+                            saw_shot = true;
+                        }
+                        GameEvent::Death {
+                            victim,
+                            victim_name,
+                            killer,
+                            killer_name,
+                        } => death = Some((victim, killer, victim_name, killer_name)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        std::thread::yield_now();
+        if death.is_some() {
+            break;
+        }
+    }
+
+    assert!(saw_shot, "события Shot должны доезжать в снапшотах");
+    let (seen_victim, seen_killer, victim_name, killer_name) =
+        death.expect("цель должна погибнуть от попаданий");
+    assert_eq!(seen_victim, victim_id);
+    assert_eq!(seen_killer, shooter_id);
+    // Имена подставляет серверная сессия (знает таблицу клиентов).
+    assert_eq!(victim_name, "Тестер");
+    assert_eq!(killer_name, "Тестер");
 }

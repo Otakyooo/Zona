@@ -236,6 +236,64 @@ fn rebuild_static_equivalent_to_initial_build() {
 }
 
 #[test]
+fn cast_ray_hits_static_box_and_respects_range() {
+    let world = world_with_ground();
+
+    // Луч вниз из точки над полом упирается в верхнюю грань (y = 0.5).
+    let toi = world
+        .cast_ray(
+            Vector::new(0.0, 5.0, 0.0),
+            Vector::new(0.0, -1.0, 0.0),
+            10.0,
+        )
+        .expect("луч должен попасть в пол");
+    assert!((toi - 4.5).abs() < 0.01, "toi = {toi}");
+
+    // В сторону — пусто.
+    assert!(world
+        .cast_ray(Vector::new(0.0, 5.0, 0.0), Vector::new(1.0, 0.0, 0.0), 10.0,)
+        .is_none());
+
+    // Пол ближе, чем max_distance — попадания нет.
+    assert!(world
+        .cast_ray(Vector::new(0.0, 5.0, 0.0), Vector::new(0.0, -1.0, 0.0), 1.0,)
+        .is_none());
+}
+
+#[test]
+fn cast_ray_sees_scene_colliders_and_clear_static_opens_path() {
+    let mut world = PhysicsWorld::default();
+    let object = SceneObject::new(
+        glam::Vec3::new(2.0, 1.0, 0.0),
+        glam::Vec3::new(1.0, 2.0, 1.0),
+        glam::Vec4::ONE,
+    );
+    world.add_scene_object(&object);
+    world.step_dynamic_bodies();
+
+    // Ближняя грань бокса на x = 1.5 (центр 2.0, полуразмер 0.5).
+    let toi = world
+        .cast_ray(
+            Vector::new(0.0, 1.0, 0.0),
+            Vector::new(1.0, 0.0, 0.0),
+            100.0,
+        )
+        .expect("луч должен попасть в объект сцены");
+    assert!((toi - 1.5).abs() < 0.01, "toi = {toi}");
+
+    // Пересборка без объекта — путь свободен.
+    world.clear_static();
+    world.step_dynamic_bodies();
+    assert!(world
+        .cast_ray(
+            Vector::new(0.0, 1.0, 0.0),
+            Vector::new(1.0, 0.0, 0.0),
+            100.0
+        )
+        .is_none());
+}
+
+#[test]
 fn glam_adapters_land_on_box_and_report_feet() {
     let mut world = PhysicsWorld::with_gravity_y(-9.81, DT);
     world.add_static_box_glam(glam::Vec3::new(10.0, 0.5, 10.0), glam::Vec3::ZERO);

@@ -486,6 +486,8 @@ impl ClientApp {
                     server_tick,
                     acked_input_tick,
                     players,
+                    // Визуал событий боя — следующий коммит M4a.
+                    events: _,
                 } => self.apply_snapshot(server_tick, acked_input_tick, &players),
             }
         }
@@ -856,6 +858,7 @@ mod tests {
             velocity: [0.0; 3],
             yaw: predicted.yaw,
             pitch: 0.0,
+            health: zn_sim::MAX_HEALTH,
             flags: 0,
         };
         let other = PlayerNetState {
@@ -864,6 +867,7 @@ mod tests {
             velocity: [0.0; 3],
             yaw: 0.5,
             pitch: 0.0,
+            health: zn_sim::MAX_HEALTH,
             flags: 0,
         };
         app.apply_snapshot(100, last_tick, &[me, other]);

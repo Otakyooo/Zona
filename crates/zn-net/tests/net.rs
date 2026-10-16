@@ -7,6 +7,7 @@ fn state(player_id: u64) -> PlayerNetState {
         velocity: [0.0, -1.5, 4.0],
         yaw: 0.5,
         pitch: -0.25,
+        health: 100,
         flags: FLAG_GROUNDED,
     }
 }
@@ -66,6 +67,19 @@ fn all_message_variants_roundtrip_through_bincode() {
             server_tick: 50,
             acked_input_tick: 44,
             players: vec![state(1), state(2)],
+            events: vec![
+                GameEvent::Shot {
+                    shooter: 1,
+                    origin: [0.0, 1.62, 0.0],
+                    dir: [1.0, 0.0, 0.0],
+                },
+                GameEvent::Death {
+                    victim: 2,
+                    victim_name: "Жертва".to_string(),
+                    killer: 1,
+                    killer_name: "Сталкер".to_string(),
+                },
+            ],
         },
         Message::Pong {
             nonce: 9,
@@ -120,6 +134,20 @@ fn full_snapshot_fits_udp_mtu() {
         server_tick: 1000,
         acked_input_tick: 999,
         players,
+        // Худший реалистичный случай: снапшот с событиями, имена — кириллица.
+        events: vec![
+            GameEvent::Shot {
+                shooter: 3,
+                origin: [0.0, 1.62, 14.0],
+                dir: [1.0, 0.0, 0.0],
+            },
+            GameEvent::Death {
+                victim: 5,
+                victim_name: "Охотник".to_string(),
+                killer: 3,
+                killer_name: "Сталкер".to_string(),
+            },
+        ],
     };
     let bytes = encode_message(&message).unwrap();
     assert!(
@@ -132,7 +160,7 @@ fn full_snapshot_fits_udp_mtu() {
 
 #[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 3);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);

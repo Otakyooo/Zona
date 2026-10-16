@@ -162,6 +162,7 @@ mod tests {
             velocity: [0.0; 3],
             yaw,
             pitch: 0.0,
+            health: zn_sim::MAX_HEALTH,
             flags: 0,
         }
     }

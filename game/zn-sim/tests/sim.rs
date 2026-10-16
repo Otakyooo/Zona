@@ -1,9 +1,12 @@
 use std::time::Duration;
 
 use glam::Vec3;
-use zn_net::ClientInput;
+use zn_net::{ClientInput, GameEvent};
 use zn_scene::{Scene, SceneObject};
-use zn_sim::{Simulation, FLAG_SPRINTING};
+use zn_sim::{
+    aim_forward, zone_damage, Simulation, EYE_HEIGHT, FLAG_FIRE, FLAG_SPRINTING, MAX_HEALTH,
+    ZONE_HEAD_MIN, ZONE_TORSO_MIN,
+};
 
 const SIM_STEPS: u64 = 60;
 
@@ -299,4 +302,182 @@ fn despawn_removes_player_and_inputs() {
     assert_eq!(sim.player_count(), 0);
     assert_eq!(sim.last_input_tick(id), None);
     assert!(!sim.despawn_player(id));
+}
+
+// ── Бой (M4a) ───────────────────────────────────────────────────────────
+
+/// Инпут с удержанием огня.
+fn fire_input(tick: u64) -> ClientInput {
+    ClientInput {
+        tick,
+        buttons: FLAG_FIRE,
+        ..ClientInput::default()
+    }
+}
+
+/// Один выстрел стрелка (`shooter_x`, yaw = 0 → +X) с прицелом на высоту
+/// `hit_height` цели на дистанции. Возвращает здоровье цели после выстрела.
+fn health_after_one_shot(shooter_x: f32, target_x: f32, hit_height: f32) -> u16 {
+    let mut sim = Simulation::new();
+    let shooter = sim.spawn_player(Vec3::new(shooter_x, 0.0, 0.0));
+    let target = sim.spawn_player(Vec3::new(target_x, 0.0, 0.0));
+    let mut command = fire_input(0);
+    command.pitch_delta = (hit_height - EYE_HEIGHT).atan2(target_x - shooter_x);
+    sim.queue_input(shooter, command);
+    sim.step_once();
+    sim.player_state(target).unwrap().health
+}
+
+#[test]
+fn zone_damage_boundaries() {
+    assert_eq!(zone_damage(ZONE_HEAD_MIN + 0.05), 50);
+    assert_eq!(zone_damage(ZONE_TORSO_MIN + 0.05), 25);
+    assert_eq!(zone_damage(ZONE_TORSO_MIN - 0.05), 15);
+}
+
+#[test]
+fn damage_zones_head_torso_legs() {
+    // Голова ×2 → 50, торс ×1 → 25, ноги ×0.6 → 15.
+    assert_eq!(health_after_one_shot(-5.0, 5.0, 1.65), MAX_HEALTH - 50);
+    assert_eq!(health_after_one_shot(-5.0, 5.0, 1.15), MAX_HEALTH - 25);
+    assert_eq!(health_after_one_shot(-5.0, 5.0, 0.4), MAX_HEALTH - 15);
+}
+
+#[test]
+fn torso_shots_kill_and_respawn_at_spawn() {
+    let mut sim = Simulation::new();
+    let shooter = sim.spawn_player(Vec3::new(-5.0, 0.0, 0.0));
+    let target = sim.spawn_player(Vec3::new(5.0, 0.0, 0.0));
+
+    // Первый выстрел — в торс.
+    let mut command = fire_input(0);
+    command.pitch_delta = (1.15 - EYE_HEIGHT).atan2(10.0);
+    sim.queue_input(shooter, command);
+    sim.step_once();
+
+    assert_eq!(
+        sim.player_state(target).unwrap().health,
+        MAX_HEALTH - 25,
+        "первый выстрел в торс — 25 урона"
+    );
+    let events = sim.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, GameEvent::Shot { shooter: id, .. } if *id == shooter)),
+        "событие Shot потерялось: {events:?}"
+    );
+
+    // Удержание огня: выстрелы на тиках 8/16/24 — цель умирает.
+    for tick in 1..30u64 {
+        sim.queue_input(shooter, fire_input(tick));
+        sim.step_once();
+    }
+    let dead = sim.player_state(target).unwrap();
+    assert_eq!(dead.health, 0, "четыре торс-попадания должны убивать");
+
+    let death_events = sim.take_events();
+    assert!(
+        death_events.iter().any(|event| matches!(
+            event,
+            GameEvent::Death { victim, killer, .. }
+                if *victim == target && *killer == shooter
+        )),
+        "событие Death потерялось: {death_events:?}"
+    );
+
+    // Мёртвый заморожен: инпуты движения не действуют.
+    let frozen = dead.position;
+    for tick in 30..60u64 {
+        sim.queue_input(shooter, input(tick, 0.0, 0.0, false)); // прекратить огонь
+        sim.queue_input(target, input(tick, 1.0, 0.0, false));
+        sim.step_once();
+    }
+    let still = sim.player_state(target).unwrap();
+    assert_eq!(still.health, 0);
+    assert_eq!(still.position, frozen, "мёртвый не должен двигаться");
+
+    // Через 3 с (180 тиков) после смерти — респавн на точке спавна уровня.
+    while sim.tick() <= 24 + 180 {
+        sim.queue_input(target, input(sim.tick(), 0.0, 0.0, false));
+        sim.step_once();
+    }
+    let respawned = sim.player_state(target).unwrap();
+    assert_eq!(respawned.health, MAX_HEALTH, "респавн возвращает здоровье");
+    assert!(
+        (respawned.position - Vec3::ZERO).length() < 1e-3,
+        "респавн должен быть на точке спавна: {:?}",
+        respawned.position
+    );
+}
+
+#[test]
+fn wall_blocks_bullet() {
+    let mut scene = Scene::new("combat-wall");
+    scene.spawn = Vec3::ZERO;
+    scene.add(SceneObject::new(
+        Vec3::new(0.0, -0.5, 0.0),
+        Vec3::new(30.0, 1.0, 30.0),
+        glam::Vec4::ONE,
+    ));
+    // Стена между стрелком и целью.
+    scene.add(SceneObject::new(
+        Vec3::new(0.0, 1.5, 0.0),
+        Vec3::new(1.0, 3.0, 4.0),
+        glam::Vec4::ONE,
+    ));
+
+    let mut sim = Simulation::with_scene(&scene);
+    let shooter = sim.spawn_player(Vec3::new(-5.0, 0.0, 0.0));
+    let target = sim.spawn_player(Vec3::new(5.0, 0.0, 0.0));
+
+    let mut command = fire_input(0);
+    command.pitch_delta = (1.15 - EYE_HEIGHT).atan2(10.0);
+    sim.queue_input(shooter, command);
+    for tick in 1..10u64 {
+        sim.queue_input(shooter, fire_input(tick));
+        sim.step_once();
+    }
+
+    assert_eq!(
+        sim.player_state(target).unwrap().health,
+        MAX_HEALTH,
+        "стена должна блокировать выстрел"
+    );
+    let events = sim.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, GameEvent::Shot { .. })),
+        "выстрел в стену всё равно должен быть виден: {events:?}"
+    );
+}
+
+#[test]
+fn fire_rate_is_limited() {
+    let mut sim = Simulation::new();
+    let shooter = sim.spawn_player(Vec3::ZERO);
+    for tick in 0..25u64 {
+        sim.queue_input(shooter, fire_input(tick));
+        sim.step_once();
+    }
+    let shots = sim
+        .take_events()
+        .iter()
+        .filter(|event| matches!(event, GameEvent::Shot { .. }))
+        .count();
+    // 25 тиков удержания — выстрелы только на тиках 0, 8, 16, 24.
+    assert_eq!(shots, 4, "авто-огонь должен ограничиваться кулдауном");
+}
+
+#[test]
+fn aim_forward_matches_camera_convention() {
+    let forward = aim_forward(0.0, 0.0);
+    assert!((forward - Vec3::X).length() < 1e-5, "{forward:?}");
+
+    // Положительный pitch — вверх; yaw = +90° переводит прицел на +Z
+    // (экранное «вправо», как в zn-render).
+    assert!(aim_forward(0.0, 0.5).y > 0.4, "pitch вверх");
+    let right = aim_forward(std::f32::consts::FRAC_PI_2, 0.0);
+    assert!((right - Vec3::Z).length() < 1e-5, "{right:?}");
 }
