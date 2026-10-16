@@ -19,6 +19,7 @@ winit = { workspace = true }
 zn-assets = { path = "../zn-assets" }
 zn-core = { path = "../zn-core" }
 zn-input = { path = "../zn-input" }
+zn-net = { path = "../zn-net" }
 zn-physics = { path = "../zn-physics" }
 zn-render = { path = "../zn-render" }
 zn-scene = { path = "../zn-scene" }

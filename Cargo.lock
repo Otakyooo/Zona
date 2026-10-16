@@ -5001,6 +5001,7 @@ dependencies = [
  "zn-assets",
  "zn-core",
  "zn-input",
+ "zn-net",
  "zn-physics",
  "zn-render",
  "zn-scene",
