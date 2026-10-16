@@ -51,6 +51,8 @@ pub struct NetClient {
     rtt_ms: Option<f32>,
     next_nonce: u32,
     last_sent_tick: Option<u64>,
+    /// Уже сообщали в лог, что сервер не отвечает (серия UDP-сбросов).
+    server_unreachable: bool,
 }
 
 impl NetClient {
@@ -76,6 +78,7 @@ impl NetClient {
             rtt_ms: None,
             next_nonce: 1,
             last_sent_tick: None,
+            server_unreachable: false,
         })
     }
 
@@ -166,15 +169,40 @@ impl NetClient {
         let mut buf = [0u8; 2048];
         loop {
             match self.socket.recv(&mut buf) {
-                Ok(len) => match decode_message::<Message>(&buf[..len]) {
-                    Ok(message) => {
-                        if let Some(event) = self.handle_message(message, now) {
-                            events.push(event);
+                Ok(len) => {
+                    // Сервер снова отвечает — серия сбросов прервана.
+                    self.server_unreachable = false;
+                    match decode_message::<Message>(&buf[..len]) {
+                        Ok(message) => {
+                            if let Some(event) = self.handle_message(message, now) {
+                                events.push(event);
+                            }
+                        }
+                        Err(error) => {
+                            log::debug!("пакет от {} не декодирован: {error}", self.server);
                         }
                     }
-                    Err(error) => log::debug!("пакет от {} не декодирован: {error}", self.server),
-                },
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    // ICMP «порт недоступен» после падения сервера: на Windows
+                    // это WSAECONNRESET на каждый кадр, на Linux — ECONNREFUSED.
+                    // Канал не сломан, связь оборвёт обычный таймаут снапшотов,
+                    // поэтому пишем в лог один раз на серию ошибок.
+                    if !self.server_unreachable {
+                        self.server_unreachable = true;
+                        log::debug!(
+                            "сервер {} не отвечает (UDP-сброс); ждём таймаут связи",
+                            self.server
+                        );
+                    }
+                    break;
+                }
                 Err(error) => {
                     log::debug!("recv от {}: {error}", self.server);
                     break;
