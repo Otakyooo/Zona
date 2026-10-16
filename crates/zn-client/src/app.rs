@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use egui_wgpu::ScreenDescriptor;
 use glam::{Mat4, Quat, Vec3, Vec4};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -9,7 +10,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowId};
 
-use zn_core::FixedStep;
+use zn_core::{FixedStep, SIMULATION_HZ};
 use zn_input::InputState;
 use zn_net::{GameEvent, PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY};
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
@@ -18,7 +19,8 @@ use zn_render::{
 };
 use zn_scene::{Scene, SceneObject};
 use zn_sim::{
-    ClientInput, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING, RIFLE_RANGE,
+    ClientInput, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING, MAX_HEALTH,
+    RESPAWN_DELAY_TICKS, RIFLE_RANGE,
 };
 
 use crate::assets::{AssetEvent, AssetLoader};
@@ -44,6 +46,10 @@ const FLASH_SIZE: f32 = 0.12;
 const MUZZLE_OFFSET: f32 = 0.45;
 const TRACER_COLOR: Vec4 = Vec4::new(1.0, 0.92, 0.6, 1.0);
 const FLASH_COLOR: Vec4 = Vec4::new(1.0, 0.8, 0.4, 1.0);
+
+/// Kill-фид: сколько строк показывать и сколько живёт строка.
+const KILL_FEED_MAX: usize = 3;
+const KILL_FEED_TTL: Duration = Duration::from_secs(4);
 
 /// Масштаб unit-капсулы (радиус 0.5, полная высота 2.0) под капсулу игрока
 /// (`PLAYER_RADIUS` 0.3, полувысота `PLAYER_HALF_HEIGHT` 0.6).
@@ -86,6 +92,27 @@ struct MuzzleFlash {
     until: Instant,
 }
 
+/// Строка kill-фида: текст и время жизни.
+#[derive(Debug)]
+struct KillFeedEntry {
+    text: String,
+    until: Instant,
+}
+
+/// Срез состояния для отрисовки HUD (собирается до заимствования renderer).
+struct HudData {
+    health: u16,
+    max_health: u16,
+    /// Имя убийцы — только когда локальный игрок мёртв.
+    killer: Option<String>,
+    /// Секунд до возрождения — только когда локальный игрок мёртв.
+    respawn_secs: Option<f32>,
+    /// Строки kill-фида: текст и альфа (1 — свежая, 0 — угасла).
+    feed: Vec<(String, f32)>,
+    /// Секунды с запуска клиента — время для egui.
+    time: f64,
+}
+
 pub struct ClientApp {
     renderer: Option<Renderer>,
     input: InputState,
@@ -120,6 +147,19 @@ pub struct ClientApp {
     flashes: Vec<MuzzleFlash>,
     /// Раньше этого клиентского тика локальный отклик огня не повторяется.
     next_local_fire_tick: u64,
+    /// Контекст egui и рендерер HUD (создаётся в `resumed`, как у редактора).
+    egui_ctx: egui::Context,
+    ui_renderer: Option<egui_wgpu::Renderer>,
+    /// Начало работы клиента — время для egui.
+    started: Instant,
+    /// Последний серверный тик (из снапшотов) — отсчёт респавна.
+    last_server_tick: u64,
+    /// Серверный тик ожидаемого респавна локального игрока (экран смерти).
+    my_respawn_tick: Option<u64>,
+    /// Имя убийцы локального игрока — для экрана смерти.
+    my_killer: Option<String>,
+    /// Последние смерти — строки kill-фида.
+    kill_feed: Vec<KillFeedEntry>,
     builtin_mesh_ids: HashMap<String, MeshId>,
     cursor_grabbed: bool,
     fixed: FixedStep,
@@ -210,6 +250,13 @@ impl ClientApp {
             tracers: Vec::new(),
             flashes: Vec::new(),
             next_local_fire_tick: 0,
+            egui_ctx: egui::Context::default(),
+            ui_renderer: None,
+            started: Instant::now(),
+            last_server_tick: 0,
+            my_respawn_tick: None,
+            my_killer: None,
+            kill_feed: Vec::new(),
             builtin_mesh_ids: HashMap::new(),
             cursor_grabbed: false,
             fixed: FixedStep::from_hz(60),
@@ -568,38 +615,58 @@ impl ClientApp {
         });
     }
 
-    /// Чужие выстрелы из событий снапшота: трейсер и вспышка. Свои выстрелы
-    /// уже показаны локальным откликом (событие своего shot пропускается).
-    fn handle_shot_events(&mut self, events: &[GameEvent], now: Instant) {
+    /// События боя из снапшота: чужие выстрелы (трейсер и вспышка) и смерти
+    /// (kill-фид и экран смерти). Свои выстрелы уже показаны локальным
+    /// откликом — событие своего shot пропускается.
+    fn handle_combat_events(&mut self, events: &[GameEvent], now: Instant) {
         for event in events {
-            let GameEvent::Shot {
-                shooter,
-                origin,
-                dir,
-            } = event
-            else {
-                continue;
-            };
-            if Some(*shooter) == self.net_player_id {
-                continue;
+            match event {
+                GameEvent::Shot {
+                    shooter,
+                    origin,
+                    dir,
+                } => {
+                    if Some(*shooter) == self.net_player_id {
+                        continue;
+                    }
+                    let origin = Vec3::from_array(*origin);
+                    let Some(dir) = Vec3::from_array(*dir).try_normalize() else {
+                        continue;
+                    };
+                    let end = self
+                        .simulation
+                        .cast_ray(origin, dir, RIFLE_RANGE)
+                        .unwrap_or(origin + dir * RIFLE_RANGE);
+                    self.flashes.push(MuzzleFlash {
+                        at: origin + dir * MUZZLE_OFFSET,
+                        until: now + FLASH_TTL,
+                    });
+                    self.tracers.push(Tracer {
+                        from: origin,
+                        to: end,
+                        until: now + TRACER_TTL,
+                    });
+                }
+                GameEvent::Death {
+                    victim,
+                    victim_name,
+                    killer,
+                    killer_name,
+                } => {
+                    let victim_text = side_name(*victim, victim_name, self.net_player_id);
+                    let killer_text = side_name(*killer, killer_name, self.net_player_id);
+                    self.kill_feed.push(KillFeedEntry {
+                        text: format!("{killer_text} → {victim_text}"),
+                        until: now + KILL_FEED_TTL,
+                    });
+                    while self.kill_feed.len() > KILL_FEED_MAX {
+                        self.kill_feed.remove(0);
+                    }
+                    if Some(*victim) == self.net_player_id {
+                        self.my_killer = Some(killer_text);
+                    }
+                }
             }
-            let origin = Vec3::from_array(*origin);
-            let Some(dir) = Vec3::from_array(*dir).try_normalize() else {
-                continue;
-            };
-            let end = self
-                .simulation
-                .cast_ray(origin, dir, RIFLE_RANGE)
-                .unwrap_or(origin + dir * RIFLE_RANGE);
-            self.flashes.push(MuzzleFlash {
-                at: origin + dir * MUZZLE_OFFSET,
-                until: now + FLASH_TTL,
-            });
-            self.tracers.push(Tracer {
-                from: origin,
-                to: end,
-                until: now + TRACER_TTL,
-            });
         }
     }
 
@@ -692,7 +759,22 @@ impl ClientApp {
         events: &[GameEvent],
         now: Instant,
     ) {
-        self.handle_shot_events(events, now);
+        self.handle_combat_events(events, now);
+        self.last_server_tick = server_tick;
+        // Переход жив↔мёртв локального игрока: серверный дедлайн респавна
+        // для экрана смерти; при возрождении сбрасывается.
+        match players
+            .iter()
+            .find(|state| Some(state.player_id) == self.net_player_id)
+            .map(|state| state.health)
+        {
+            Some(0) => {
+                self.my_respawn_tick
+                    .get_or_insert(server_tick + RESPAWN_DELAY_TICKS);
+            }
+            Some(_) => self.my_respawn_tick = None,
+            None => {}
+        }
 
         // Удалённые игроки рисуются с задержкой 100 мс (нужна пара снапшотов
         // вокруг рендер-тика); время рендера назад не идёт.
@@ -744,6 +826,55 @@ impl ClientApp {
         );
     }
 
+    /// Срез состояния HUD: HP, экран смерти, kill-фид. Собирается до
+    /// заимствования рендерера; здесь же чистятся угасшие строки фида.
+    fn collect_hud_data(&mut self) -> HudData {
+        let health = self
+            .simulation
+            .player_state(self.player_id)
+            .map(|state| state.health)
+            .unwrap_or(MAX_HEALTH);
+        if health > 0 {
+            // Живой: экран смерти и его отсчёт сбрасываются.
+            self.my_killer = None;
+            self.my_respawn_tick = None;
+        }
+        let respawn_secs = self
+            .my_respawn_tick
+            .map(|tick| tick.saturating_sub(self.last_server_tick) as f32 / SIMULATION_HZ as f32);
+
+        let now = Instant::now();
+        self.kill_feed.retain(|entry| entry.until > now);
+        let feed = self
+            .kill_feed
+            .iter()
+            .map(|entry| {
+                let left = entry.until.saturating_duration_since(now).as_secs_f32();
+                (
+                    entry.text.clone(),
+                    (left / KILL_FEED_TTL.as_secs_f32()).clamp(0.0, 1.0),
+                )
+            })
+            .collect();
+
+        HudData {
+            health,
+            max_health: MAX_HEALTH,
+            killer: if health == 0 {
+                Some(
+                    self.my_killer
+                        .clone()
+                        .unwrap_or_else(|| "неизвестно".to_string()),
+                )
+            } else {
+                None
+            },
+            respawn_secs: if health == 0 { respawn_secs } else { None },
+            feed,
+            time: self.started.elapsed().as_secs_f64(),
+        }
+    }
+
     /// Заголовок окна: режим связи и RTT (`ZONA — ping 42 ms`). Обновляется
     /// только при изменении, чтобы не дёргать ОС каждый кадр.
     fn update_window_title(&mut self) {
@@ -781,6 +912,20 @@ impl ApplicationHandler for ClientApp {
             return;
         }
         self.renderer = Some(Renderer::new(event_loop));
+        // HUD: egui-wgpu поверх сцены (msaa 1 — кадр без мультисэмплинга,
+        // depth не нужен: проход оверлея идёт без depth attach).
+        if let Some(renderer) = self.renderer.as_mut() {
+            self.egui_ctx
+                .set_pixels_per_point(renderer.window().scale_factor() as f32);
+            self.ui_renderer = Some(egui_wgpu::Renderer::new(
+                renderer.device(),
+                renderer.surface_format(),
+                egui_wgpu::RendererOptions {
+                    msaa_samples: 1,
+                    ..Default::default()
+                },
+            ));
+        }
         // Ассеты и draw list разрешаются через уже установленный renderer.
         self.register_loaded_assets();
         let list = self.build_frame_draw_list();
@@ -872,6 +1017,7 @@ impl ApplicationHandler for ClientApp {
                 // Поправка сервера гаснет после того, как кадр её применил.
                 self.smoother.decay(frame_delta.as_secs_f32());
                 let list = self.build_frame_draw_list();
+                let hud = self.collect_hud_data();
                 if let Some(renderer) = self.renderer.as_mut() {
                     // Ресурсы всех батчей помечаем использованными до кулинга:
                     // оффскрин-объекты не должны вытеснять видимые из LRU.
@@ -882,7 +1028,12 @@ impl ApplicationHandler for ClientApp {
                             .unwrap_or(zn_assets::Bounds::EMPTY)
                     });
                     renderer.update_draw_list(&DrawList { batches: visible });
-                    renderer.render(&self.camera);
+                    if let Some(ui_renderer) = self.ui_renderer.as_mut() {
+                        // HUD отдельным проходом поверх сцены (Load, без depth).
+                        render_hud(renderer, ui_renderer, &self.egui_ctx, &self.camera, &hud);
+                    } else {
+                        renderer.render(&self.camera);
+                    }
                 }
                 self.update_window_title();
             }
@@ -914,6 +1065,188 @@ impl ApplicationHandler for ClientApp {
 /// вверх (pitch+). Знаки закреплены тестом (см. также конвенцию осей в zn-sim).
 fn look_delta(dx: f32, dy: f32) -> (f32, f32) {
     (dx * LOOK_SENSITIVITY, -dy * LOOK_SENSITIVITY)
+}
+
+/// HUD поверх кадра: пассивный egui — RawInput без событий, весь ввод
+/// остаётся игре; `render_with` открывает проход оверлея (Load, без depth).
+fn render_hud(
+    renderer: &mut Renderer,
+    ui_renderer: &mut egui_wgpu::Renderer,
+    ctx: &egui::Context,
+    camera: &Camera,
+    hud: &HudData,
+) {
+    let size = renderer.surface_size();
+    let ppp = ctx.pixels_per_point();
+    let logical = egui::vec2(size.width as f32, size.height as f32) / ppp;
+    let raw_input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, logical)),
+        time: Some(hud.time),
+        ..Default::default()
+    };
+
+    ctx.begin_pass(raw_input);
+    draw_hud(ctx, hud);
+    let mut output = ctx.end_pass();
+    // Текстурные дельты egui (атлас шрифта) обязан потребить вызывающий.
+    let mut textures = std::mem::take(&mut output.textures_delta);
+    let clipped = ctx.tessellate(output.shapes, ppp);
+    let screen_descriptor = ScreenDescriptor {
+        size_in_pixels: [size.width, size.height],
+        pixels_per_point: ppp,
+    };
+
+    for (id, deltas) in textures.set.drain() {
+        for delta in deltas {
+            ui_renderer.update_texture(renderer.device(), renderer.queue(), id, &delta);
+        }
+    }
+    for id in textures.free.drain() {
+        ui_renderer.free_texture(&id);
+    }
+
+    let device = renderer.device().clone();
+    let queue = renderer.queue().clone();
+    // Аплоад буферов egui отдельным энкодером до кадра: рендер использует
+    // буферы уже этого кадра.
+    let mut upload = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("zn-client-ui-upload"),
+    });
+    let user_buffers =
+        ui_renderer.update_buffers(&device, &queue, &mut upload, &clipped, &screen_descriptor);
+    queue.submit(user_buffers.into_iter().chain([upload.finish()]));
+    renderer.render_with(camera, |pass| {
+        let mut pass = pass.forget_lifetime();
+        ui_renderer.render(&mut pass, &clipped, &screen_descriptor);
+    });
+}
+
+/// Разметка HUD: прицел, HP, kill-фид, экран смерти (пассивные примитивы).
+fn draw_hud(ctx: &egui::Context, hud: &HudData) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("hud"),
+    ));
+    let screen = ctx.viewport_rect();
+
+    // Прицел — только живому.
+    if hud.health > 0 {
+        let center = screen.center();
+        let stroke = (1.5, egui::Color32::from_white_alpha(220));
+        let (gap, len) = (4.0, 10.0);
+        for (from, to) in [
+            (
+                center - egui::vec2(gap + len, 0.0),
+                center - egui::vec2(gap, 0.0),
+            ),
+            (
+                center + egui::vec2(gap, 0.0),
+                center + egui::vec2(gap + len, 0.0),
+            ),
+            (
+                center - egui::vec2(0.0, gap + len),
+                center - egui::vec2(0.0, gap),
+            ),
+            (
+                center + egui::vec2(0.0, gap),
+                center + egui::vec2(0.0, gap + len),
+            ),
+        ] {
+            painter.line_segment([from, to], stroke);
+        }
+    }
+
+    // Kill-фид — правый верхний угол, свежие строки ярче.
+    let mut y = screen.top() + 12.0;
+    for (text, alpha) in &hud.feed {
+        let color = egui::Color32::from_rgba_unmultiplied(255, 235, 210, (alpha * 230.0) as u8);
+        painter.text(
+            egui::pos2(screen.right() - 14.0, y),
+            egui::Align2::RIGHT_TOP,
+            text,
+            egui::FontId::proportional(15.0),
+            color,
+        );
+        y += 20.0;
+    }
+
+    // HP — левый нижний угол: полоска и число.
+    let bar_pos = egui::pos2(screen.left() + 18.0, screen.bottom() - 38.0);
+    let bar_size = egui::vec2(220.0, 12.0);
+    let fraction = hud.health as f32 / hud.max_health.max(1) as f32;
+    painter.rect_filled(
+        egui::Rect::from_min_size(bar_pos, bar_size),
+        2.0,
+        egui::Color32::from_black_alpha(150),
+    );
+    let hp_color = if fraction > 0.5 {
+        egui::Color32::from_rgb(120, 200, 90)
+    } else if fraction > 0.25 {
+        egui::Color32::from_rgb(220, 180, 70)
+    } else {
+        egui::Color32::from_rgb(210, 80, 70)
+    };
+    painter.rect_filled(
+        egui::Rect::from_min_size(bar_pos, egui::vec2(bar_size.x * fraction, bar_size.y)),
+        2.0,
+        hp_color,
+    );
+    painter.text(
+        egui::pos2(bar_pos.x, bar_pos.y - 4.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("HP {}/{}", hud.health, hud.max_health),
+        egui::FontId::proportional(16.0),
+        egui::Color32::from_white_alpha(230),
+    );
+
+    // Экран смерти.
+    if hud.health == 0 {
+        let center = screen.center();
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(165));
+        painter.text(
+            center - egui::vec2(0.0, 36.0),
+            egui::Align2::CENTER_CENTER,
+            "ВЫ УБИТЫ",
+            egui::FontId::proportional(44.0),
+            egui::Color32::from_rgb(214, 78, 66),
+        );
+        painter.text(
+            center + egui::vec2(0.0, 4.0),
+            egui::Align2::CENTER_CENTER,
+            format!("убийца: {}", hud.killer.as_deref().unwrap_or("неизвестно")),
+            egui::FontId::proportional(20.0),
+            egui::Color32::from_white_alpha(235),
+        );
+        let respawn_text = match hud.respawn_secs {
+            Some(secs) => format!("возрождение через {:.1} с", secs.max(0.0)),
+            None => "возрождение…".to_string(),
+        };
+        painter.text(
+            center + egui::vec2(0.0, 36.0),
+            egui::Align2::CENTER_CENTER,
+            respawn_text,
+            egui::FontId::proportional(18.0),
+            egui::Color32::from_white_alpha(200),
+        );
+        painter.text(
+            center + egui::vec2(0.0, 72.0),
+            egui::Align2::CENTER_CENTER,
+            "мышь — осмотреться",
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_white_alpha(140),
+        );
+    }
+}
+
+/// Имя игрока для килл-фида: «Вы» для себя, иначе имя с сервера или `#id`.
+fn side_name(id: u64, name: &str, me: Option<u64>) -> String {
+    if Some(id) == me {
+        "Вы".to_string()
+    } else if name.is_empty() {
+        format!("#{id}")
+    } else {
+        name.to_string()
+    }
 }
 
 /// Извлекает слоты текстур материала из импортированного ассета.
@@ -1121,7 +1454,7 @@ mod tests {
         app.net_player_id = Some(7);
         let now = Instant::now();
 
-        app.handle_shot_events(
+        app.handle_combat_events(
             &[
                 GameEvent::Shot {
                     shooter: 8,
@@ -1146,16 +1479,80 @@ mod tests {
 
         assert_eq!(app.tracers.len(), 1, "только чужой выстрел даёт трейсер");
         assert_eq!(app.flashes.len(), 1);
-        // События смерти в коммите B не используются — не паникуем.
-        app.handle_shot_events(
+
+        // Смерть чужого игрока от моей руки — строка килл-фида.
+        app.handle_combat_events(
             &[GameEvent::Death {
                 victim: 8,
-                victim_name: "A".to_string(),
+                victim_name: "Цель".to_string(),
                 killer: 7,
-                killer_name: "B".to_string(),
+                killer_name: "Сталкер".to_string(),
             }],
             now,
         );
         assert_eq!(app.tracers.len(), 1);
+        assert_eq!(app.kill_feed.len(), 1);
+        assert_eq!(app.kill_feed[0].text, "Вы → Цель");
+        assert!(
+            app.my_killer.is_none(),
+            "чужая смерть не открывает мой экран"
+        );
+    }
+
+    #[test]
+    fn kill_feed_keeps_last_three_deaths() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.net_player_id = Some(7);
+        let now = Instant::now();
+
+        for victim in 1..=4u64 {
+            app.handle_combat_events(
+                &[GameEvent::Death {
+                    victim,
+                    victim_name: format!("Жертва{victim}"),
+                    killer: 7,
+                    killer_name: "Сталкер".to_string(),
+                }],
+                now,
+            );
+        }
+
+        assert_eq!(app.kill_feed.len(), KILL_FEED_MAX, "в фиде только свежие");
+        assert!(app.kill_feed[0].text.ends_with("Жертва2"));
+        assert!(app.kill_feed[2].text.ends_with("Жертва4"));
+    }
+
+    #[test]
+    fn death_screen_data_tracks_local_death() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.net_player_id = Some(7);
+        let now = Instant::now();
+
+        app.handle_combat_events(
+            &[GameEvent::Death {
+                victim: 7,
+                victim_name: "Сталкер".to_string(),
+                killer: 8,
+                killer_name: "Охотник".to_string(),
+            }],
+            now,
+        );
+        assert_eq!(app.my_killer.as_deref(), Some("Охотник"));
+
+        // Снапшот со смертью: экран смерти получает отсчёт от серверного тика.
+        let mut me = app
+            .simulation
+            .player_state(app.player_id)
+            .unwrap()
+            .net_state();
+        me.player_id = 7;
+        me.health = 0;
+        app.apply_snapshot(100, 0, &[me], &[], now);
+
+        let hud = app.collect_hud_data();
+        assert_eq!(hud.health, 0);
+        assert_eq!(hud.killer.as_deref(), Some("Охотник"));
+        let respawn = hud.respawn_secs.expect("отсчёт респавна");
+        assert!(respawn > 0.0 && respawn <= 3.0, "respawn = {respawn}");
     }
 }

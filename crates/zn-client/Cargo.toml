@@ -12,9 +12,12 @@ name = "zn-client"
 path = "src/main.rs"
 
 [dependencies]
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
 env_logger = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
+wgpu = { workspace = true }
 winit = { workspace = true }
 zn-assets = { path = "../zn-assets" }
 zn-core = { path = "../zn-core" }
