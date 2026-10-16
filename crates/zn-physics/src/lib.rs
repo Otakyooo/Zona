@@ -3,6 +3,8 @@ use rapier3d::pipeline::{PhysicsPipeline, QueryFilter};
 use rapier3d::prelude::*;
 use zn_scene::{ColliderShape, SceneObject};
 
+use glam::Vec3 as GlamVec3;
+
 pub const PLAYER_RADIUS: f32 = 0.3;
 pub const PLAYER_HALF_HEIGHT: f32 = 0.6;
 pub const PLAYER_TOTAL_HEIGHT: f32 = 2.0 * (PLAYER_HALF_HEIGHT + PLAYER_RADIUS);
@@ -237,6 +239,32 @@ impl PhysicsWorld {
                 |_| {},
             )
             .into()
+    }
+
+    /// Статический бокс в glam-координатах: полуразмеры и центр.
+    /// Удобный адаптер для симуляции, чтобы не тянуть rapier-типы в `zn-sim`.
+    pub fn add_static_box_glam(
+        &mut self,
+        half_extents: GlamVec3,
+        center: GlamVec3,
+    ) -> ColliderHandle {
+        self.add_static_box(
+            Vector::new(half_extents.x, half_extents.y, half_extents.z),
+            Vector::new(center.x, center.y, center.z),
+        )
+    }
+
+    /// Движение персонажа в glam-координатах: `feet` — положение ступней,
+    /// `desired` — желаемое смещение за шаг. Возвращает фактическое смещение
+    /// ступней и флаг опоры.
+    pub fn move_character_feet(&mut self, feet: GlamVec3, desired: GlamVec3) -> (GlamVec3, bool) {
+        let origin = Self::character_origin(Vector::new(feet.x, feet.y, feet.z));
+        let movement = self.move_character(origin, Vector::new(desired.x, desired.y, desired.z));
+        let translation = movement.translation;
+        (
+            GlamVec3::new(translation.x, translation.y, translation.z),
+            movement.grounded,
+        )
     }
 
     pub fn character_origin(feet_position: Vector) -> Vector {

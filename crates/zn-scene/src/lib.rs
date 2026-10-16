@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 
 pub const SCENE_EXTENSION: &str = "scene.ron";
 
+/// Константы FNV-1a (64 бита) для [`Scene::content_hash`].
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
 /// Ключ ассета по умолчанию: встроенный процедурный куб.
 pub const BUILTIN_CUBE: &str = "builtin://cube";
 
@@ -193,6 +197,19 @@ impl Scene {
 
     pub fn to_ron(&self) -> Result<String, ron::Error> {
         ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())
+    }
+
+    /// Детерминированный хэш содержимого уровня (FNV-1a по каноническому
+    /// RON-представлению). Не зависит от пути к файлу; клиент и сервер
+    /// сверяют его при сетевом handshake, чтобы коллайдеры совпадали.
+    pub fn content_hash(&self) -> u64 {
+        let text = self.to_ron().unwrap_or_else(|_| self.name.clone());
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in text.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
     }
 
     pub fn save_ron(&self, path: impl AsRef<Path>) -> Result<(), SceneError> {

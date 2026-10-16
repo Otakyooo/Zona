@@ -12,3 +12,5 @@ glam = { workspace = true }
 log = { workspace = true }
 zn-core = { path = "../../crates/zn-core" }
 zn-net = { path = "../../crates/zn-net" }
+zn-physics = { path = "../../crates/zn-physics" }
+zn-scene = { path = "../../crates/zn-scene" }

@@ -17,17 +17,18 @@ fn input_roundtrips_through_bincode() {
 }
 
 #[test]
-fn snapshot_roundtrips_through_bincode() {
-    let snapshot = PlayerSnapshot {
-        entity_id: 7,
+fn net_state_roundtrips_through_bincode() {
+    let state = PlayerNetState {
+        player_id: 7,
         position: [1.0, 2.0, 3.0],
+        velocity: [0.0, -1.5, 4.0],
         yaw: 0.5,
         pitch: -0.25,
         flags: FLAG_GROUNDED,
     };
-    let bytes = encode_message(&snapshot).unwrap();
-    let decoded: PlayerSnapshot = decode_message(&bytes).unwrap();
-    assert_eq!(decoded, snapshot);
+    let bytes = encode_message(&state).unwrap();
+    let decoded: PlayerNetState = decode_message(&bytes).unwrap();
+    assert_eq!(decoded, state);
 }
 
 #[test]

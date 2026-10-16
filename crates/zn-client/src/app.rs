@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use glam::Vec3;
-use rapier3d::prelude::Vector;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -12,7 +11,7 @@ use winit::window::{CursorGrabMode, WindowId};
 
 use zn_core::FixedStep;
 use zn_input::InputState;
-use zn_physics::{PhysicsWorld, PLAYER_EYE_HEIGHT};
+use zn_physics::PLAYER_EYE_HEIGHT;
 use zn_render::{Camera, DrawList, MaterialId, MeshId, Renderer};
 use zn_scene::{Scene, SceneObject};
 use zn_sim::{ClientInput, Simulation, FLAG_SPRINTING};
@@ -20,12 +19,9 @@ use zn_sim::{ClientInput, Simulation, FLAG_SPRINTING};
 use crate::assets::{AssetEvent, AssetLoader};
 use crate::level::{build_draw_list, load_level, DEFAULT_CONTENT_ROOT, DEFAULT_LEVEL};
 
+/// Чувствительность мыши (рад на пиксель). Скорости движения, гравитация и
+/// прыжок живут в `zn_sim`, чтобы клиент и сервер считали кинематику одинаково.
 const LOOK_SENSITIVITY: f32 = 0.0022;
-const WALK_SPEED: f32 = 5.5;
-const SPRINT_SPEED: f32 = 8.5;
-const JUMP_SPEED: f32 = 6.5;
-const GRAVITY: f32 = 18.0;
-const MAX_FALL_SPEED: f32 = 45.0;
 
 /// Состояние загрузки ассета по ключу (путь или `builtin://…`).
 pub enum AssetState {
@@ -43,13 +39,10 @@ pub struct ClientApp {
     simulation: Simulation,
     scene: Scene,
     camera: Camera,
-    physics: Option<PhysicsWorld>,
+    player_id: u64,
     asset_loader: AssetLoader,
     assets: HashMap<String, AssetState>,
     builtin_mesh_ids: HashMap<String, MeshId>,
-    character_origin: Vector,
-    vertical_velocity: f32,
-    grounded: bool,
     cursor_grabbed: bool,
     fixed: FixedStep,
     last_frame: Option<Instant>,
@@ -58,24 +51,19 @@ pub struct ClientApp {
 
 impl ClientApp {
     /// Новая сессия клиента: уровень с диска (или demo_zone-fallback),
-    /// физика из прокси-коллайдеров, фоновый загрузчик ассетов.
+    /// симуляция с коллайдерами сцены, фоновый загрузчик ассетов.
     pub fn with_content(content_root: impl Into<PathBuf>, level: &str) -> Self {
         let content_root = content_root.into();
         let (scene, _) = load_level(&content_root, level);
         log::info!("уровень '{}': {} объектов", scene.name, scene.len());
-        let camera = Camera::new(scene.spawn, scene.spawn_yaw, 16.0 / 9.0);
 
-        let mut physics = PhysicsWorld::with_gravity_y(-GRAVITY, 1.0 / 60.0);
-        for object in &scene.objects {
-            physics.add_scene_object(object);
-        }
-        physics.step_dynamic_bodies();
-
-        let character_origin = PhysicsWorld::character_origin(Vector::new(
-            scene.spawn.x,
-            scene.spawn.y,
-            scene.spawn.z,
-        ));
+        let mut simulation = Simulation::with_scene(&scene);
+        let player_id = simulation.spawn_player(scene.spawn);
+        let camera = Camera::new(
+            scene.spawn + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0),
+            scene.spawn_yaw,
+            16.0 / 9.0,
+        );
 
         let mut assets = HashMap::new();
         let loader = AssetLoader::new(&content_root);
@@ -96,16 +84,13 @@ impl ClientApp {
         Self {
             renderer: None,
             input: InputState::new(),
-            simulation: Simulation::new(),
+            simulation,
             scene,
             camera,
-            physics: Some(physics),
+            player_id,
             asset_loader: loader,
             assets,
             builtin_mesh_ids: HashMap::new(),
-            character_origin,
-            vertical_velocity: 0.0,
-            grounded: false,
             cursor_grabbed: false,
             fixed: FixedStep::from_hz(60),
             last_frame: None,
@@ -233,72 +218,50 @@ impl ClientApp {
         build_draw_list(&self.scene, |object| self.resolve_asset(object))
     }
 
+    /// Один кадр offline-клиента: для каждого фиксированного шага собирается
+    /// `ClientInput` (та же структура, что пойдёт по сети), кладётся в очередь
+    /// общей симуляции и выполняется шаг. Камера синхронизируется из состояния
+    /// игрока после шагов.
     fn simulate(&mut self, frame_delta: std::time::Duration) {
         let steps = self.fixed.accumulate(frame_delta);
-        let dt = self.fixed.fixed_dt().as_secs_f32();
 
         for _ in 0..steps {
             let (dx, dy) = self.input.take_mouse_delta();
-            self.camera
-                .look(-dx * LOOK_SENSITIVITY, -dy * LOOK_SENSITIVITY);
+            let (yaw_delta, pitch_delta) = look_delta(dx, dy);
 
             let [right_axis, forward_axis] =
                 self.input
                     .move_axis(KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD);
-            let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
-            let forward = Vec3::new(cos_yaw, 0.0, sin_yaw);
-            let right = Vec3::new(sin_yaw, -cos_yaw, 0.0);
-            let move_dir = forward * forward_axis + right * right_axis;
-            let move_dir = if move_dir.length_squared() > 1.0 {
-                move_dir.normalize()
-            } else {
-                move_dir
-            };
-
-            let sprinting = self.input.is_key_down(KeyCode::ShiftLeft) && forward_axis.abs() > 0.1;
-            let speed = if sprinting { SPRINT_SPEED } else { WALK_SPEED };
-
-            if self.input.just_pressed(KeyCode::Space) && self.grounded {
-                self.vertical_velocity = JUMP_SPEED;
-                self.grounded = false;
-            }
-            self.vertical_velocity = (self.vertical_velocity - GRAVITY * dt).max(-MAX_FALL_SPEED);
-
-            let desired = Vector::new(
-                move_dir.x * speed * dt,
-                self.vertical_velocity * dt,
-                move_dir.z * speed * dt,
-            );
+            let sprinting = self.input.is_key_down(KeyCode::ShiftLeft);
 
             let command = ClientInput {
                 tick: self.client_tick,
                 move_forward: forward_axis,
                 move_right: right_axis,
-                yaw_delta: -dx * LOOK_SENSITIVITY,
-                pitch_delta: -dy * LOOK_SENSITIVITY,
+                yaw_delta,
+                pitch_delta,
                 jump: self.input.just_pressed(KeyCode::Space),
                 buttons: if sprinting { FLAG_SPRINTING } else { 0 },
             };
-            self.simulation.queue_input(1, command);
-
-            if let Some(physics) = self.physics.as_mut() {
-                physics.step_dynamic_bodies();
-                let movement = physics.move_character(self.character_origin, desired);
-                self.character_origin += movement.translation;
-                self.grounded = movement.grounded;
-                if self.grounded && self.vertical_velocity < 0.0 {
-                    self.vertical_velocity = 0.0;
-                }
-            }
-
-            let feet = PhysicsWorld::character_feet(self.character_origin);
-            self.camera.position = Vec3::new(feet.x, feet.y + PLAYER_EYE_HEIGHT, feet.z);
-
-            self.client_tick += 1;
+            self.simulation.queue_input(self.player_id, command);
             self.simulation.step_once();
+            self.client_tick += 1;
         }
 
-        self.input.end_frame();
+        if steps > 0 {
+            self.sync_camera_from_simulation();
+            self.input.end_frame();
+        }
+    }
+
+    /// Камера из состояния игрока: ступни + высота глаз; углы — из симуляции.
+    fn sync_camera_from_simulation(&mut self) {
+        let Some(state) = self.simulation.player_state(self.player_id) else {
+            return;
+        };
+        self.camera.position = state.position + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0);
+        self.camera.yaw = state.yaw;
+        self.camera.pitch = state.pitch;
     }
 }
 
@@ -411,6 +374,14 @@ impl ApplicationHandler for ClientApp {
     }
 }
 
+/// Дельта мыши (пиксели) → дельты углов обзора (радианы).
+///
+/// Мышь вправо (dx > 0) — поворот вправо (yaw+); мышь вверх (dy < 0) — взгляд
+/// вверх (pitch+). Знаки закреплены тестом (см. также конвенцию осей в zn-sim).
+fn look_delta(dx: f32, dy: f32) -> (f32, f32) {
+    (dx * LOOK_SENSITIVITY, -dy * LOOK_SENSITIVITY)
+}
+
 /// Извлекает слоты текстур материала из импортированного ассета.
 fn material_images<'a>(
     asset: &'a zn_assets::ImportedAsset,
@@ -455,12 +426,14 @@ mod tests {
     #[test]
     fn app_builds_with_default_content_root() {
         // Только проверка компиляции/конструирования без окна.
-        let app = ClientApp::with_content("game/content", "demo_zone");
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
         assert_eq!(app.scene.name, "demo_zone");
         assert!(!app.scene.is_empty());
-        let physics = app.physics.as_ref().unwrap();
         // Коллайдеры созданы для всех solid-объектов сцены.
-        assert!(physics.static_collider_count() > 0);
+        assert!(app.simulation.static_collider_count() > 0);
+        // Игрок заспавнен в точке сцены.
+        let player = app.simulation.player_state(app.player_id).unwrap();
+        assert_eq!(player.position, app.scene.spawn);
     }
 
     #[test]
@@ -468,5 +441,36 @@ mod tests {
         let app = ClientApp::with_content("game/content", "demo_zone");
         // demo_zone целиком на builtin-кубах — внешних запросов нет.
         assert!(app.assets.is_empty());
+    }
+
+    #[test]
+    fn look_delta_follows_screen_conventions() {
+        let (yaw_right, pitch_up) = look_delta(10.0, -10.0);
+        assert!(yaw_right > 0.0, "мышь вправо → поворот вправо (yaw+)");
+        assert!(pitch_up > 0.0, "мышь вверх → взгляд вверх (pitch+)");
+
+        let (yaw_left, pitch_down) = look_delta(-10.0, 10.0);
+        assert!(yaw_left < 0.0, "мышь влево → поворот влево");
+        assert!(pitch_down < 0.0, "мышь вниз → взгляд вниз");
+    }
+
+    #[test]
+    fn offline_client_walks_via_shared_simulation() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        let start = app.simulation.player_state(app.player_id).unwrap();
+
+        app.input.press_key(KeyCode::KeyW);
+        for _ in 0..30 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+
+        let end = app.simulation.player_state(app.player_id).unwrap();
+        assert!(
+            (end.position - start.position).length() > 0.5,
+            "игрок должен сдвинуться по W: {start:?} → {end:?}"
+        );
+        assert_eq!(end.velocity.y, 0.0, "игрок должен стоять на полу");
+        // Камера следует за симуляцией (ступни + высота глаз).
+        assert_eq!(app.camera.position.y, end.position.y + PLAYER_EYE_HEIGHT);
     }
 }

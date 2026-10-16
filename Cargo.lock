@@ -4997,7 +4997,6 @@ dependencies = [
  "env_logger",
  "glam 0.34.1",
  "log",
- "rapier3d",
  "winit",
  "zn-assets",
  "zn-core",
@@ -5101,6 +5100,8 @@ dependencies = [
  "log",
  "zn-core",
  "zn-net",
+ "zn-physics",
+ "zn-scene",
 ]
 
 [[package]]

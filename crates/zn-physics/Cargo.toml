@@ -8,9 +8,7 @@ rust-version.workspace = true
 description = "ZONA physics: rapier3d world wrappers and kinematic character controller"
 
 [dependencies]
+glam = { workspace = true }
 log = { workspace = true }
 rapier3d = { workspace = true }
 zn-scene = { path = "../zn-scene" }
-
-[dev-dependencies]
-glam = { workspace = true }

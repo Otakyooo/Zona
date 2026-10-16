@@ -2,12 +2,14 @@ use crate::types::{AssetVertex, CpuMesh};
 use glam::Vec3;
 
 /// Встроенные процедурные примитивы: ключ → имя.
-pub const BUILTIN_MESH_NAMES: &[&str] = &["cube", "sphere", "cylinder", "quad"];
+pub const BUILTIN_MESH_NAMES: &[&str] = &["cube", "sphere", "cylinder", "capsule", "quad"];
 
 /// Число сегментов у встроенных сферы и цилиндра.
 pub const CYLINDER_SEGMENTS: u32 = 24;
 pub const SPHERE_RINGS: u32 = 12;
 pub const SPHERE_SEGMENTS: u32 = 16;
+/// Число колец на каждую полусферу встроенной капсулы.
+pub const CAPSULE_CAP_RINGS: u32 = 8;
 
 /// Ключ builtin-ассета (`builtin://<name>`).
 pub fn builtin_key(name: &str) -> String {
@@ -26,6 +28,7 @@ pub fn builtin_mesh(name: &str) -> Option<CpuMesh> {
         "cube" => cube(),
         "sphere" => sphere(SPHERE_SEGMENTS, SPHERE_RINGS),
         "cylinder" => cylinder(CYLINDER_SEGMENTS),
+        "capsule" => capsule(CYLINDER_SEGMENTS, CAPSULE_CAP_RINGS),
         "quad" => quad(),
         _ => return None,
     };
@@ -174,6 +177,59 @@ pub fn cylinder(segments: u32) -> CpuMesh {
     CpuMesh::new(vertices, indices)
 }
 
+/// Капсула вдоль Y: радиус 0.5, цилиндрическая часть высотой 1, полусферы
+/// сверху и снизу (полная высота 2). Нормали гладкие, экватор без шва.
+pub fn capsule(segments: u32, cap_rings: u32) -> CpuMesh {
+    let segments = segments.max(3);
+    let cap_rings = cap_rings.max(1);
+    let radius = 0.5f32;
+    let half_height = 0.5f32;
+    let half_pi = std::f32::consts::FRAC_PI_2;
+
+    // Профиль снизу вверх: (y, радиальный масштаб 0..1, y-компонента нормали).
+    let mut profile: Vec<(f32, f32, f32)> = Vec::with_capacity(cap_rings as usize * 2 + 2);
+    profile.push((-half_height - radius, 0.0, -1.0));
+    for i in 1..=cap_rings {
+        let psi = half_pi * (1.0 - i as f32 / cap_rings as f32);
+        profile.push((-half_height - radius * psi.sin(), psi.cos(), -psi.sin()));
+    }
+    profile.push((half_height, 1.0, 0.0));
+    for i in 1..=cap_rings {
+        let psi = half_pi * (i as f32 / cap_rings as f32);
+        profile.push((half_height + radius * psi.sin(), psi.cos(), psi.sin()));
+    }
+
+    let rows = profile.len() as u32;
+    let stride = segments + 1;
+    let mut vertices = Vec::with_capacity(rows as usize * stride as usize);
+    let mut indices = Vec::new();
+    for (row, &(y, radial, normal_y)) in profile.iter().enumerate() {
+        let v = row as f32 / (rows - 1) as f32;
+        for segment in 0..=segments {
+            let u = segment as f32 / segments as f32;
+            let (sin, cos) = (u * std::f32::consts::TAU).sin_cos();
+            vertices.push(AssetVertex::new(
+                Vec3::new(cos * radius * radial, y, sin * radius * radial),
+                Vec3::new(cos * radial, normal_y, sin * radial),
+                [u, v],
+            ));
+        }
+    }
+    // Ряды идут снизу вверх — по сравнению со sphere() обход перевёрнут,
+    // поэтому индексы образуют те же внешние треугольники в порядке [c, a, d, d, a, b].
+    for row in 0..rows - 1 {
+        for segment in 0..segments {
+            let a = row * stride + segment;
+            let b = a + 1;
+            let c = a + stride;
+            let d = c + 1;
+            indices.extend_from_slice(&[c, a, d, d, a, b]);
+        }
+    }
+
+    CpuMesh::new(vertices, indices)
+}
+
 /// Квад в плоскости XZ, нормаль вверх (+Y), размер 1x1.
 pub fn quad() -> CpuMesh {
     let vertices = vec![
@@ -251,15 +307,36 @@ mod tests {
     }
 
     #[test]
+    fn capsule_spans_unit_radius_and_full_height() {
+        let mesh = builtin_mesh("capsule").unwrap();
+        assert_eq!(mesh.indices.len() % 3, 0);
+        assert!((mesh.bounds.min.y + 1.0).abs() < 1e-3, "{:?}", mesh.bounds);
+        assert!((mesh.bounds.max.y - 1.0).abs() < 1e-3, "{:?}", mesh.bounds);
+        assert!(mesh.bounds.min.x >= -0.501 && mesh.bounds.max.x <= 0.501);
+        assert!(mesh.bounds.min.z >= -0.501 && mesh.bounds.max.z <= 0.501);
+        for vertex in &mesh.vertices {
+            let position = Vec3::from_array(vertex.position);
+            let normal = Vec3::from_array(vertex.normal);
+            assert!((normal.length() - 1.0).abs() < 1e-4, "normal {normal:?}");
+            // Цилиндрическая часть: точка лежит на радиусе 0.5.
+            if position.y.abs() <= 0.5 + 1e-4 {
+                let radial = (position.x * position.x + position.z * position.z).sqrt();
+                assert!((radial - 0.5).abs() < 1e-3, "radial {radial}");
+            }
+        }
+    }
+
+    #[test]
     fn builtin_keys_roundtrip() {
         assert_eq!(parse_builtin_key("builtin://cube"), Some("cube"));
         assert_eq!(parse_builtin_key("builtin://sphere"), Some("sphere"));
         assert_eq!(parse_builtin_key("builtin://cylinder"), Some("cylinder"));
+        assert_eq!(parse_builtin_key("builtin://capsule"), Some("capsule"));
         assert_eq!(parse_builtin_key("builtin://quad"), Some("quad"));
         assert_eq!(parse_builtin_key("builtin://teapot"), None);
         assert_eq!(parse_builtin_key("assets/teapot.gltf"), None);
         assert_eq!(builtin_key("cube"), "builtin://cube");
-        assert_eq!(builtin_meshes().len(), 4);
+        assert_eq!(builtin_meshes().len(), 5);
     }
 
     #[test]

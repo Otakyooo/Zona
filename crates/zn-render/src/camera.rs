@@ -35,12 +35,13 @@ impl Camera {
         Vec3::new(cos_yaw * cos_pitch, sin_pitch, sin_yaw * cos_pitch).normalize()
     }
 
+    /// Правая половина экрана в мировых координатах (при yaw = 0 — это +Z).
     pub fn right(&self) -> Vec3 {
-        Vec3::Y.cross(self.forward()).normalize()
+        self.forward().cross(Vec3::Y).normalize()
     }
 
     pub fn up(&self) -> Vec3 {
-        self.forward().cross(self.right()).normalize()
+        self.right().cross(self.forward()).normalize()
     }
 
     pub fn set_aspect(&mut self, aspect: f32) {

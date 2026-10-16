@@ -15,7 +15,6 @@ path = "src/main.rs"
 env_logger = { workspace = true }
 glam = { workspace = true }
 log = { workspace = true }
-rapier3d = { workspace = true }
 winit = { workspace = true }
 zn-assets = { path = "../zn-assets" }
 zn-core = { path = "../zn-core" }

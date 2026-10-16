@@ -26,9 +26,10 @@ impl ClientInput {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct PlayerSnapshot {
-    pub entity_id: u32,
+pub struct PlayerNetState {
+    pub player_id: u64,
     pub position: [f32; 3],
+    pub velocity: [f32; 3],
     pub yaw: f32,
     pub pitch: f32,
     pub flags: u32,

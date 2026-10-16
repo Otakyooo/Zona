@@ -173,3 +173,25 @@ fn add_static_shape_uses_scale_as_full_size() {
     assert!((cuboid.half_extents.y - 1.0).abs() < 1e-6);
     assert!((cuboid.half_extents.z - 3.0).abs() < 1e-6);
 }
+
+#[test]
+fn glam_adapters_land_on_box_and_report_feet() {
+    let mut world = PhysicsWorld::with_gravity_y(-9.81, DT);
+    world.add_static_box_glam(glam::Vec3::new(10.0, 0.5, 10.0), glam::Vec3::ZERO);
+    world.step_dynamic_bodies();
+
+    let mut feet = glam::Vec3::new(0.0, 5.0, 0.0);
+    let mut grounded = false;
+    for _ in 0..240 {
+        let (translation, on_ground) =
+            world.move_character_feet(feet, glam::Vec3::new(0.0, -9.81 * DT, 0.0));
+        feet += translation;
+        grounded = on_ground;
+        if grounded {
+            break;
+        }
+    }
+
+    assert!(grounded, "character never became grounded (glam adapter)");
+    assert!((feet.y - 0.5).abs() < 0.05, "feet y = {}", feet.y);
+}

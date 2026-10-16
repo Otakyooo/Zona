@@ -132,4 +132,25 @@ mod tests {
         assert!((max.y - 1.0).abs() < 1e-5);
         assert!((min.y + 1.0).abs() < 1e-5);
     }
+
+    #[test]
+    fn content_hash_is_stable_across_roundtrip() {
+        let scene = Scene::demo_zone();
+        let text = scene.to_ron().unwrap();
+        let loaded = Scene::from_ron(&text).unwrap();
+        assert_eq!(loaded.content_hash(), scene.content_hash());
+    }
+
+    #[test]
+    fn content_hash_distinguishes_levels() {
+        let a = Scene::new("a");
+        let mut b = Scene::new("b");
+        b.add(SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE));
+        assert_ne!(a.content_hash(), b.content_hash());
+
+        // Изменение геометрии объекта меняет хэш.
+        let mut c = b.clone();
+        c.objects[0].position.x = 5.0;
+        assert_ne!(c.content_hash(), b.content_hash());
+    }
 }
