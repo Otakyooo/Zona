@@ -15,6 +15,7 @@ path = "src/main.rs"
 bytemuck = { workspace = true }
 env_logger = { workspace = true }
 egui = { workspace = true }
+egui-wgpu = { workspace = true }
 egui-winit = "0.36"
 glam = { workspace = true }
 log = { workspace = true }

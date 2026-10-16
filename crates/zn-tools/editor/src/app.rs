@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Pos2, RichText, Stroke};
+use egui_wgpu::ScreenDescriptor;
 use glam::{Vec2, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -13,7 +14,6 @@ use winit::window::WindowId;
 use zn_render::{Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer};
 use zn_scene::{ColliderShape, Scene, SceneObject};
 
-use crate::epaint_painter::EguiPainter;
 use crate::gizmo::{self, GizmoDelta, GizmoMode, GizmoState};
 use crate::orbit::OrbitCamera;
 use crate::picking::{cursor_ray, pick_object, placement_point};
@@ -54,7 +54,7 @@ pub struct EditorApp {
     renderer: Option<Renderer>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
-    ui_painter: Option<EguiPainter>,
+    ui_renderer: Option<egui_wgpu::Renderer>,
     camera: Camera,
     orbit: OrbitCamera,
     scene: Scene,
@@ -92,7 +92,7 @@ impl EditorApp {
             renderer: None,
             egui_ctx,
             egui_state: None,
-            ui_painter: None,
+            ui_renderer: None,
             camera,
             orbit,
             scene,
@@ -583,6 +583,24 @@ impl EditorApp {
                     ui.label(RichText::new("ничего не выделено").weak());
                     return;
                 };
+                // Имена материалов импортированного ассета объекта — для комбо.
+                let asset_material_names: Vec<String> = self
+                    .scene
+                    .objects
+                    .get(index)
+                    .and_then(|object| object.asset.as_deref())
+                    .and_then(|key| self.assets.get(key))
+                    .map(|asset| {
+                        let mut names: Vec<String> = asset
+                            .materials
+                            .iter()
+                            .filter_map(|(name, _)| name.clone())
+                            .collect();
+                        names.sort();
+                        names.dedup();
+                        names
+                    })
+                    .unwrap_or_default();
                 let Some(object) = self.scene.objects.get_mut(index) else {
                     return;
                 };
@@ -656,20 +674,40 @@ impl EditorApp {
                     object.asset = if asset.is_empty() { None } else { Some(asset) };
                 }
 
-                let mut material = object.material.clone().unwrap_or_default();
-                if ui
-                    .horizontal(|ui| {
-                        ui.label("material");
-                        ui.text_edit_singleline(&mut material).changed()
-                    })
-                    .inner
-                {
-                    object.material = if material.is_empty() {
-                        None
-                    } else {
-                        Some(material)
-                    };
-                }
+                ui.horizontal(|ui| {
+                    ui.label("material");
+                    let current = object.material.clone().unwrap_or_default();
+                    let mut material = current.clone();
+                    let edited = ui.text_edit_singleline(&mut material).changed();
+                    let mut picked = false;
+                    if !asset_material_names.is_empty() {
+                        // Имена материалов ассета — помимо ручного ввода.
+                        egui::ComboBox::from_id_salt("object-material")
+                            .selected_text("▾")
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(material.is_empty(), "<по мешу>")
+                                    .clicked()
+                                {
+                                    material.clear();
+                                    picked = true;
+                                }
+                                for name in &asset_material_names {
+                                    if ui.selectable_label(material == *name, name).clicked() {
+                                        material = name.clone();
+                                        picked = true;
+                                    }
+                                }
+                            });
+                    }
+                    if edited || picked {
+                        object.material = if material.is_empty() {
+                            None
+                        } else {
+                            Some(material)
+                        };
+                    }
+                });
 
                 let mut collider = object.collider;
                 egui::ComboBox::from_id_salt("collider")
@@ -794,9 +832,18 @@ impl ApplicationHandler for EditorApp {
             None,
         );
         self.egui_state = Some(egui_state);
-        let ui_painter = EguiPainter::new(renderer.device(), renderer.surface_format());
+        // UI: egui-wgpu поверх сцены. msaa 1 — кадр без мультисэмплинга;
+        // depth не нужен: проход оверлея идёт без depth attach.
+        let ui_renderer = egui_wgpu::Renderer::new(
+            renderer.device(),
+            renderer.surface_format(),
+            egui_wgpu::RendererOptions {
+                msaa_samples: 1,
+                ..Default::default()
+            },
+        );
         self.renderer = Some(renderer);
-        self.ui_painter = Some(ui_painter);
+        self.ui_renderer = Some(ui_renderer);
         if let Some(path) = self.current_path.clone() {
             self.path_buffer = path.to_string_lossy().to_string();
         }
@@ -1010,46 +1057,58 @@ impl ApplicationHandler for EditorApp {
                     let size = renderer.surface_size();
                     ([size.width, size.height], self.egui_ctx.pixels_per_point())
                 };
+                let screen_descriptor = ScreenDescriptor {
+                    size_in_pixels: screen_size_px,
+                    pixels_per_point,
+                };
 
-                // Текстурные дельты egui (включая атлас шрифта) — до рисования.
-                // Дельты необходимо ПОТРЕБИТЬ (drain), иначе Drop TexturesDelta
-                // падает на debug_assert.
-                if let (Some(ui_painter), Some(renderer)) =
-                    (self.ui_painter.as_mut(), self.renderer.as_ref())
+                // Текстурные дельты egui (атлас шрифта и user-текстуры) — до
+                // рисования. Дельты необходимо ПОТРЕБИТЬ (set + free), иначе
+                // Drop TexturesDelta падает на debug_assert.
+                if let (Some(ui_renderer), Some(renderer)) =
+                    (self.ui_renderer.as_mut(), self.renderer.as_ref())
                 {
                     let mut textures = std::mem::take(&mut output.textures_delta);
-                    for (_, deltas) in textures.set.drain() {
+                    for (id, deltas) in textures.set.drain() {
                         for delta in deltas {
-                            ui_painter.update_texture(renderer.device(), renderer.queue(), &delta);
+                            ui_renderer.update_texture(
+                                renderer.device(),
+                                renderer.queue(),
+                                id,
+                                &delta,
+                            );
                         }
                     }
                     for texture_id in textures.free.drain() {
-                        log::debug!("egui освободил текстуру {texture_id:?} (атласов у нас нет)");
+                        ui_renderer.free_texture(&texture_id);
                     }
                 }
 
                 let list = self.build_draw_list();
-                if let (Some(renderer), Some(ui_painter)) =
-                    (self.renderer.as_mut(), self.ui_painter.as_mut())
+                if let (Some(renderer), Some(ui_renderer)) =
+                    (self.renderer.as_mut(), self.ui_renderer.as_mut())
                 {
                     renderer.update_draw_list(&list);
                     let device = renderer.device().clone();
                     let queue = renderer.queue().clone();
+                    // Аплоад буферов egui отдельным энкодером до кадра:
+                    // render() требует свежего update_buffers в этом кадре.
+                    let mut upload =
+                        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("zn-editor-ui-upload"),
+                        });
+                    let user_buffers = ui_renderer.update_buffers(
+                        &device,
+                        &queue,
+                        &mut upload,
+                        &clipped,
+                        &screen_descriptor,
+                    );
+                    queue.submit(user_buffers.into_iter().chain([upload.finish()]));
                     let camera = &self.camera;
-                    let logical = [
-                        screen_size_px[0] as f32 / pixels_per_point,
-                        screen_size_px[1] as f32 / pixels_per_point,
-                    ];
                     renderer.render_with(camera, |pass| {
                         let mut pass = pass.forget_lifetime();
-                        ui_painter.render(
-                            &device,
-                            &queue,
-                            &mut pass,
-                            &clipped,
-                            logical,
-                            pixels_per_point,
-                        );
+                        ui_renderer.render(&mut pass, &clipped, &screen_descriptor);
                     });
                 }
             }

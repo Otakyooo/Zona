@@ -829,9 +829,9 @@ impl Renderer {
         self.render_with(camera, |_pass| {});
     }
 
-    /// Рендер + хук для оверлея (egui редактора): команды оверлея
-    /// добавляются в тот же render pass после отрисовки сцены.
-    /// Pass передаётся во владение — оверлей может вызвать
+    /// Рендер + хук для оверлея (UI редактора): после прохода сцены
+    /// открывается отдельный проход поверх результата (`LoadOp::Load`,
+    /// без depth attach). Pass передаётся во владение — оверлей может вызвать
     /// `pass.forget_lifetime()` (egui-wgpu принимает `RenderPass<'static>`).
     pub fn render_with(&mut self, camera: &Camera, overlay: impl FnOnce(wgpu::RenderPass<'_>)) {
         self.update_camera(camera);
@@ -946,7 +946,27 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.instance_buffer.slice(start..end));
                 pass.draw_indexed(0..mesh.index_count, 0, 0..range.instance_count);
             }
+        }
 
+        // Оверлей (UI): отдельный проход без depth attach — конвейер
+        // egui-wgpu создаётся без depth-состояния.
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("zn-overlay-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
             overlay(pass);
         }
 

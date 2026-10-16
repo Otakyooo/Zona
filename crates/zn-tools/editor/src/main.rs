@@ -1,5 +1,4 @@
 mod app;
-mod epaint_painter;
 mod gizmo;
 mod orbit;
 mod picking;
