@@ -43,7 +43,10 @@ pub struct PhysicsWorld {
     ccd_solver: CCDSolver,
     controller: KinematicCharacterController,
     character_shape: Collider,
-    static_colliders: usize,
+    /// Статические прокси-коллайдеры объектов сцены (`add_static_shape`/
+    /// `add_scene_object`): пересобираются при загрузке уровня. Ручные
+    /// коллайдеры (пол-пластина, `add_static_box*`) сюда не входят.
+    static_handles: Vec<ColliderHandle>,
 }
 
 impl PhysicsWorld {
@@ -78,7 +81,7 @@ impl PhysicsWorld {
             ccd_solver: CCDSolver::new(),
             controller,
             character_shape,
-            static_colliders: 0,
+            static_handles: Vec::new(),
         }
     }
 
@@ -100,9 +103,7 @@ impl PhysicsWorld {
             .translation(position)
             .friction(friction)
             .build();
-        let handle = self.colliders.insert(collider);
-        self.static_colliders += 1;
-        handle
+        self.colliders.insert(collider)
     }
 
     /// Статический прокси-коллайдер формы `shape`: размеры берутся из полного
@@ -127,7 +128,7 @@ impl PhysicsWorld {
         };
         let collider = builder.translation(position).friction(friction).build();
         let handle = self.colliders.insert(collider);
-        self.static_colliders += 1;
+        self.static_handles.push(handle);
         handle
     }
 
@@ -139,8 +140,31 @@ impl PhysicsWorld {
         Some(self.add_static_shape(shape, position, scale, DEFAULT_FRICTION))
     }
 
+    /// Убирает статические коллайдеры объектов сцены, не трогая ручные
+    /// (`add_static_box*`: пол-пластина, тестовые боксы).
+    pub fn clear_static(&mut self) {
+        for handle in self.static_handles.drain(..) {
+            self.colliders.remove(
+                handle,
+                &mut self.islands,
+                &mut self.bodies,
+                &mut self.soft_bodies,
+                false,
+            );
+        }
+    }
+
+    /// Пересобирает статические коллайдеры сцены: очистка + добавление
+    /// объектов через `effective_collider`. Единый путь загрузки уровня.
+    pub fn rebuild_static(&mut self, objects: &[SceneObject]) {
+        self.clear_static();
+        for object in objects {
+            self.add_scene_object(object);
+        }
+    }
+
     pub fn static_collider_count(&self) -> usize {
-        self.static_colliders
+        self.static_handles.len()
     }
 
     pub fn colliders(&self) -> &ColliderSet {

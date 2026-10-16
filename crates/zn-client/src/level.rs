@@ -37,23 +37,22 @@ pub fn level_path(content_root: &Path, level: &str) -> PathBuf {
         .join(format!("{level}.scene.ron"))
 }
 
-/// Разрешает ключ ассета объекта в пару (меш, материал) для draw list.
-/// Вызывающий код отвечает за fallback на builtin-куб/default-материал.
+/// Разрешает объект сцены в пары (меш, материал) для draw list: объект
+/// мультиматериального glTF даёт по батчу на примитив. Вызывающий код
+/// отвечает за fallback на builtin-куб/default-материал.
 pub fn build_draw_list(
     scene: &Scene,
-    resolve: impl Fn(&SceneObject) -> (MeshId, MaterialId),
+    resolve: impl Fn(&SceneObject) -> Vec<(MeshId, MaterialId)>,
 ) -> DrawList {
     let mut list = DrawList::new();
     for object in &scene.objects {
-        let (mesh, material) = resolve(object);
-        list.push(
-            mesh,
-            material,
-            InstanceRaw {
-                model: object.model_matrix().to_cols_array(),
-                color: object.color.into(),
-            },
-        );
+        let instance = InstanceRaw {
+            model: object.model_matrix().to_cols_array(),
+            color: object.color.into(),
+        };
+        for (mesh, material) in resolve(object) {
+            list.push(mesh, material, instance);
+        }
     }
     list
 }
@@ -114,9 +113,9 @@ mod tests {
 
         let list = build_draw_list(&scene, |object| {
             if object.asset_key() == "builtin://cube" {
-                (1, 1)
+                vec![(1, 1)]
             } else {
-                (2, 2)
+                vec![(2, 2)]
             }
         });
         assert_eq!(list.instance_count(), 4);
@@ -124,11 +123,21 @@ mod tests {
     }
 
     #[test]
+    fn build_draw_list_emits_all_pairs_of_multi_material_object() {
+        let mut scene = Scene::new("multi");
+        scene.add(object_at(0.0, Some("assets/multi.gltf")));
+
+        let list = build_draw_list(&scene, |_| vec![(1, 10), (2, 11), (1, 11)]);
+        assert_eq!(list.batches.len(), 3);
+        assert_eq!(list.instance_count(), 3);
+    }
+
+    #[test]
     fn build_draw_list_fallback_for_unknown_assets() {
         let mut scene = Scene::new("fallback");
         scene.add(object_at(0.0, Some("assets/missing.gltf")));
 
-        let list = build_draw_list(&scene, |_| (99, 99));
+        let list = build_draw_list(&scene, |_| vec![(99, 99)]);
         assert_eq!(list.batches.len(), 1);
         assert_eq!(list.batches[0].mesh, 99);
         assert_eq!(list.instance_count(), 1);
@@ -145,7 +154,7 @@ mod tests {
         .with_yaw(1.0);
         scene.add(object.clone());
 
-        let list = build_draw_list(&scene, |_| (1, 1));
+        let list = build_draw_list(&scene, |_| vec![(1, 1)]);
         let instance = &list.batches[0].instances[0];
         assert_eq!(instance.color, [0.5, 0.25, 0.75, 1.0]);
         let model = glam::Mat4::from_cols_array(&instance.model);

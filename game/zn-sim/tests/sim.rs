@@ -219,6 +219,29 @@ fn scene_colliders_block_movement() {
 }
 
 #[test]
+fn rebuild_static_replaces_scene_colliders() {
+    let mut scene = Scene::new("reload");
+    scene.add(SceneObject::new(
+        Vec3::new(0.0, -0.5, 0.0),
+        Vec3::new(20.0, 1.0, 20.0),
+        glam::Vec4::ONE,
+    ));
+    let mut sim = Simulation::with_scene(&scene);
+    assert_eq!(sim.static_collider_count(), 1);
+
+    // Новый состав сцены: старый коллайдер снимается, дублей нет.
+    let mut next = Scene::new("reload-next");
+    next.add(SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE));
+    next.add(SceneObject::new(
+        Vec3::new(3.0, 0.0, 0.0),
+        Vec3::ONE,
+        glam::Vec4::ONE,
+    ));
+    sim.rebuild_static(&next);
+    assert_eq!(sim.static_collider_count(), 2);
+}
+
+#[test]
 fn restore_and_replay_converges() {
     let mut sim = Simulation::new();
     let id = sim.spawn_player(Vec3::ZERO);

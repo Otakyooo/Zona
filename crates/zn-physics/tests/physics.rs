@@ -1,6 +1,7 @@
 use rapier3d::prelude::*;
 
 use zn_physics::{PhysicsWorld, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
+use zn_scene::{Scene, SceneObject};
 
 const DT: f32 = 1.0 / 60.0;
 
@@ -98,7 +99,7 @@ fn character_dimensions_are_stable() {
 
 #[test]
 fn scene_objects_become_expected_colliders() {
-    use zn_scene::{ColliderShape, Scene, SceneObject};
+    use zn_scene::ColliderShape;
 
     let mut scene = Scene::new("shapes");
     scene.add(SceneObject::new(
@@ -172,6 +173,66 @@ fn add_static_shape_uses_scale_as_full_size() {
     assert!((cuboid.half_extents.x - 2.0).abs() < 1e-6);
     assert!((cuboid.half_extents.y - 1.0).abs() < 1e-6);
     assert!((cuboid.half_extents.z - 3.0).abs() < 1e-6);
+}
+
+#[test]
+fn clear_static_removes_scene_colliders_but_keeps_manual_boxes() {
+    let mut world = PhysicsWorld::default();
+    // Ручной пол («пластина») — clear_static его не трогает.
+    world.add_static_box(Vector::new(10.0, 0.5, 10.0), Vector::new(0.0, -0.5, 0.0));
+    let object = SceneObject::new(
+        glam::Vec3::new(4.0, 1.0, 0.0),
+        glam::Vec3::splat(2.0),
+        glam::Vec4::ONE,
+    );
+    assert!(world.add_scene_object(&object).is_some());
+    assert_eq!(world.static_collider_count(), 1);
+    assert_eq!(world.colliders().iter().count(), 2);
+
+    world.clear_static();
+
+    assert_eq!(world.static_collider_count(), 0);
+    // Пол остался, коллайдер объекта снят.
+    assert_eq!(world.colliders().iter().count(), 1);
+    let (_, collider) = world.colliders().iter().next().expect("manual box");
+    assert!(collider.shape().as_cuboid().is_some());
+}
+
+#[test]
+fn rebuild_static_equivalent_to_initial_build() {
+    let mut scene = Scene::new("rebuild");
+    scene.add(SceneObject::new(
+        glam::Vec3::new(0.0, -0.5, 0.0),
+        glam::Vec3::new(20.0, 1.0, 20.0),
+        glam::Vec4::ONE,
+    ));
+    scene.add(SceneObject::new(
+        glam::Vec3::new(2.0, 1.0, 0.0),
+        glam::Vec3::new(0.5, 2.0, 4.0),
+        glam::Vec4::ONE,
+    ));
+
+    let mut initial = PhysicsWorld::default();
+    for object in &scene.objects {
+        initial.add_scene_object(object);
+    }
+
+    let mut rebuilt = PhysicsWorld::default();
+    // Ручной бокс не должен участвовать в пересборке.
+    rebuilt.add_static_box(Vector::new(1.0, 1.0, 1.0), Vector::new(50.0, 0.0, 0.0));
+    rebuilt.rebuild_static(&scene.objects);
+    // Повторная пересборка без изменений — без дублей.
+    rebuilt.rebuild_static(&scene.objects);
+
+    assert_eq!(
+        rebuilt.static_collider_count(),
+        initial.static_collider_count()
+    );
+    assert_eq!(rebuilt.static_collider_count(), 2);
+    assert_eq!(
+        rebuilt.colliders().iter().count(),
+        initial.colliders().iter().count() + 1
+    );
 }
 
 #[test]

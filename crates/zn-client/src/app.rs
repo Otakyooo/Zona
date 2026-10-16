@@ -13,7 +13,9 @@ use zn_core::FixedStep;
 use zn_input::InputState;
 use zn_net::{PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY};
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
-use zn_render::{Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer};
+use zn_render::{
+    cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer,
+};
 use zn_scene::{Scene, SceneObject};
 use zn_sim::{ClientInput, Simulation, FLAG_SPRINTING};
 
@@ -49,6 +51,8 @@ pub enum AssetState {
     Pending,
     Loaded {
         meshes: Vec<MeshId>,
+        /// Индекс материала glTF для каждого меша (primitive.material).
+        mesh_materials: Vec<Option<usize>>,
         materials: Vec<(Option<String>, MaterialId)>,
     },
     Failed,
@@ -80,6 +84,8 @@ pub struct ClientApp {
     last_reconcile_log: Instant,
     asset_loader: AssetLoader,
     assets: HashMap<String, AssetState>,
+    /// Материалы с `AlphaMode::Blend` — для back-to-front сортировки кадра.
+    blend_materials: HashSet<MaterialId>,
     builtin_mesh_ids: HashMap<String, MeshId>,
     cursor_grabbed: bool,
     fixed: FixedStep,
@@ -166,6 +172,7 @@ impl ClientApp {
             last_reconcile_log: Instant::now(),
             asset_loader: loader,
             assets,
+            blend_materials: HashSet::new(),
             builtin_mesh_ids: HashMap::new(),
             cursor_grabbed: false,
             fixed: FixedStep::from_hz(60),
@@ -238,22 +245,30 @@ impl ClientApp {
                         .iter()
                         .map(|mesh| renderer.register_mesh(mesh))
                         .collect();
-                    let materials: Vec<(Option<String>, MaterialId)> = asset
-                        .materials
-                        .iter()
-                        .map(|material| {
-                            let images = material_images(&asset, material);
-                            let id = renderer.register_material(material, &images);
-                            (material.name.clone(), id)
-                        })
-                        .collect();
+                    let mesh_materials: Vec<Option<usize>> =
+                        asset.meshes.iter().map(|mesh| mesh.material).collect();
+                    let mut materials: Vec<(Option<String>, MaterialId)> = Vec::new();
+                    for material in &asset.materials {
+                        let images = material_images(&asset, material);
+                        let id = renderer.register_material(material, &images);
+                        if material.alpha_mode == zn_assets::AlphaMode::Blend {
+                            self.blend_materials.insert(id);
+                        }
+                        materials.push((material.name.clone(), id));
+                    }
                     log::info!(
                         "ассет '{key}' зарегистрирован: мешей {}, материалов {}",
                         meshes.len(),
                         materials.len()
                     );
-                    self.assets
-                        .insert(key, AssetState::Loaded { meshes, materials });
+                    self.assets.insert(
+                        key,
+                        AssetState::Loaded {
+                            meshes,
+                            mesh_materials,
+                            materials,
+                        },
+                    );
                 }
                 AssetEvent::Failed { key, error } => {
                     log::warn!("ассет '{key}' не загружен: {error} — fallback на builtin");
@@ -264,45 +279,83 @@ impl ClientApp {
     }
 
     /// Пары (меш, материал) для draw list; незагруженное → builtin fallback.
-    fn resolve_asset(&self, object: &SceneObject) -> (MeshId, MaterialId) {
+    /// Приоритет материала: имя объекта → индекс материала примитива (glTF)
+    /// → первый материал ассета → дефолтный.
+    fn resolve_asset(&self, object: &SceneObject) -> Vec<(MeshId, MaterialId)> {
         let Some(renderer) = self.renderer.as_ref() else {
-            return (0, 0);
+            return vec![(0, 0)];
         };
         let cube = renderer.builtin_cube_mesh();
         let default = renderer.default_material();
         let key = object.asset_key();
 
         if let Some(name) = zn_assets::parse_builtin_key(key) {
-            return if name == "cube" {
+            return vec![if name == "cube" {
                 (cube, default)
             } else {
                 self.builtin_mesh_ids
                     .get(name)
                     .map_or((cube, default), |id| (*id, default))
-            };
+            }];
         }
 
         match self.assets.get(key) {
-            Some(AssetState::Loaded { meshes, materials }) => {
-                let mesh = meshes.first().copied().unwrap_or(cube);
-                let material = match object.material.as_deref() {
-                    Some(name) => materials
+            Some(AssetState::Loaded {
+                meshes,
+                mesh_materials,
+                materials,
+            }) => {
+                if meshes.is_empty() {
+                    return vec![(cube, default)];
+                }
+                // Имя материала объекта — для всех примитивов сразу.
+                if let Some(name) = object.material.as_deref() {
+                    if let Some((_, id)) = materials
                         .iter()
                         .find(|(material_name, _)| material_name.as_deref() == Some(name))
-                        .map(|(_, id)| *id),
-                    None => materials.first().map(|(_, id)| *id),
+                    {
+                        return meshes.iter().map(|mesh| (*mesh, *id)).collect();
+                    }
+                    log::debug!("материал '{name}' не найден в '{key}' — по примитивам");
                 }
-                .unwrap_or(default);
-                (mesh, material)
+                meshes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, mesh)| {
+                        let material = mesh_materials
+                            .get(index)
+                            .copied()
+                            .flatten()
+                            .and_then(|material_index| {
+                                materials.get(material_index).map(|(_, id)| *id)
+                            })
+                            .or_else(|| materials.first().map(|(_, id)| *id))
+                            .unwrap_or(default);
+                        (*mesh, material)
+                    })
+                    .collect()
             }
-            _ => (cube, default),
+            _ => vec![(cube, default)],
         }
     }
 
-    /// Кадровый draw list: статика сцены + капсулы удалённых игроков на их
-    /// интерполированных позициях. Локальный игрок не рисуется — его точка
-    /// зрения и есть камера.
+    /// Кадровый draw list: статика сцены + капсулы удалённых игроков;
+    /// полупрозрачные батчи упорядочены back-to-front.
     fn build_frame_draw_list(&mut self) -> DrawList {
+        let mut list = self.collect_frame_draw_list();
+        // Blend рисуется после opaque; внутри батча — дальние раньше, чтобы
+        // результат смешивания не зависел от порядка объектов в сцене.
+        let camera_position = self.camera.position;
+        list.sort_blended_back_to_front(camera_position, |material| {
+            self.blend_materials.contains(&material)
+        });
+        list
+    }
+
+    /// Сырой кадровый draw list: статика сцены + капсулы удалённых игроков
+    /// на их интерполированных позициях. Локальный игрок не рисуется — его
+    /// точка зрения и есть камера.
+    fn collect_frame_draw_list(&mut self) -> DrawList {
         let mut list = build_draw_list(&self.scene, |object| self.resolve_asset(object));
 
         if self.remote.is_empty() {
@@ -648,7 +701,15 @@ impl ApplicationHandler for ClientApp {
                 self.smoother.decay(frame_delta.as_secs_f32());
                 let list = self.build_frame_draw_list();
                 if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.update_draw_list(&list);
+                    // Ресурсы всех батчей помечаем использованными до кулинга:
+                    // оффскрин-объекты не должны вытеснять видимые из LRU.
+                    renderer.touch_scene(&list);
+                    let visible = visible_instances(&list.batches, &self.camera, |mesh| {
+                        renderer
+                            .mesh_bounds(mesh)
+                            .unwrap_or(zn_assets::Bounds::EMPTY)
+                    });
+                    renderer.update_draw_list(&DrawList { batches: visible });
                     renderer.render(&self.camera);
                 }
                 self.update_window_title();

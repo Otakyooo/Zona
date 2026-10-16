@@ -167,16 +167,20 @@ impl Simulation {
     /// как в `demo_zone`.
     pub fn with_scene(scene: &Scene) -> Self {
         let mut simulation = Self::build(scene.spawn, scene.spawn_yaw, false);
-        {
-            let physics = simulation
-                .world
-                .get_resource_mut::<PhysicsWorld>()
-                .expect("physics resource initialized in build()");
-            for object in &scene.objects {
-                physics.add_scene_object(object);
-            }
-        }
+        simulation.rebuild_static(scene);
         simulation
+    }
+
+    /// Пересобирает статические коллайдеры сцены и точку спавна: единый путь
+    /// загрузки уровня (ручная пол-пластина пустой сцены не трогается).
+    pub fn rebuild_static(&mut self, scene: &Scene) {
+        self.spawn = scene.spawn;
+        self.spawn_yaw = scene.spawn_yaw;
+        let physics = self
+            .world
+            .get_resource_mut::<PhysicsWorld>()
+            .expect("physics resource initialized in build()");
+        physics.rebuild_static(&scene.objects);
     }
 
     fn build(spawn: Vec3, spawn_yaw: f32, ground_plate: bool) -> Self {
