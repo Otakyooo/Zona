@@ -1,25 +1,37 @@
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use glam::Vec3;
-use zn_net::{ClientInput, MAX_PLAYERS_PER_SESSION, PROTOCOL_VERSION};
-use zn_sim::Simulation;
+use zn_net::{MAX_PLAYERS_PER_SESSION, PROTOCOL_VERSION, SIMULATION_HZ, SNAPSHOT_HZ};
+use zn_scene::Scene;
+use zn_server::{Session, SessionConfig, DEFAULT_PORT};
 
-#[derive(Clone, Copy, Debug)]
+const USAGE: &str = "usage: zn-server [--bind <addr>] [--port <port>] [--max-players <n>] \
+[--content-root <dir>] [--level <name>] [--sim-latency-ms <ms>] [--sim-loss-pct <0..100>]";
+
+#[derive(Clone, Debug)]
 struct ServerArgs {
+    bind: String,
     port: u16,
     max_players: usize,
-    tick_hz: u32,
+    content_root: PathBuf,
+    level: String,
+    sim_latency_ms: u64,
+    sim_loss_pct: f32,
 }
 
 impl Default for ServerArgs {
     fn default() -> Self {
         Self {
-            port: 7700,
+            bind: "0.0.0.0".to_string(),
+            port: DEFAULT_PORT,
             max_players: MAX_PLAYERS_PER_SESSION,
-            tick_hz: 60,
+            content_root: PathBuf::from("game/content"),
+            level: "demo_zone".to_string(),
+            sim_latency_ms: 0,
+            sim_loss_pct: 0.0,
         }
     }
 }
@@ -32,6 +44,7 @@ fn parse_args() -> Result<ServerArgs, String> {
             .next()
             .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
+            "--bind" => args.bind = value,
             "--port" => {
                 args.port = value
                     .parse()
@@ -42,16 +55,23 @@ fn parse_args() -> Result<ServerArgs, String> {
                     .parse()
                     .map_err(|_| format!("invalid max players: {value}"))?
             }
-            "--tick-hz" => {
-                args.tick_hz = value
+            "--content-root" => args.content_root = PathBuf::from(value),
+            "--level" => args.level = value,
+            "--sim-latency-ms" => {
+                args.sim_latency_ms = value
                     .parse()
-                    .map_err(|_| format!("invalid tick hz: {value}"))?
+                    .map_err(|_| format!("invalid sim latency: {value}"))?
+            }
+            "--sim-loss-pct" => {
+                args.sim_loss_pct = value
+                    .parse()
+                    .map_err(|_| format!("invalid sim loss pct: {value}"))?
             }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    args.max_players = args.max_players.clamp(1, MAX_PLAYERS_PER_SESSION * 10);
-    args.tick_hz = args.tick_hz.clamp(10, 240);
+    args.max_players = args.max_players.clamp(1, MAX_PLAYERS_PER_SESSION);
+    args.sim_loss_pct = args.sim_loss_pct.clamp(0.0, 100.0);
     Ok(args)
 }
 
@@ -62,24 +82,47 @@ fn main() {
         Ok(args) => args,
         Err(error) => {
             eprintln!("error: {error}");
-            eprintln!("usage: zn-server [--port <port>] [--max-players <n>] [--tick-hz <n>]");
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };
 
-    let mut simulation = Simulation::new();
+    let scene = load_scene(&args.content_root, &args.level);
+    let config = SessionConfig {
+        max_players: args.max_players,
+        out_latency: Duration::from_millis(args.sim_latency_ms),
+        out_loss_pct: args.sim_loss_pct,
+        ..SessionConfig::default()
+    };
 
+    let bind_addr = format!("{}:{}", args.bind, args.port);
+    let mut session = match Session::bind(&bind_addr, &scene, config) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("error: не удалось забиндить {bind_addr}: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let local = session
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or(bind_addr);
     log::info!(
-        "ZONA dedicated server starting: port={} max_players={} tick_hz={} (simulation: {} Hz) protocol={}",
-        args.port,
+        "ZONA dedicated server: листен {local}, симуляция {SIMULATION_HZ} Гц, снапшоты {SNAPSHOT_HZ} Гц, \
+protocol={PROTOCOL_VERSION}, max_players={}, уровень '{}'",
         args.max_players,
-        args.tick_hz,
-        simulation.tick_hz(),
-        PROTOCOL_VERSION
+        scene.name
     );
+    if args.sim_latency_ms > 0 || args.sim_loss_pct > 0.0 {
+        log::warn!(
+            "включена диагностика сети: задержка исходящих {} мс, дроп {:.1}%",
+            args.sim_latency_ms,
+            args.sim_loss_pct
+        );
+    }
 
     let (tx, rx) = channel::<String>();
-
     thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines().map_while(Result::ok) {
@@ -99,45 +142,93 @@ fn main() {
         let frame_delta = now - last;
         last = now;
 
-        let steps = simulation.advance(frame_delta);
-        if steps > 0 {
-            log::debug!(target: "zn_server", "ran {steps} fixed steps, tick={}", simulation.tick());
-        }
+        session.poll(frame_delta);
 
         while let Ok(line) = rx.try_recv() {
             match line.as_str() {
                 "quit" | "exit" => running = false,
-                "status" | "" => print_status(&mut simulation, args, boot),
+                "status" | "" => print_status(&mut session, &args, boot),
+                "list" => print_clients(&mut session),
                 "spawn" => {
-                    let id = simulation.spawn_player(Vec3::ZERO);
-                    simulation.queue_input(id, ClientInput::new(simulation.tick()));
+                    let id = session.debug_spawn();
                     println!("spawned player {id}");
                 }
-                other => println!("unknown command: {other} (try: status, spawn, quit)"),
+                other => match other.strip_prefix("kick ") {
+                    Some(id) => match id.trim().parse::<u64>() {
+                        Ok(id) if session.kick(id) => println!("kicked player {id}"),
+                        Ok(id) => println!("player {id} not found"),
+                        Err(_) => println!("usage: kick <player_id>"),
+                    },
+                    None => println!(
+                        "unknown command: {other} (try: status, list, kick <id>, spawn, quit)"
+                    ),
+                },
             }
         }
 
         if last_status.elapsed() >= Duration::from_secs(5) {
             last_status = Instant::now();
-            print_status(&mut simulation, args, boot);
+            print_status(&mut session, &args, boot);
         }
 
         thread::sleep(Duration::from_millis(2));
     }
 
-    println!("server stopped after {} ticks", simulation.tick());
+    println!("server stopped after {} ticks", session.tick());
     let _ = std::io::stdout().flush();
 }
 
-fn print_status(simulation: &mut Simulation, args: ServerArgs, boot: Instant) {
+fn load_scene(content_root: &Path, level: &str) -> Scene {
+    let path = content_root
+        .join("levels")
+        .join(format!("{level}.scene.ron"));
+    match Scene::load_ron(&path) {
+        Ok(scene) => {
+            log::info!(
+                "уровень '{level}' загружен из {} ({} объектов)",
+                path.display(),
+                scene.len()
+            );
+            scene
+        }
+        Err(error) => {
+            log::warn!(
+                "уровень '{level}' не прочитан ({}): {error} — fallback на demo_zone()",
+                path.display()
+            );
+            Scene::demo_zone()
+        }
+    }
+}
+
+fn print_status(session: &mut Session, args: &ServerArgs, boot: Instant) {
+    let stats = session.stats();
     println!(
-        "status: uptime={:?} tick={} players={}/{} snapshot_entities={} protocol={}",
+        "status: uptime={:?} tick={} players={}/{} packets: rx={} tx={} drop={} protocol={} hash={:#018x}",
         boot.elapsed(),
-        simulation.tick(),
-        simulation.player_count(),
+        session.tick(),
+        session.player_count(),
         args.max_players,
-        simulation.snapshot().len(),
-        PROTOCOL_VERSION
+        stats.received,
+        stats.sent,
+        stats.dropped,
+        PROTOCOL_VERSION,
+        session.content_hash(),
     );
+    let _ = std::io::stdout().flush();
+}
+
+fn print_clients(session: &mut Session) {
+    let clients = session.clients();
+    if clients.is_empty() {
+        println!("клиентов нет");
+        return;
+    }
+    for client in clients {
+        println!(
+            "  id={} name='{}' addr={} idle={:?}",
+            client.player_id, client.name, client.addr, client.idle
+        );
+    }
     let _ = std::io::stdout().flush();
 }

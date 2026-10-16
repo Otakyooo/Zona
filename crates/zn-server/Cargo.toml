@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "ZONA dedicated server: authoritative session simulation (netcode transport lands in M3)"
+description = "ZONA dedicated server: authoritative UDP session (one process = one match)"
+
+[lib]
+name = "zn_server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "zn-server"
@@ -13,8 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 env_logger = { workspace = true }
-glam = { workspace = true }
 log = { workspace = true }
-zn-core = { path = "../zn-core" }
 zn-net = { path = "../zn-net" }
+zn-scene = { path = "../zn-scene" }
 zn-sim = { path = "../../game/zn-sim" }

@@ -1,0 +1,413 @@
+//! E2E-тесты UDP-сессии на loopback: сервер и «тупые» клиенты через `zn-net`.
+//! Время сессии виртуальное (`Session::poll(dt)`), wall-clock-ожиданий нет —
+//! только короткие `yield_now` для доставки loopback-датаграмм.
+
+use std::net::{SocketAddr, UdpSocket};
+use std::time::Duration;
+
+use zn_net::{
+    decode_message, encode_message, ClientInput, Message, PlayerNetState, RejectReason,
+    FLAG_GROUNDED, PROTOCOL_VERSION,
+};
+use zn_scene::Scene;
+use zn_server::{Session, SessionConfig};
+
+struct TestClient {
+    socket: UdpSocket,
+}
+
+impl TestClient {
+    fn connect(server: SocketAddr) -> Self {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect(server).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        Self { socket }
+    }
+
+    fn send(&self, message: &Message) {
+        let bytes = encode_message(message).unwrap();
+        self.socket.send(&bytes).unwrap();
+    }
+
+    fn hello(&self, content_hash: u64) {
+        self.send(&Message::ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            content_hash,
+            name: "Тестер".to_string(),
+        });
+    }
+
+    fn try_recv(&self) -> Option<Message> {
+        let mut buf = [0u8; 2048];
+        match self.socket.recv(&mut buf) {
+            Ok(len) => Some(decode_message(&buf[..len]).unwrap()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("recv: {error}"),
+        }
+    }
+
+    /// Последний снапшот из накопленных (остальные отбрасываются).
+    fn last_snapshot(&self) -> Option<(u64, u64, Vec<PlayerNetState>)> {
+        let mut last = None;
+        while let Some(message) = self.try_recv() {
+            if let Message::Snapshot {
+                server_tick,
+                acked_input_tick,
+                players,
+            } = message
+            {
+                last = Some((server_tick, acked_input_tick, players));
+            }
+        }
+        last
+    }
+}
+
+fn test_session(max_players: usize) -> (Session, SocketAddr) {
+    let scene = Scene::demo_zone();
+    let config = SessionConfig {
+        max_players,
+        ..SessionConfig::default()
+    };
+    let session = Session::bind("127.0.0.1:0", &scene, config).unwrap();
+    let addr = session.local_addr().unwrap();
+    (session, addr)
+}
+
+/// Крутит виртуальное время сессии (по 1 мс), пока клиент не получит
+/// сообщение, удовлетворяющее предикату. Верхняя граница — 2 с виртуального
+/// времени (меньше `SERVER_TIMEOUT`).
+fn expect_message(
+    session: &mut Session,
+    client: &TestClient,
+    mut matches: impl FnMut(&Message) -> bool,
+) -> Message {
+    for _ in 0..2000 {
+        session.poll(Duration::from_millis(1));
+        while let Some(message) = client.try_recv() {
+            if matches(&message) {
+                return message;
+            }
+        }
+        std::thread::yield_now();
+    }
+    panic!("сообщение не получено за 2000 итераций");
+}
+
+fn expect_welcome(session: &mut Session, client: &TestClient) -> u64 {
+    match expect_message(session, client, |message| {
+        matches!(message, Message::ServerWelcome { .. })
+    }) {
+        Message::ServerWelcome { player_id, .. } => player_id,
+        other => unreachable!("предикат гарантирует Welcome: {other:?}"),
+    }
+}
+
+fn find_player(players: &[PlayerNetState], player_id: u64) -> PlayerNetState {
+    *players
+        .iter()
+        .find(|player| player.player_id == player_id)
+        .unwrap_or_else(|| panic!("нет игрока {player_id} в снапшоте"))
+}
+
+#[test]
+fn handshake_yields_welcome_with_scene_spawn() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    let scene = Scene::demo_zone();
+
+    client.hello(scene.content_hash());
+    let reply = expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::ServerWelcome { .. } | Message::ServerReject { .. }
+        )
+    });
+
+    match reply {
+        Message::ServerWelcome {
+            player_id, spawn, ..
+        } => {
+            assert_eq!(player_id, 1);
+            assert_eq!(spawn, scene.spawn.to_array());
+        }
+        other => panic!("ожидали Welcome, получили {other:?}"),
+    }
+    assert_eq!(session.player_count(), 1);
+    let clients = session.clients();
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0].name, "Тестер");
+}
+
+#[test]
+fn repeated_hello_resends_welcome_without_second_player() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(Scene::demo_zone().content_hash());
+    let first = expect_welcome(&mut session, &client);
+
+    // Welcome мог потеряться — клиент повторяет Hello; получает тот же id.
+    client.hello(Scene::demo_zone().content_hash());
+    let second = expect_welcome(&mut session, &client);
+
+    assert_eq!(first, second);
+    assert_eq!(session.player_count(), 1);
+}
+
+#[test]
+fn wrong_protocol_version_is_rejected() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+
+    client.send(&Message::ClientHello {
+        protocol_version: PROTOCOL_VERSION + 1,
+        content_hash: Scene::demo_zone().content_hash(),
+        name: "Чужак".to_string(),
+    });
+    let reply = expect_message(&mut session, &client, |message| {
+        matches!(message, Message::ServerReject { .. })
+    });
+
+    assert_eq!(
+        reply,
+        Message::ServerReject {
+            reason: RejectReason::VersionMismatch {
+                server: PROTOCOL_VERSION
+            }
+        }
+    );
+    assert_eq!(session.player_count(), 0);
+}
+
+#[test]
+fn wrong_content_hash_is_rejected() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+
+    client.hello(Scene::demo_zone().content_hash() ^ 0xFFFF);
+    let reply = expect_message(&mut session, &client, |message| {
+        matches!(message, Message::ServerReject { .. })
+    });
+
+    assert_eq!(
+        reply,
+        Message::ServerReject {
+            reason: RejectReason::ContentMismatch
+        }
+    );
+    assert_eq!(session.player_count(), 0);
+}
+
+#[test]
+fn session_full_rejects_second_client() {
+    let (mut session, addr) = test_session(1);
+    let first = TestClient::connect(addr);
+    let second = TestClient::connect(addr);
+    let hash = Scene::demo_zone().content_hash();
+
+    first.hello(hash);
+    expect_welcome(&mut session, &first);
+
+    second.hello(hash);
+    let reply = expect_message(&mut session, &second, |message| {
+        matches!(message, Message::ServerReject { .. })
+    });
+
+    assert_eq!(
+        reply,
+        Message::ServerReject {
+            reason: RejectReason::SessionFull
+        }
+    );
+    assert_eq!(session.player_count(), 1);
+}
+
+#[test]
+fn inputs_are_acked_and_move_the_player() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    let scene = Scene::demo_zone();
+    client.hello(scene.content_hash());
+    let player_id = expect_welcome(&mut session, &client);
+
+    let spawn = scene.spawn.to_array();
+    let mut next_tick = 0u64;
+    let mut last_position = spawn;
+    let mut last_ack = 0u64;
+    let mut grounded = false;
+
+    for _ in 0..60 {
+        let inputs: Vec<ClientInput> = (0..2)
+            .map(|_| {
+                let mut input = ClientInput::new(next_tick);
+                input.move_forward = 1.0;
+                next_tick += 1;
+                input
+            })
+            .collect();
+        client.send(&Message::InputPacket { inputs });
+        session.poll(Duration::from_millis(33));
+        if let Some((_, ack, players)) = client.last_snapshot() {
+            last_ack = last_ack.max(ack);
+            let me = find_player(&players, player_id);
+            last_position = me.position;
+            grounded = me.flags & FLAG_GROUNDED != 0;
+        }
+        std::thread::yield_now();
+
+        if last_ack > 0 && grounded && (last_position[0] - spawn[0]).abs() > 1.0 {
+            break;
+        }
+    }
+
+    assert!(
+        last_ack > 0,
+        "ack снапшота должен расти с обработанными инпутами"
+    );
+    assert!(grounded, "игрок должен приземлиться на пол");
+    // Спавн смотрит вдоль -X (yaw = π): W двигает в -X.
+    assert!(
+        last_position[0] < spawn[0] - 1.0,
+        "игрок не сдвинулся: {last_position:?}"
+    );
+    // Верх пола demo_zone — y = -0.25 (пол 0.5 м от центра -0.5).
+    assert!(
+        (last_position[1] - -0.25).abs() < 0.1,
+        "игрок должен стоять на полу: {last_position:?}"
+    );
+}
+
+#[test]
+fn ping_gets_pong_with_server_tick() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(Scene::demo_zone().content_hash());
+    expect_welcome(&mut session, &client);
+
+    client.send(&Message::Ping { nonce: 42 });
+    let reply = expect_message(&mut session, &client, |message| {
+        matches!(message, Message::Pong { .. })
+    });
+
+    match reply {
+        Message::Pong { nonce, server_tick } => {
+            assert_eq!(nonce, 42);
+            assert!(server_tick <= session.tick());
+        }
+        other => unreachable!("предикат гарантирует Pong: {other:?}"),
+    }
+}
+
+#[test]
+fn silent_client_is_timed_out_on_virtual_time() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(Scene::demo_zone().content_hash());
+    expect_welcome(&mut session, &client);
+    assert_eq!(session.player_count(), 1);
+
+    // 5.2 с виртуального времени молчания — больше SERVER_TIMEOUT (5 с).
+    for _ in 0..520 {
+        session.poll(Duration::from_millis(10));
+        let _ = client.try_recv();
+    }
+
+    assert_eq!(session.player_count(), 0);
+    assert!(session.clients().is_empty());
+}
+
+#[test]
+fn client_bye_removes_player_immediately() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(Scene::demo_zone().content_hash());
+    expect_welcome(&mut session, &client);
+    assert_eq!(session.player_count(), 1);
+
+    client.send(&Message::ClientBye);
+    session.poll(Duration::from_millis(1));
+
+    assert_eq!(session.player_count(), 0);
+    assert!(session.clients().is_empty());
+}
+
+#[test]
+fn snapshots_contain_both_players_and_positions_converge() {
+    let (mut session, addr) = test_session(10);
+    let client_a = TestClient::connect(addr);
+    let client_b = TestClient::connect(addr);
+    let scene = Scene::demo_zone();
+    let hash = scene.content_hash();
+
+    client_a.hello(hash);
+    let player_a = expect_welcome(&mut session, &client_a);
+    client_b.hello(hash);
+    let player_b = expect_welcome(&mut session, &client_b);
+    assert_ne!(player_a, player_b);
+
+    let spawn = scene.spawn.to_array();
+    let mut next_tick = 0u64;
+    let mut snapshot_a = None;
+    let mut snapshot_b = None;
+
+    for _ in 0..80 {
+        let mut inputs_a = Vec::new();
+        let mut inputs_b = Vec::new();
+        for _ in 0..2 {
+            let mut forward = ClientInput::new(next_tick);
+            forward.move_forward = 1.0; // A: вперёд (−X)
+            inputs_a.push(forward);
+
+            let mut strafe = ClientInput::new(next_tick);
+            strafe.move_right = 1.0; // B: вправо (−Z при yaw = π)
+            inputs_b.push(strafe);
+
+            next_tick += 1;
+        }
+        client_a.send(&Message::InputPacket { inputs: inputs_a });
+        client_b.send(&Message::InputPacket { inputs: inputs_b });
+        session.poll(Duration::from_millis(33));
+        snapshot_a = client_a.last_snapshot().or(snapshot_a);
+        snapshot_b = client_b.last_snapshot().or(snapshot_b);
+        std::thread::yield_now();
+
+        let moved = |snapshot: &Option<(u64, u64, Vec<PlayerNetState>)>| {
+            snapshot.as_ref().is_some_and(|(_, ack, players)| {
+                *ack > 0 && (find_player(players, player_a).position[0] - spawn[0]).abs() > 1.0
+            })
+        };
+        if moved(&snapshot_a) && moved(&snapshot_b) {
+            break;
+        }
+    }
+
+    let (_, ack_a, players_a) = snapshot_a.expect("A должен получить снапшот");
+    let (_, ack_b, players_b) = snapshot_b.expect("B должен получить снапшот");
+    assert!(ack_a > 0 && ack_b > 0, "ack обоих клиентов должен расти");
+    assert_eq!(players_a.len(), 2, "снапшот A содержит обоих игроков");
+    assert_eq!(players_b.len(), 2, "снапшот B содержит обоих игроков");
+
+    // Направления движения: A — вперёд (−X), B — вправо (−Z).
+    let a_from_a = find_player(&players_a, player_a);
+    let b_from_a = find_player(&players_a, player_b);
+    let a_from_b = find_player(&players_b, player_a);
+    let b_from_b = find_player(&players_b, player_b);
+    assert!(
+        a_from_a.position[0] < spawn[0] - 1.0,
+        "A не сдвинулся: {a_from_a:?}"
+    );
+    assert!(
+        b_from_b.position[2] < spawn[2] - 1.0,
+        "B не сдвинулся: {b_from_b:?}"
+    );
+
+    // Обоим клиентам разослан один и тот же тик состояния.
+    for (left, right) in [
+        (a_from_a.position, a_from_b.position),
+        (b_from_a.position, b_from_b.position),
+    ] {
+        let delta =
+            (left[0] - right[0]).abs() + (left[1] - right[1]).abs() + (left[2] - right[2]).abs();
+        assert!(delta < 0.5, "позиции разошлись: {left:?} vs {right:?}");
+    }
+}
