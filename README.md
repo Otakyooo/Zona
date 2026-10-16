@@ -27,8 +27,8 @@
 | Клиент | `zn-client` | все движковые крейты |
 | Сервер | `zn-server` | zn-sim, zn-net |
 | Лаунчер | `zn-launcher` | — |
-| Ассеты | `zn-assets` | gltf, image, ktx2 |
-| Редактор | `zn-tools-editor` | egui, zn-render, zn-assets |
+| Ассеты | `zn-assets` | gltf, image, ktx2, basisu |
+| Редактор | `zn-tools-editor` | egui, egui-wgpu, zn-render, zn-assets |
 | Аудио | `zn-audio` | kira |
 
 ## Сборка и запуск (Windows)
@@ -50,6 +50,7 @@ cargo run -p zn-tools-editor --bin zn-editor
 
 ## Тулчейн
 
+- Минимальная версия Rust — **1.95** (`rust-version` workspace).
 - Целевой тулчейн для разработки: `stable-x86_64-pc-windows-msvc`
   (`rustup default stable-x86_64-pc-windows-msvc`), как в CI. Запуск клиента —
 
@@ -76,7 +77,8 @@ cargo run -p zn-tools-editor --bin zn-editor
 ## Контент
 
 Уровни — RON-файлы `game/content/levels/<имя>.scene.ron`, ассеты —
-`game/content/assets/` (glTF/GLB, PNG/JPEG, KTX2-uncompressed). Клиент читает
+`game/content/assets/` (glTF/GLB, PNG/JPEG, KTX2: uncompressed и Basis Universal).
+Клиент читает
 корень контента из `--content-root` (или `ZN_CONTENT_ROOT`, по умолчанию
 `game/content`) и уровень из `--level <имя>`; если файл не найден — предупреждение
 и fallback на `demo_zone()`. Редактор: `cargo run -p zn-tools-editor --bin zn-editor` —
@@ -96,8 +98,15 @@ cylinder/quad` или относительный путь к glTF), `material` (
 Asset-ключи — строки, межкратные ID (`MeshId`/`MaterialId`) живут только внутри
 `zn-render`. Загрузка ассетов в клиенте — фоновый поток (std::thread + mpsc);
 не загруженное показывается builtin-кубом. GPU-кэши с LRU-выселением по бюджетам
-256 МиБ (меши) / 512 МиБ (текстуры). KTX2 поддерживается только в
-uncompressed-виде (BasisU не реализован — фолбэк на PNG/JPEG/uncompressed KTX2).
+256 МиБ (меши) / 512 МиБ (текстуры). Текстуры грузятся с CPU box-мип-цепочкой
+(сэмплер LinearMipLinear). Материалы с `AlphaMode::Blend` рисуются вторым
+проходом back-to-front после непрозрачных.
+
+KTX2: uncompressed и Basis Universal (ETC1S/BasisLZ и UASTC, в т.ч. с
+Zstd-суперкомпрессией) — транскод в RGBA8 на CPU через `basisu`; BCn-compressed
+форматы вне объёма (фолбэк на PNG/JPEG/uncompressed KTX2). Прокси-коллайдеры
+статики строятся при (пере)загрузке уровня; смена масштаба объекта в рантайме
+их не пересчитывает.
 
 ## Сеть (M3)
 
@@ -138,6 +147,9 @@ Dedicated-сервер и клиент общаются по UDP (bincode, пр�
 - **M2**: контент-пайплайн (glTF/KTX2-импорт, CPU-типы + GPU-кэши), редактор
   уровней, стриминг с LRU-кэшами — готово, валидация: тесты/clippy/fmt зелёные,
   клиент запускается из `game/content`
+- **M2.5**: бэклог M2 — wgpu 30, BasisU-транскод, CPU-мипы, Blend-конвейер,
+  кулинг инстансов, мультиматериал, редактор на egui-wgpu — готово, валидация:
+  тесты/clippy/fmt зелёные, smoke клиента и редактора
 - **M3**: netcode (клиентский prediction/reconciliation, интерполяция удалённых
   игроков), dedicated-сервер (1 матч, ≤ 10 игроков), UDP-протокол v2 — готово,
   валидация: тесты/clippy/fmt зелёные, smoke: сервер + 2 клиента
