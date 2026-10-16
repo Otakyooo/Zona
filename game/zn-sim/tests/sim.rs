@@ -471,6 +471,29 @@ fn fire_rate_is_limited() {
 }
 
 #[test]
+fn snapshot_death_does_not_respawn_locally() {
+    // Предсказание клиента: смерть пришла снапшотом (respawn_at не задан) —
+    // локального респавна быть не должно, игрока вернёт сервер.
+    let mut sim = Simulation::new();
+    let id = sim.spawn_player(Vec3::ZERO);
+    let mut dead = sim.player_state(id).unwrap().net_state();
+    dead.health = 0;
+    assert!(sim.restore_player(id, &dead));
+
+    for _ in 0..300 {
+        sim.step_once();
+    }
+
+    let state = sim.player_state(id).unwrap();
+    assert_eq!(state.health, 0, "локальный респавн без respawn_at запрещён");
+    assert!(
+        state.position.length() < 1e-3,
+        "позиция мёртвого не меняется: {:?}",
+        state.position
+    );
+}
+
+#[test]
 fn aim_forward_matches_camera_convention() {
     let forward = aim_forward(0.0, 0.0);
     assert!((forward - Vec3::X).length() < 1e-5, "{forward:?}");

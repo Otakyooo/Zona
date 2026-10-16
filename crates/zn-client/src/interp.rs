@@ -19,6 +19,8 @@ pub struct PlayerSample {
     pub position: Vec3,
     pub yaw: f32,
     pub pitch: f32,
+    /// Здоровье; 0 — мёртв и не рисуется.
+    pub health: u16,
 }
 
 /// Буфер интерполяции одного удалённого игрока.
@@ -102,6 +104,7 @@ impl InterpolatedPlayer {
             position: p0.lerp(p1, alpha),
             yaw: lerp_angle(s0.yaw, s1.yaw, alpha),
             pitch: s0.pitch + (s1.pitch - s0.pitch) * alpha,
+            health: s0.health,
         })
     }
 }
@@ -111,6 +114,7 @@ fn sample_of(state: &PlayerNetState) -> PlayerSample {
         position: Vec3::from_array(state.position),
         yaw: state.yaw,
         pitch: state.pitch,
+        health: state.health,
     }
 }
 

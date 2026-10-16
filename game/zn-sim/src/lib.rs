@@ -32,8 +32,9 @@ const RIFLE_DAMAGE: f32 = 25.0;
 /// Множители урона головы/ног к базовому.
 const HEAD_DAMAGE_MULT: f32 = 2.0;
 const LEGS_DAMAGE_MULT: f32 = 0.6;
-/// Интервал между выстрелами (60 Гц → ~7.5 выстрелов/с).
-const FIRE_INTERVAL_TICKS: u64 = 8;
+/// Интервал между выстрелами (60 Гц → ~7.5 выстрелов/с); публичен для
+/// локального отклика на клиенте.
+pub const FIRE_INTERVAL_TICKS: u64 = 8;
 /// Задержка респавна после смерти (3 с).
 const RESPAWN_DELAY_TICKS: u64 = 180;
 
@@ -402,6 +403,15 @@ impl Simulation {
             .unwrap_or_default()
     }
 
+    /// Точка попадания луча в статику уровня (конец трейсера для эффектов
+    /// выстрела); `dir` — единичный вектор.
+    pub fn cast_ray(&self, origin: Vec3, dir: Vec3, max_distance: f32) -> Option<Vec3> {
+        self.world
+            .get_resource::<PhysicsWorld>()
+            .and_then(|physics| physics.cast_ray_glam(origin, dir, max_distance))
+            .map(|toi| origin + dir * toi)
+    }
+
     /// Число статических коллайдеров физики (для тестов и диагностики).
     pub fn static_collider_count(&self) -> usize {
         self.world
@@ -735,7 +745,10 @@ fn player_respawn(world: &mut World) {
 
     let mut query = world.query::<&mut PlayerState>();
     for state in query.iter() {
-        if state.health == 0 && tick >= state.respawn_at {
+        // `respawn_at > 0` — страховка клиентского предсказания: смерть из
+        // снапшота не задаёт respawn_at, локальный респавн не срабатывает
+        // (игрока вернёт серверный снапшот).
+        if state.health == 0 && state.respawn_at > 0 && tick >= state.respawn_at {
             state.position = spawn.position;
             state.velocity = Vec3::ZERO;
             state.yaw = spawn.yaw;

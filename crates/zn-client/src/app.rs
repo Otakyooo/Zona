@@ -1,23 +1,25 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowId};
 
 use zn_core::FixedStep;
 use zn_input::InputState;
-use zn_net::{PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY};
+use zn_net::{GameEvent, PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY};
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
     cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer,
 };
 use zn_scene::{Scene, SceneObject};
-use zn_sim::{ClientInput, Simulation, FLAG_SPRINTING};
+use zn_sim::{
+    ClientInput, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING, RIFLE_RANGE,
+};
 
 use crate::assets::{AssetEvent, AssetLoader};
 use crate::interp::{player_color, InterpolatedPlayer, INTERP_DELAY_TICKS};
@@ -31,6 +33,17 @@ const LOOK_SENSITIVITY: f32 = 0.0022;
 
 /// Имя игрока в handshake с сервером.
 const CLIENT_NAME: &str = "Сталкер";
+
+/// Время жизни эффектов выстрела.
+const TRACER_TTL: Duration = Duration::from_millis(80);
+const FLASH_TTL: Duration = Duration::from_millis(60);
+/// Размеры эффектов (инстансы unit-куба): толщина трейсера и ребро вспышки.
+const TRACER_THICKNESS: f32 = 0.025;
+const FLASH_SIZE: f32 = 0.12;
+/// Смещение дула от глаз вдоль прицела.
+const MUZZLE_OFFSET: f32 = 0.45;
+const TRACER_COLOR: Vec4 = Vec4::new(1.0, 0.92, 0.6, 1.0);
+const FLASH_COLOR: Vec4 = Vec4::new(1.0, 0.8, 0.4, 1.0);
 
 /// Масштаб unit-капсулы (радиус 0.5, полная высота 2.0) под капсулу игрока
 /// (`PLAYER_RADIUS` 0.3, полувысота `PLAYER_HALF_HEIGHT` 0.6).
@@ -56,6 +69,21 @@ pub enum AssetState {
         materials: Vec<(Option<String>, MaterialId)>,
     },
     Failed,
+}
+
+/// Трейсер выстрела: отрезок от дула до попадания, живущий доли секунды.
+#[derive(Debug)]
+struct Tracer {
+    from: Vec3,
+    to: Vec3,
+    until: Instant,
+}
+
+/// Вспышка выстрела у дула.
+#[derive(Debug)]
+struct MuzzleFlash {
+    at: Vec3,
+    until: Instant,
 }
 
 pub struct ClientApp {
@@ -86,6 +114,12 @@ pub struct ClientApp {
     assets: HashMap<String, AssetState>,
     /// Материалы с `AlphaMode::Blend` — для back-to-front сортировки кадра.
     blend_materials: HashSet<MaterialId>,
+    /// Трейсеры выстрелов: свои — локальный отклик, чужие — события Shot.
+    tracers: Vec<Tracer>,
+    /// Вспышки у дула.
+    flashes: Vec<MuzzleFlash>,
+    /// Раньше этого клиентского тика локальный отклик огня не повторяется.
+    next_local_fire_tick: u64,
     builtin_mesh_ids: HashMap<String, MeshId>,
     cursor_grabbed: bool,
     fixed: FixedStep,
@@ -173,6 +207,9 @@ impl ClientApp {
             asset_loader: loader,
             assets,
             blend_materials: HashSet::new(),
+            tracers: Vec::new(),
+            flashes: Vec::new(),
+            next_local_fire_tick: 0,
             builtin_mesh_ids: HashMap::new(),
             cursor_grabbed: false,
             fixed: FixedStep::from_hz(60),
@@ -358,21 +395,18 @@ impl ClientApp {
     fn collect_frame_draw_list(&mut self) -> DrawList {
         let mut list = build_draw_list(&self.scene, |object| self.resolve_asset(object));
 
-        if self.remote.is_empty() {
+        // Без GPU (например, в тестах) — только статика сцены.
+        let Some(renderer) = self.renderer.as_ref() else {
             return list;
-        }
-        let (capsule, material) = {
-            let Some(renderer) = self.renderer.as_ref() else {
-                return list;
-            };
-            // До регистрации капсулы (или без GPU) fallback — куб.
-            let capsule = self
-                .builtin_mesh_ids
-                .get("capsule")
-                .copied()
-                .unwrap_or_else(|| renderer.builtin_cube_mesh());
-            (capsule, renderer.default_material())
         };
+        // До регистрации капсулы fallback — куб.
+        let capsule = self
+            .builtin_mesh_ids
+            .get("capsule")
+            .copied()
+            .unwrap_or_else(|| renderer.builtin_cube_mesh());
+        let cube = renderer.builtin_cube_mesh();
+        let material = renderer.default_material();
 
         // Порядок обхода HashMap случаен — рисуем в порядке id (детерминизм).
         let mut ids: Vec<u64> = self.remote.keys().copied().collect();
@@ -385,6 +419,10 @@ impl ClientApp {
             let Some(sample) = player.sample(render_tick) else {
                 continue;
             };
+            if sample.health == 0 {
+                // Мёртвые не рисуются до респавна.
+                continue;
+            }
             let model = Mat4::from_scale_rotation_translation(
                 PLAYER_CAPSULE_SCALE,
                 Quat::from_rotation_y(sample.yaw),
@@ -399,6 +437,47 @@ impl ClientApp {
                 },
             );
         }
+
+        // Эффекты выстрелов: трейсеры (растянутый по направлению куб) и
+        // вспышки у дула. Живут доли секунды — просроченные отбрасываются.
+        let now = Instant::now();
+        self.tracers.retain(|tracer| tracer.until > now);
+        self.flashes.retain(|flash| flash.until > now);
+        for tracer in &self.tracers {
+            let delta = tracer.to - tracer.from;
+            let length = delta.length();
+            if length < 1e-4 {
+                continue;
+            }
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::new(TRACER_THICKNESS, length, TRACER_THICKNESS),
+                Quat::from_rotation_arc(Vec3::Y, delta / length),
+                (tracer.from + tracer.to) * 0.5,
+            );
+            list.push(
+                cube,
+                material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: TRACER_COLOR.to_array(),
+                },
+            );
+        }
+        for flash in &self.flashes {
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::splat(FLASH_SIZE),
+                Quat::IDENTITY,
+                flash.at,
+            );
+            list.push(
+                cube,
+                material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: FLASH_COLOR.to_array(),
+                },
+            );
+        }
         list
     }
 
@@ -409,6 +488,7 @@ impl ClientApp {
     /// игрока, а последние инпуты уходят серверу с redundancy.
     fn simulate(&mut self, frame_delta: std::time::Duration) {
         let steps = self.fixed.accumulate(frame_delta);
+        let now = Instant::now();
 
         for _ in 0..steps {
             let (dx, dy) = self.input.take_mouse_delta();
@@ -418,6 +498,20 @@ impl ClientApp {
                 self.input
                     .move_axis(KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD);
             let sprinting = self.input.is_key_down(KeyCode::ShiftLeft);
+            // Огонь — только с захваченным курсором и живым игроком.
+            let firing = self.cursor_grabbed
+                && self.input.is_button_down(MouseButton::Left)
+                && self
+                    .simulation
+                    .player_state(self.player_id)
+                    .is_none_or(|state| state.health > 0);
+            let mut buttons = 0;
+            if sprinting {
+                buttons |= FLAG_SPRINTING;
+            }
+            if firing {
+                buttons |= FLAG_FIRE;
+            }
 
             let command = ClientInput {
                 tick: self.client_tick,
@@ -426,13 +520,23 @@ impl ClientApp {
                 yaw_delta,
                 pitch_delta,
                 jump: self.input.just_pressed(KeyCode::Space),
-                buttons: if sprinting { FLAG_SPRINTING } else { 0 },
+                buttons,
             };
             self.history.push(command);
             self.simulation.queue_input(self.player_id, command);
             self.simulation.step_once();
+
+            // Локальный отклик своего выстрела (чужой приходит событием Shot).
+            if firing && self.client_tick >= self.next_local_fire_tick {
+                self.next_local_fire_tick = self.client_tick + FIRE_INTERVAL_TICKS;
+                self.spawn_local_shot(now);
+            }
             self.client_tick += 1;
         }
+
+        // Локальное предсказание не репликует события боя: урон и события —
+        // авторитет сервера; очередь очищаем, чтобы она не росла.
+        let _ = self.simulation.take_events();
 
         if steps > 0 {
             self.sync_camera_from_simulation();
@@ -442,6 +546,60 @@ impl ClientApp {
                 // должна превращаться в потерю движения.
                 net.send_inputs(&self.history.last_n(INPUT_REDUNDANCY));
             }
+        }
+    }
+
+    /// Локальный отклик своего выстрела: трейсер до первой стены и вспышка.
+    fn spawn_local_shot(&mut self, now: Instant) {
+        let dir = self.camera.forward();
+        let start = self.camera.position + dir * MUZZLE_OFFSET;
+        let end = self
+            .simulation
+            .cast_ray(start, dir, RIFLE_RANGE)
+            .unwrap_or(start + dir * RIFLE_RANGE);
+        self.flashes.push(MuzzleFlash {
+            at: start,
+            until: now + FLASH_TTL,
+        });
+        self.tracers.push(Tracer {
+            from: start,
+            to: end,
+            until: now + TRACER_TTL,
+        });
+    }
+
+    /// Чужие выстрелы из событий снапшота: трейсер и вспышка. Свои выстрелы
+    /// уже показаны локальным откликом (событие своего shot пропускается).
+    fn handle_shot_events(&mut self, events: &[GameEvent], now: Instant) {
+        for event in events {
+            let GameEvent::Shot {
+                shooter,
+                origin,
+                dir,
+            } = event
+            else {
+                continue;
+            };
+            if Some(*shooter) == self.net_player_id {
+                continue;
+            }
+            let origin = Vec3::from_array(*origin);
+            let Some(dir) = Vec3::from_array(*dir).try_normalize() else {
+                continue;
+            };
+            let end = self
+                .simulation
+                .cast_ray(origin, dir, RIFLE_RANGE)
+                .unwrap_or(origin + dir * RIFLE_RANGE);
+            self.flashes.push(MuzzleFlash {
+                at: origin + dir * MUZZLE_OFFSET,
+                until: now + FLASH_TTL,
+            });
+            self.tracers.push(Tracer {
+                from: origin,
+                to: end,
+                until: now + TRACER_TTL,
+            });
         }
     }
 
@@ -486,9 +644,8 @@ impl ClientApp {
                     server_tick,
                     acked_input_tick,
                     players,
-                    // Визуал событий боя — следующий коммит M4a.
-                    events: _,
-                } => self.apply_snapshot(server_tick, acked_input_tick, &players),
+                    events,
+                } => self.apply_snapshot(server_tick, acked_input_tick, &players, &events, now),
             }
         }
 
@@ -525,14 +682,18 @@ impl ClientApp {
         self.remote.clear();
     }
 
-    /// Снапшот сервера: буферы удалённых игроков, время рендера интерполяции и
-    /// reconciliation локального предсказания.
+    /// Снапшот сервера: события боя, буферы удалённых игроков, время рендера
+    /// интерполяции и reconciliation локального предсказания.
     fn apply_snapshot(
         &mut self,
         server_tick: u64,
         acked_input_tick: u64,
         players: &[PlayerNetState],
+        events: &[GameEvent],
+        now: Instant,
     ) {
+        self.handle_shot_events(events, now);
+
         // Удалённые игроки рисуются с задержкой 100 мс (нужна пара снапшотов
         // вокруг рендер-тика); время рендера назад не идёт.
         self.render_tick = self
@@ -688,6 +849,15 @@ impl ApplicationHandler for ClientApp {
             } => {
                 let grab = !self.cursor_grabbed;
                 self.grab_cursor(grab);
+            }
+            WindowEvent::MouseInput {
+                button: MouseButton::Left,
+                state: ElementState::Pressed,
+                ..
+            } if !self.cursor_grabbed => {
+                // Клик вне захвата — снова захватить курсор; этот клик огня не
+                // даёт (в инпут не попадает).
+                self.grab_cursor(true);
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
@@ -870,7 +1040,7 @@ mod tests {
             health: zn_sim::MAX_HEALTH,
             flags: 0,
         };
-        app.apply_snapshot(100, last_tick, &[me, other]);
+        app.apply_snapshot(100, last_tick, &[me, other], &[], Instant::now());
 
         // Локальный игрок встал на серверную позицию…
         let corrected = app.simulation.player_state(app.player_id).unwrap();
@@ -917,5 +1087,75 @@ mod tests {
             Some(NetClient::connect(&server.local_addr().unwrap().to_string(), 0, "Тест").unwrap());
         app.update_window_title();
         assert_eq!(app.window_title, "ZONA — подключение…");
+    }
+
+    #[test]
+    fn offline_client_fires_with_local_echo() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.cursor_grabbed = true;
+        app.input.press_button(MouseButton::Left);
+        for _ in 0..30 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+
+        // ~0.5 с удержания при интервале 8 тиков: 2–5 трейсеров, а не каждый кадр.
+        assert!(
+            (2..=5).contains(&app.tracers.len()),
+            "трейсеров: {}",
+            app.tracers.len()
+        );
+        assert_eq!(
+            app.flashes.len(),
+            app.tracers.len(),
+            "вспышка на каждый выстрел"
+        );
+        // Локальный отклик упирается в стену/пол (демо-уровень тесный).
+        let tracer = &app.tracers[0];
+        let length = (tracer.to - tracer.from).length();
+        assert!(length > 0.0 && length <= RIFLE_RANGE + 1e-3, "{tracer:?}");
+    }
+
+    #[test]
+    fn shot_events_spawn_tracers_only_for_remote_shooters() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.net_player_id = Some(7);
+        let now = Instant::now();
+
+        app.handle_shot_events(
+            &[
+                GameEvent::Shot {
+                    shooter: 8,
+                    origin: [0.0, 1.62, 14.0],
+                    dir: [1.0, 0.0, 0.0],
+                },
+                // Свой выстрел уже показан локальным откликом — пропускается.
+                GameEvent::Shot {
+                    shooter: 7,
+                    origin: [0.0, 1.62, 14.0],
+                    dir: [1.0, 0.0, 0.0],
+                },
+                // Мусорное направление не роняет кадр.
+                GameEvent::Shot {
+                    shooter: 9,
+                    origin: [0.0, 1.62, 14.0],
+                    dir: [0.0, 0.0, 0.0],
+                },
+            ],
+            now,
+        );
+
+        assert_eq!(app.tracers.len(), 1, "только чужой выстрел даёт трейсер");
+        assert_eq!(app.flashes.len(), 1);
+        // События смерти в коммите B не используются — не паникуем.
+        app.handle_shot_events(
+            &[GameEvent::Death {
+                victim: 8,
+                victim_name: "A".to_string(),
+                killer: 7,
+                killer_name: "B".to_string(),
+            }],
+            now,
+        );
+        assert_eq!(app.tracers.len(), 1);
     }
 }
