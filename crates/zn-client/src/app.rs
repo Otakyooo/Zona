@@ -14,14 +14,14 @@ use zn_content::ItemCatalog;
 use zn_core::{FixedStep, SIMULATION_HZ};
 use zn_input::InputState;
 use zn_net::{
-    dequantize_pos, dequantize_yaw, CorpseNet, GameEvent, GroundItemNet, InventoryAction,
+    dequantize_pos, dequantize_yaw, BoltNet, CorpseNet, GameEvent, GroundItemNet, InventoryAction,
     ItemStackNet, PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY,
 };
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
     cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer,
 };
-use zn_scene::{Scene, SceneObject};
+use zn_scene::{AnomalyKind, Scene, SceneObject};
 use zn_sim::{
     ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING,
     INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS, INVENTORY_SLOTS,
@@ -80,6 +80,24 @@ const CORPSE_SIZE: Vec3 = Vec3::new(1.9, 0.35, 0.7);
 /// Цвет предмета, которого нет в каталоге (контент разошёлся с сервером).
 const DEFAULT_ITEM_COLOR: Vec4 = Vec4::new(0.75, 0.75, 0.75, 1.0);
 
+/// Аномалии (M4c): еле заметные мерцающие сферы; болт, сработавший в аномалии,
+/// проявляет её ярко на `ANOMALY_REVEAL_TTL` c вспышкой в точке срабатывания.
+const ANOMALY_BASE_ALPHA: f32 = 0.12;
+const ANOMALY_FLICKER_ALPHA: f32 = 0.05;
+const ANOMALY_FLICKER_SPEED: f32 = 2.4;
+const ANOMALY_REVEAL_ALPHA: f32 = 0.5;
+const ANOMALY_REVEAL_TTL: Duration = Duration::from_secs(5);
+const ANOMALY_FLASH_TTL: Duration = Duration::from_millis(350);
+const ANOMALY_FLASH_SIZE: f32 = 1.1;
+const ANOMALY_HEAT_COLOR: [f32; 3] = [1.0, 0.45, 0.2];
+const ANOMALY_GRAVITY_COLOR: [f32; 3] = [0.5, 0.35, 1.0];
+const ANOMALY_FLASH_COLOR: Vec4 = Vec4::new(1.0, 0.95, 0.75, 0.8);
+
+/// Болт в полёте: тонкая палочка вдоль направления движения.
+const BOLT_THICKNESS: f32 = 0.05;
+const BOLT_LENGTH: f32 = 0.34;
+const BOLT_COLOR: Vec4 = Vec4::new(0.85, 0.86, 0.8, 1.0);
+
 /// Интервал диагностического лога reconciliation, с.
 const RECONCILE_LOG_INTERVAL_SECS: f32 = 5.0;
 
@@ -106,6 +124,40 @@ struct Tracer {
 /// Вспышка выстрела у дула.
 #[derive(Debug)]
 struct MuzzleFlash {
+    at: Vec3,
+    until: Instant,
+}
+
+/// Болт в полёте: позиции двух последних снапшотов для интерполяции рендера.
+#[derive(Clone, Copy, Debug)]
+struct BoltView {
+    id: u32,
+    prev: Vec3,
+    pos: Vec3,
+    prev_tick: u64,
+    tick: u64,
+}
+
+impl BoltView {
+    /// Позиция на момент рендера: линейная интерполяция между снапшотами.
+    fn sample(&self, render_tick: u64) -> Vec3 {
+        if self.tick <= self.prev_tick {
+            return self.pos;
+        }
+        let span = (self.tick - self.prev_tick) as f32;
+        let fraction = (render_tick.saturating_sub(self.prev_tick) as f32 / span).clamp(0.0, 1.0);
+        self.prev.lerp(self.pos, fraction)
+    }
+
+    /// Направление полёта (prev → pos) — для ориентации палочки.
+    fn direction(&self) -> Vec3 {
+        (self.pos - self.prev).try_normalize().unwrap_or(Vec3::Y)
+    }
+}
+
+/// Вспышка в точке срабатывания болта (проявление аномалии).
+#[derive(Debug)]
+struct AnomalyFlash {
     at: Vec3,
     until: Instant,
 }
@@ -255,6 +307,15 @@ pub struct ClientApp {
     world_loot: Vec<GroundItemNet>,
     /// Трупы: снапшоты сервера (offline — локальная симуляция).
     world_corpses: Vec<CorpseNet>,
+    /// Болты в полёте: снапшоты сервера (offline — локальная симуляция);
+    /// позиции интерполируются между кадрами.
+    world_bolts: Vec<BoltView>,
+    /// Проявленные болтом аномалии: индекс → до какого `Instant` яркие.
+    revealed: HashMap<u32, Instant>,
+    /// Вспышки в точках срабатывания болтов.
+    anomaly_flashes: Vec<AnomalyFlash>,
+    /// Полупрозрачный материал аномалий (blend); появляется с renderer.
+    anomaly_material: Option<MaterialId>,
     /// Инвентарь локального игрока из персональных апдейтов.
     inventory: Vec<Option<ItemStackNet>>,
     /// Открытый контейнер обыска; `None` — панель закрыта.
@@ -375,6 +436,10 @@ impl ClientApp {
             catalog,
             world_loot: Vec::new(),
             world_corpses: Vec::new(),
+            world_bolts: Vec::new(),
+            revealed: HashMap::new(),
+            anomaly_flashes: Vec::new(),
+            anomaly_material: None,
             inventory: Vec::new(),
             open_container: None,
             inventory_open: false,
@@ -441,6 +506,28 @@ impl ClientApp {
                 let id = renderer.register_mesh(&mesh);
                 self.builtin_mesh_ids.insert("capsule".to_string(), id);
             }
+        }
+
+        // Сфера нужна даже без сферических объектов сцены: ею рисуются
+        // аномалии (M4c).
+        if !self.builtin_mesh_ids.contains_key("sphere") {
+            if let Some(mesh) = zn_assets::builtin_mesh("sphere") {
+                let id = renderer.register_mesh(&mesh);
+                self.builtin_mesh_ids.insert("sphere".to_string(), id);
+            }
+        }
+
+        // Материал аномалий: альфа-блендинг, прозрачность — из instance-цвета.
+        if self.anomaly_material.is_none() {
+            let material = zn_assets::CpuMaterial {
+                name: Some("anomaly".to_string()),
+                alpha_mode: zn_assets::AlphaMode::Blend,
+                double_sided: true,
+                ..zn_assets::CpuMaterial::default()
+            };
+            let id = renderer.register_material(&material, &[]);
+            self.blend_materials.insert(id);
+            self.anomaly_material = Some(id);
         }
 
         for event in self.asset_loader.drain_events() {
@@ -652,11 +739,86 @@ impl ClientApp {
             );
         }
 
-        // Эффекты выстрелов: трейсеры (растянутый по направлению куб) и
-        // вспышки у дула. Живут доли секунды — просроченные отбрасываются.
+        // Эффекты: трейсеры, вспышки выстрелов, аномалии и болты — живут доли
+        // секунд (кроме подсветки аномалий); просроченные отбрасываются.
         let now = Instant::now();
         self.tracers.retain(|tracer| tracer.until > now);
         self.flashes.retain(|flash| flash.until > now);
+        self.anomaly_flashes.retain(|flash| flash.until > now);
+        self.revealed.retain(|_, until| *until > now);
+
+        // Аномалии (M4c): еле заметные мерцающие сферы; проявленные болтом —
+        // яркие на `ANOMALY_REVEAL_TTL`.
+        let sphere = self.builtin_mesh_ids.get("sphere").copied().unwrap_or(cube);
+        let anomaly_material = self.anomaly_material.unwrap_or(material);
+        let time = self.started.elapsed().as_secs_f32();
+        for (index, anomaly) in self.scene.anomalies.iter().enumerate() {
+            let rgb = match anomaly.kind {
+                AnomalyKind::Heat => ANOMALY_HEAT_COLOR,
+                AnomalyKind::Gravity => ANOMALY_GRAVITY_COLOR,
+            };
+            let alpha = if self
+                .revealed
+                .get(&(index as u32))
+                .is_some_and(|until| *until > now)
+            {
+                ANOMALY_REVEAL_ALPHA
+            } else {
+                let phase = index as f32 * 1.7;
+                let flicker = 0.5 + 0.5 * (time * ANOMALY_FLICKER_SPEED + phase).sin();
+                ANOMALY_BASE_ALPHA + ANOMALY_FLICKER_ALPHA * flicker
+            };
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::splat(anomaly.radius * 2.0),
+                Quat::IDENTITY,
+                anomaly.center(),
+            );
+            list.push(
+                sphere,
+                anomaly_material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: [rgb[0], rgb[1], rgb[2], alpha],
+                },
+            );
+        }
+
+        // Вспышки проявления аномалий: яркий шар в точке срабатывания болта.
+        for flash in &self.anomaly_flashes {
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::splat(ANOMALY_FLASH_SIZE),
+                Quat::IDENTITY,
+                flash.at,
+            );
+            list.push(
+                sphere,
+                anomaly_material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: ANOMALY_FLASH_COLOR.to_array(),
+                },
+            );
+        }
+
+        // Болты в полёте (M4c): палочка по направлению движения, позиция —
+        // интерполяция между снапшотами (offline — из локальной симуляции).
+        for view in &self.world_bolts {
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::new(BOLT_THICKNESS, BOLT_LENGTH, BOLT_THICKNESS),
+                Quat::from_rotation_arc(Vec3::Y, view.direction()),
+                view.sample(render_tick),
+            );
+            list.push(
+                cube,
+                material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: BOLT_COLOR.to_array(),
+                },
+            );
+        }
+
+        // Трейсеры (растянутый по направлению куб) и вспышки у дула.
         for tracer in &self.tracers {
             let delta = tracer.to - tracer.from;
             let length = delta.length();
@@ -765,16 +927,36 @@ impl ClientApp {
         }
 
         if self.net.is_none() {
-            // Offline: истина — локальная симуляция (лут, трупы, апдейты).
+            // Offline: истина — локальная симуляция (лут, трупы, болты, апдейты).
             for event in &local_events {
-                if let GameEvent::UseStarted { player, ticks } = event {
-                    if *player == self.player_id {
+                match event {
+                    GameEvent::UseStarted { player, ticks } if *player == self.player_id => {
                         self.start_healing_view(*ticks, now);
                     }
+                    GameEvent::AnomalyRevealed { anomaly, position } => {
+                        self.reveal_anomaly(*anomaly, *position, now);
+                    }
+                    _ => {}
                 }
             }
             self.world_loot = self.simulation.snapshot_loot();
             self.world_corpses = self.simulation.snapshot_corpses();
+            self.world_bolts = self
+                .simulation
+                .snapshot_bolts()
+                .into_iter()
+                .map(|bolt| {
+                    // Offline-болты обновляются каждый тик — интерполяция не нужна.
+                    let position = Vec3::from_array(dequantize_pos(bolt.pos));
+                    BoltView {
+                        id: bolt.id,
+                        prev: position,
+                        pos: position,
+                        prev_tick: self.client_tick,
+                        tick: self.client_tick,
+                    }
+                })
+                .collect();
             self.apply_net_updates();
         } else {
             // Online: локальные апдейты предсказания не нужны — истина в сети.
@@ -859,18 +1041,33 @@ impl ClientApp {
                         self.start_healing_view(*ticks, now);
                     }
                 }
-                // Яркая подсветка аномалии и вспышка — визуал клиента (M4c).
-                GameEvent::AnomalyRevealed { .. } => {}
+                // Болт сработал в аномалии (M4c): яркая подсветка и вспышка.
+                GameEvent::AnomalyRevealed { anomaly, position } => {
+                    self.reveal_anomaly(*anomaly, *position, now);
+                }
             }
         }
     }
 
-    /// Действия вне инпутов: E (обыск/подбор/закрыть), I (инвентарь),
-    /// T (взять всё), Q (выбросить), Enter (взять/использовать), стрелки
-    /// (навигация). Панели passive — курсор остаётся в игре.
+    /// Проявление аномалии болтом: индекс аномалии и точка вспышки (место
+    /// срабатывания); видят все — событие приходит всем клиентам.
+    fn reveal_anomaly(&mut self, anomaly: u32, position: [f32; 3], now: Instant) {
+        self.revealed.insert(anomaly, now + ANOMALY_REVEAL_TTL);
+        self.anomaly_flashes.push(AnomalyFlash {
+            at: Vec3::from_array(position),
+            until: now + ANOMALY_FLASH_TTL,
+        });
+    }
+
+    /// Действия вне инпутов: E (обыск/подбор/закрыть), G (бросок болта),
+    /// I (инвентарь), T (взять всё), Q (выбросить), Enter (взять/использовать),
+    /// стрелки (навигация). Панели passive — курсор остаётся в игре.
     fn handle_action_keys(&mut self) {
         if self.input.just_pressed(KeyCode::KeyE) {
             self.send_action(PlayerAction::Interact);
+        }
+        if self.input.just_pressed(KeyCode::KeyG) {
+            self.send_action(PlayerAction::ThrowBolt);
         }
         if self.input.just_pressed(KeyCode::KeyI) {
             self.inventory_open = !self.inventory_open;
@@ -1167,12 +1364,14 @@ impl ClientApp {
                     players,
                     loot,
                     corpses,
+                    bolts,
                     events,
-                    bolts: _,
                 } => {
-                    // Мировые списки лута/трупов — прямое замещение снапшотом.
+                    // Мировые списки лута/трупов — прямое замещение снапшотом,
+                    // болты — с позициями прошлого кадра (для интерполяции).
                     self.world_loot = loot;
                     self.world_corpses = corpses;
+                    self.apply_snapshot_bolts(&bolts, server_tick);
                     self.apply_snapshot(server_tick, acked_input_tick, &players, &events, now);
                 }
                 NetEvent::InventoryUpdate { slots } => self.inventory = slots,
@@ -1216,8 +1415,38 @@ impl ClientApp {
         // Сетевая истина лута теряется — offline продолжится с локальной.
         self.world_loot.clear();
         self.world_corpses.clear();
+        self.world_bolts.clear();
+        self.revealed.clear();
+        self.anomaly_flashes.clear();
         self.inventory.clear();
         self.open_container = None;
+    }
+
+    /// Болты из снапшота: список замещается, но позиции обновляются с
+    /// сохранением прошлого кадра — рендер интерполируется между снапшотами.
+    fn apply_snapshot_bolts(&mut self, bolts: &[BoltNet], server_tick: u64) {
+        self.world_bolts
+            .retain(|view| bolts.iter().any(|bolt| bolt.id == view.id));
+        for bolt in bolts {
+            let position = Vec3::from_array(dequantize_pos(bolt.pos));
+            match self.world_bolts.iter_mut().find(|view| view.id == bolt.id) {
+                Some(view) => {
+                    if view.pos != position {
+                        view.prev = view.pos;
+                        view.prev_tick = view.tick;
+                        view.pos = position;
+                        view.tick = server_tick;
+                    }
+                }
+                None => self.world_bolts.push(BoltView {
+                    id: bolt.id,
+                    prev: position,
+                    pos: position,
+                    prev_tick: server_tick,
+                    tick: server_tick,
+                }),
+            }
+        }
     }
 
     /// Снапшот сервера: события боя, буферы удалённых игроков, время рендера
@@ -2579,6 +2808,136 @@ mod tests {
         assert_eq!(
             app.collect_hud_data().hint.as_deref(),
             Some("[E] Подобрать")
+        );
+    }
+
+    // ── Аномалии и болты (M4c) ──────────────────────────────────────────
+
+    #[test]
+    fn offline_throw_bolt_key_spends_bolt_and_shows_projectile() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        let bolt = app.catalog.index_of("bolt").unwrap();
+        assert_eq!(app.simulation.debug_give(app.player_id, bolt, 2), 2);
+
+        app.input.press_key(KeyCode::KeyG);
+        for _ in 0..6 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+
+        assert_eq!(app.world_bolts.len(), 1, "болт в полёте виден рендеру");
+        let state = app.simulation.player_state(app.player_id).unwrap();
+        let left: u32 = state
+            .inventory
+            .iter()
+            .flatten()
+            .filter(|stack| stack.item == bolt)
+            .map(|stack| stack.count)
+            .sum();
+        assert_eq!(left, 1, "один болт потрачен на бросок");
+    }
+
+    #[test]
+    fn snapshot_bolts_interpolate_and_expire() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+
+        // Квант позиции — 0.1 м: [0,0,0] → 0, [6,0,0] → 0.6 м.
+        app.apply_snapshot_bolts(
+            &[BoltNet {
+                id: 1,
+                owner: 2,
+                pos: [0, 0, 0],
+            }],
+            100,
+        );
+        app.apply_snapshot_bolts(
+            &[BoltNet {
+                id: 1,
+                owner: 2,
+                pos: [6, 0, 0],
+            }],
+            102,
+        );
+        let view = app.world_bolts[0];
+        assert!(
+            (view.sample(101).x - 0.3).abs() < 1e-4,
+            "середина пути: {:?}",
+            view.sample(101)
+        );
+        assert!(view.sample(100).x.abs() < 1e-4, "старт — в первом кадре");
+        assert!(
+            (view.sample(102).x - 0.6).abs() < 1e-4,
+            "финиш — во втором кадре"
+        );
+
+        // Болт исчез из снапшота — исчезает из рендера.
+        app.apply_snapshot_bolts(&[], 104);
+        assert!(app.world_bolts.is_empty());
+    }
+
+    #[test]
+    fn anomaly_reveal_event_marks_anomaly_and_flashes() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        assert!(
+            !app.scene.anomalies.is_empty(),
+            "в demo_zone есть аномалии для рендера"
+        );
+
+        app.handle_combat_events(
+            &[GameEvent::AnomalyRevealed {
+                anomaly: 0,
+                position: [1.0, 2.0, 3.0],
+            }],
+            Instant::now(),
+        );
+
+        assert!(app.revealed.contains_key(&0), "аномалия подсвечена");
+        assert_eq!(app.anomaly_flashes.len(), 1, "вспышка в точке срабатывания");
+        assert!(
+            (app.anomaly_flashes[0].at - Vec3::new(1.0, 2.0, 3.0)).length() < 1e-6,
+            "{:?}",
+            app.anomaly_flashes[0].at
+        );
+    }
+
+    #[test]
+    fn offline_bolt_reveals_anomaly() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        let bolt = app.catalog.index_of("bolt").unwrap();
+
+        // Индекс жгучей аномалии у (15, 15) в сцене.
+        let index = app
+            .scene
+            .anomalies
+            .iter()
+            .position(|anomaly| (anomaly.position - Vec3::new(15.0, 0.0, 15.0)).length() < 0.01)
+            .expect("жгучая аномалия у (15, 15)") as u32;
+
+        // Ставим игрока в 4 м от центра с прицелом строго на него.
+        let player_id = app.player_id;
+        let mut net = app.simulation.player_state(player_id).unwrap().net_state();
+        net.position = [11.0, -0.2, 15.0];
+        net.yaw = 0.0; // прицел на +X — в центр аномалии
+        net.pitch = 0.0;
+        assert!(app.simulation.restore_player(player_id, &net));
+        assert_eq!(app.simulation.debug_give(player_id, bolt, 1), 1);
+
+        app.input.press_key(KeyCode::KeyG);
+        for _ in 0..20 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+
+        assert!(
+            app.revealed.contains_key(&index),
+            "болт в аномалии проявил её: {:?}",
+            app.revealed
+        );
+        assert!(
+            !app.anomaly_flashes.is_empty(),
+            "вспышка в месте срабатывания болта"
         );
     }
 }
