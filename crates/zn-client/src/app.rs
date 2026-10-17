@@ -25,7 +25,7 @@ use zn_scene::{Scene, SceneObject};
 use zn_sim::{
     ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING,
     INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS, INVENTORY_SLOTS,
-    MAX_HEALTH, RESPAWN_DELAY_TICKS, RIFLE_RANGE,
+    MAX_CARRY_WEIGHT_KG, MAX_HEALTH, RESPAWN_DELAY_TICKS, RIFLE_RANGE,
 };
 
 use crate::assets::{AssetEvent, AssetLoader};
@@ -57,6 +57,10 @@ const FLASH_COLOR: Vec4 = Vec4::new(1.0, 0.8, 0.4, 1.0);
 /// Kill-фид: сколько строк показывать и сколько живёт строка.
 const KILL_FEED_MAX: usize = 3;
 const KILL_FEED_TTL: Duration = Duration::from_secs(4);
+
+/// Ячейка сетки инвентаря в HUD и зазор между ячейками (логические пиксели).
+const HUD_CELL: f32 = 44.0;
+const HUD_CELL_GAP: f32 = 4.0;
 
 /// Масштаб unit-капсулы (радиус 0.5, полная высота 2.0) под капсулу игрока
 /// (`PLAYER_RADIUS` 0.3, полувысота `PLAYER_HALF_HEIGHT` 0.6).
@@ -135,10 +139,40 @@ enum PanelFocus {
     Inventory,
 }
 
-/// Локальный прогресс лечения (UseStarted): полоска живёт до `until`
-/// (длительность полоски для HUD добавит коммит панелей).
+/// Локальный прогресс лечения (UseStarted): полоска живёт до `until`,
+/// длительность — для доли заполнения в HUD.
 struct HealingView {
     until: Instant,
+    total_secs: f32,
+}
+
+/// Стек предмета для панелей HUD: имя/количество/цвет из каталога.
+struct HudItemStack {
+    name: String,
+    count: u16,
+    color: [f32; 3],
+}
+
+/// Данные панели инвентаря (сетка 8×5, выделение, вес).
+struct InventoryHud {
+    /// Ячейки: `None` — пусто.
+    slots: Vec<Option<HudItemStack>>,
+    select: usize,
+    weight_kg: f32,
+    max_weight_kg: f32,
+    /// Выделенный стек — строка названия; `None` — ячейка пуста.
+    selected: Option<HudItemStack>,
+    /// Фокус ввода на панели (когда открыты обе: ←/→).
+    focused: bool,
+}
+
+/// Данные панели обыска: заголовок («Ящик» / «Тело: имя») и строки.
+struct ContainerHud {
+    title: String,
+    items: Vec<HudItemStack>,
+    select: usize,
+    /// Фокус ввода на панели (когда открыты обе: ←/→).
+    focused: bool,
 }
 
 /// Срез состояния для отрисовки HUD (собирается до заимствования renderer).
@@ -153,6 +187,14 @@ struct HudData {
     feed: Vec<(String, f32)>,
     /// Секунды с запуска клиента — время для egui.
     time: f64,
+    /// Подсказка взаимодействия под прицелом («[E] Обыскать»).
+    hint: Option<String>,
+    /// Панель инвентаря (открыта клавишей I).
+    inventory: Option<InventoryHud>,
+    /// Панель обыска (сервер держит контейнер открытым).
+    container: Option<ContainerHud>,
+    /// Полоска лечения: доля оставшегося времени (1.0 — только началась).
+    healing: Option<f32>,
 }
 
 pub struct ClientApp {
@@ -1021,6 +1063,7 @@ impl ClientApp {
         let total_secs = f32::from(ticks) / SIMULATION_HZ as f32;
         self.healing = Some(HealingView {
             until: now + Duration::from_secs_f32(total_secs),
+            total_secs,
         });
     }
 
@@ -1052,6 +1095,30 @@ impl ClientApp {
             &containers,
             &items,
         );
+    }
+
+    /// Стек для панелей HUD: имя/цвет из каталога; неизвестный предмет
+    /// (каталог разошёлся с сервером) в панели не показывается.
+    fn hud_stack(&self, stack: ItemStackNet) -> Option<HudItemStack> {
+        let definition = self.catalog.get(stack.item)?;
+        Some(HudItemStack {
+            name: definition.display_name.clone(),
+            count: stack.count,
+            color: definition.color,
+        })
+    }
+
+    /// Суммарный вес инвентаря, кг (неизвестные предметы не считаются).
+    fn inventory_weight_kg(&self) -> f32 {
+        self.inventory
+            .iter()
+            .flatten()
+            .filter_map(|stack| {
+                self.catalog
+                    .get(stack.item)
+                    .map(|item| item.weight_kg * f32::from(stack.count))
+            })
+            .sum()
     }
 
     /// Камера из состояния игрока: ступни + высота глаз + незагасшая
@@ -1262,6 +1329,72 @@ impl ClientApp {
             })
             .collect();
 
+        let healing = self.healing.as_ref().map(|heal| {
+            let left = heal.until.saturating_duration_since(now).as_secs_f32();
+            (left / heal.total_secs).clamp(0.0, 1.0)
+        });
+
+        let hint = self.interact_hint.map(|kind| match kind {
+            HintKind::Container => "[E] Обыскать".to_string(),
+            HintKind::Item => "[E] Подобрать".to_string(),
+        });
+
+        let inventory = self.inventory_open.then(|| {
+            let select = self.inventory_select.min(INVENTORY_SLOTS - 1);
+            let slots = (0..INVENTORY_SLOTS)
+                .map(|slot| {
+                    self.inventory
+                        .get(slot)
+                        .copied()
+                        .flatten()
+                        .and_then(|stack| self.hud_stack(stack))
+                })
+                .collect();
+            let selected = self
+                .inventory
+                .get(select)
+                .copied()
+                .flatten()
+                .and_then(|stack| self.hud_stack(stack));
+            InventoryHud {
+                slots,
+                select,
+                weight_kg: self.inventory_weight_kg(),
+                max_weight_kg: MAX_CARRY_WEIGHT_KG,
+                selected,
+                focused: self.effective_focus() == Some(PanelFocus::Inventory),
+            }
+        });
+
+        let container = self.open_container.as_ref().map(|open| {
+            let title = self
+                .world_corpses
+                .iter()
+                .find(|corpse| corpse.container == open.container)
+                .map_or_else(
+                    || "Ящик".to_string(),
+                    |corpse| {
+                        if corpse.name.is_empty() {
+                            "Тело".to_string()
+                        } else {
+                            format!("Тело: {}", corpse.name)
+                        }
+                    },
+                );
+            ContainerHud {
+                title,
+                items: open
+                    .items
+                    .iter()
+                    .filter_map(|stack| self.hud_stack(*stack))
+                    .collect(),
+                select: self
+                    .container_select
+                    .min(open.items.len().saturating_sub(1)),
+                focused: self.effective_focus() == Some(PanelFocus::Container),
+            }
+        });
+
         HudData {
             health,
             max_health: MAX_HEALTH,
@@ -1277,6 +1410,10 @@ impl ClientApp {
             respawn_secs: if health == 0 { respawn_secs } else { None },
             feed,
             time: self.started.elapsed().as_secs_f64(),
+            hint,
+            inventory,
+            container,
+            healing,
         }
     }
 
@@ -1559,6 +1696,17 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         ] {
             painter.line_segment([from, to], stroke);
         }
+
+        // Подсказка взаимодействия — под прицелом.
+        if let Some(hint) = &hud.hint {
+            painter.text(
+                center + egui::vec2(0.0, 34.0),
+                egui::Align2::CENTER_CENTER,
+                hint,
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_white_alpha(220),
+            );
+        }
     }
 
     // Kill-фид — правый верхний угол, свежие строки ярче.
@@ -1604,6 +1752,41 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         egui::Color32::from_white_alpha(230),
     );
 
+    // Полоска лечения — над HP, пока идёт эффект (доля оставшегося времени).
+    if let Some(fraction) = hud.healing {
+        let heal_pos = egui::pos2(bar_pos.x, bar_pos.y - 34.0);
+        let heal_size = egui::vec2(bar_size.x, 8.0);
+        painter.rect_filled(
+            egui::Rect::from_min_size(heal_pos, heal_size),
+            2.0,
+            egui::Color32::from_black_alpha(140),
+        );
+        painter.rect_filled(
+            egui::Rect::from_min_size(heal_pos, egui::vec2(heal_size.x * fraction, heal_size.y)),
+            2.0,
+            egui::Color32::from_rgb(92, 192, 138),
+        );
+    }
+
+    // Панели лута (M4b): инвентарь справа снизу, обыск — слева от него.
+    let inventory_rect = hud.inventory.as_ref().map(|inventory| {
+        let size = inventory_panel_size();
+        let min = egui::pos2(
+            screen.right() - 14.0 - size.x,
+            screen.bottom() - 14.0 - size.y,
+        );
+        let rect = egui::Rect::from_min_size(min, size);
+        draw_inventory_panel(&painter, inventory, rect);
+        rect
+    });
+    if let Some(container) = &hud.container {
+        let rows = container.items.len().max(1) as f32;
+        let size = egui::vec2(280.0, 46.0 + rows * 24.0);
+        let right = inventory_rect.map_or(screen.right() - 14.0, |rect| rect.left() - 12.0);
+        let min = egui::pos2(right - size.x, screen.bottom() - 14.0 - size.y);
+        draw_container_panel(&painter, container, egui::Rect::from_min_size(min, size));
+    }
+
     // Экран смерти.
     if hud.health == 0 {
         let center = screen.center();
@@ -1639,6 +1822,164 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
             "мышь — осмотреться",
             egui::FontId::proportional(14.0),
             egui::Color32::from_white_alpha(140),
+        );
+    }
+}
+
+/// Размер сетки инвентаря HUD (8×5).
+fn grid_size() -> egui::Vec2 {
+    egui::vec2(
+        INVENTORY_COLS as f32 * HUD_CELL + (INVENTORY_COLS - 1) as f32 * HUD_CELL_GAP,
+        INVENTORY_ROWS as f32 * HUD_CELL + (INVENTORY_ROWS - 1) as f32 * HUD_CELL_GAP,
+    )
+}
+
+/// Размер панели инвентаря: заголовок, сетка, вес и подсказки клавиш.
+fn inventory_panel_size() -> egui::Vec2 {
+    let grid = grid_size();
+    egui::vec2(grid.x + 20.0, 34.0 + grid.y + 66.0)
+}
+
+/// Цвет предмета из каталога для egui.
+fn item_color(color: [f32; 3]) -> egui::Color32 {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0) as u8;
+    egui::Color32::from_rgb(channel(color[0]), channel(color[1]), channel(color[2]))
+}
+
+/// Рамка панели: фокусная панель ярче.
+fn panel_frame(painter: &egui::Painter, rect: egui::Rect, focused: bool) {
+    let color = if focused {
+        egui::Color32::from_white_alpha(170)
+    } else {
+        egui::Color32::from_white_alpha(60)
+    };
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.5, color),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Панель инвентаря: сетка 8×5, выделение, название/вес выбранного и
+/// подсказки клавиш. Панель passive — ввод не перехватывает.
+fn draw_inventory_panel(painter: &egui::Painter, panel: &InventoryHud, rect: egui::Rect) {
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(170));
+    panel_frame(painter, rect, panel.focused);
+
+    let header = match &panel.selected {
+        Some(stack) => format!("{} ×{}", stack.name, stack.count),
+        None => "— пусто —".to_string(),
+    };
+    painter.text(
+        egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
+        egui::Align2::LEFT_TOP,
+        header,
+        egui::FontId::proportional(16.0),
+        egui::Color32::from_white_alpha(235),
+    );
+
+    let grid_top = rect.top() + 34.0;
+    for row in 0..INVENTORY_ROWS {
+        for col in 0..INVENTORY_COLS {
+            let index = row * INVENTORY_COLS + col;
+            let min = egui::pos2(
+                rect.left() + 10.0 + col as f32 * (HUD_CELL + HUD_CELL_GAP),
+                grid_top + row as f32 * (HUD_CELL + HUD_CELL_GAP),
+            );
+            let cell = egui::Rect::from_min_size(min, egui::vec2(HUD_CELL, HUD_CELL));
+            painter.rect_filled(cell, 3.0, egui::Color32::from_white_alpha(18));
+            if let Some(Some(stack)) = panel.slots.get(index) {
+                painter.rect_filled(cell.shrink(10.0), 3.0, item_color(stack.color));
+                painter.text(
+                    cell.right_bottom() + egui::vec2(-3.0, -2.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    stack.count.to_string(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_white_alpha(235),
+                );
+            }
+            if index == panel.select {
+                painter.rect_stroke(
+                    cell,
+                    3.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(240, 220, 120)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
+
+    let weight_y = grid_top + grid_size().y + 8.0;
+    painter.text(
+        egui::pos2(rect.left() + 10.0, weight_y),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "Вес: {:.1} / {:.0} кг",
+            panel.weight_kg, panel.max_weight_kg
+        ),
+        egui::FontId::proportional(15.0),
+        egui::Color32::from_white_alpha(225),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 10.0, weight_y + 24.0),
+        egui::Align2::LEFT_TOP,
+        "I — закрыть · Q — выбросить · Enter — использовать",
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_white_alpha(140),
+    );
+}
+
+/// Панель обыска: заголовок, строки «имя ×count», выделение ↑/↓.
+fn draw_container_panel(painter: &egui::Painter, panel: &ContainerHud, rect: egui::Rect) {
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(170));
+    panel_frame(painter, rect, panel.focused);
+
+    painter.text(
+        egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
+        egui::Align2::LEFT_TOP,
+        &panel.title,
+        egui::FontId::proportional(17.0),
+        egui::Color32::from_white_alpha(235),
+    );
+
+    if panel.items.is_empty() {
+        painter.text(
+            egui::pos2(rect.left() + 10.0, rect.top() + 38.0),
+            egui::Align2::LEFT_TOP,
+            "— пусто —",
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_white_alpha(150),
+        );
+        return;
+    }
+
+    for (index, stack) in panel.items.iter().enumerate() {
+        let y = rect.top() + 36.0 + index as f32 * 24.0;
+        if index == panel.select {
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 6.0, y - 2.0),
+                    egui::vec2(rect.width() - 12.0, 22.0),
+                ),
+                3.0,
+                egui::Color32::from_white_alpha(36),
+            );
+        }
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 10.0, y + 3.0),
+                egui::vec2(12.0, 12.0),
+            ),
+            2.0,
+            item_color(stack.color),
+        );
+        painter.text(
+            egui::pos2(rect.left() + 30.0, y + 1.0),
+            egui::Align2::LEFT_TOP,
+            format!("{} ×{}", stack.name, stack.count),
+            egui::FontId::proportional(15.0),
+            egui::Color32::from_white_alpha(230),
         );
     }
 }
@@ -2052,6 +2393,12 @@ mod tests {
         let healing = app.healing.as_ref().expect("полоска лечения запущена");
         let left = healing.until.saturating_duration_since(now).as_secs_f32();
         assert!((left - 2.0).abs() < 1e-3, "left = {left}");
+        // В HUD попадает доля оставшегося времени (почти 1 сразу после старта).
+        let fraction = app
+            .collect_hud_data()
+            .healing
+            .expect("полоска лечения в HUD");
+        assert!((0.9..=1.0).contains(&fraction), "fraction = {fraction}");
 
         // Чужое лечение мою полоску не трогает.
         app.healing = None;
@@ -2067,6 +2414,7 @@ mod tests {
         // Просроченная полоска убирается при сборке HUD.
         app.healing = Some(HealingView {
             until: now - Duration::from_secs(1),
+            total_secs: 2.0,
         });
         let _ = app.collect_hud_data();
         assert!(app.healing.is_none(), "просроченная полоска убрана");
@@ -2138,6 +2486,95 @@ mod tests {
                 .iter()
                 .any(|stack| stack.item == ammo && stack.count == 60),
             "патроны в инвентаре: {stacks:?}"
+        );
+    }
+
+    #[test]
+    fn hud_inventory_panel_reports_grid_weight_and_selection() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        let medkit = app.catalog.index_of("medkit").expect("каталог загружен");
+        let ammo = app.catalog.index_of("ammo_545").unwrap();
+        let medkit_name = app.catalog.get(medkit).unwrap().display_name.clone();
+        let expected_weight = app.catalog.get(medkit).unwrap().weight_kg * 2.0
+            + app.catalog.get(ammo).unwrap().weight_kg * 60.0;
+
+        app.inventory = vec![None; INVENTORY_SLOTS];
+        app.inventory[0] = Some(ItemStackNet {
+            item: medkit,
+            count: 2,
+        });
+        app.inventory[5] = Some(ItemStackNet {
+            item: ammo,
+            count: 60,
+        });
+        app.inventory_open = true;
+        app.inventory_select = 5;
+
+        let hud = app.collect_hud_data();
+        let panel = hud.inventory.as_ref().expect("панель открыта");
+        assert_eq!(panel.slots.len(), INVENTORY_SLOTS);
+        assert_eq!(panel.select, 5);
+        let slot0 = panel.slots[0].as_ref().expect("аптечка в ячейке 0");
+        assert_eq!(slot0.name, medkit_name);
+        assert_eq!(slot0.count, 2);
+        let selected = panel.selected.as_ref().expect("выделена ячейка 5");
+        assert_eq!(selected.count, 60);
+        assert!(
+            (panel.weight_kg - expected_weight).abs() < 1e-4,
+            "вес {} при ожидании {expected_weight}",
+            panel.weight_kg
+        );
+        assert_eq!(panel.max_weight_kg, MAX_CARRY_WEIGHT_KG);
+        assert!(panel.focused, "одна панель — фокус на ней");
+        assert!(hud.container.is_none());
+    }
+
+    #[test]
+    fn hud_container_panel_title_for_crate_and_corpse() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        let bolt = app.catalog.index_of("bolt").unwrap();
+
+        app.open_container = Some(OpenContainer {
+            container: 42,
+            items: vec![ItemStackNet {
+                item: bolt,
+                count: 10,
+            }],
+        });
+        // Ящик без трупа — заголовок «Ящик».
+        let hud = app.collect_hud_data();
+        let panel = hud.container.as_ref().expect("панель обыска");
+        assert_eq!(panel.title, "Ящик");
+        assert_eq!(panel.items.len(), 1);
+        assert_eq!(panel.items[0].count, 10);
+        assert!(panel.focused, "одна панель — фокус на ней");
+
+        // Труп с тем же id контейнера — «Тело: имя».
+        app.world_corpses = vec![CorpseNet {
+            container: 42,
+            owner: 8,
+            name: "Жертва".to_string(),
+            pos: [0, 0, 0],
+            yaw: 0,
+        }];
+        let hud = app.collect_hud_data();
+        assert_eq!(hud.container.as_ref().unwrap().title, "Тело: Жертва");
+    }
+
+    #[test]
+    fn hud_hint_strings_match_target_kind() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        assert!(app.collect_hud_data().hint.is_none());
+
+        app.interact_hint = Some(HintKind::Container);
+        assert_eq!(app.collect_hud_data().hint.as_deref(), Some("[E] Обыскать"));
+
+        app.interact_hint = Some(HintKind::Item);
+        assert_eq!(
+            app.collect_hud_data().hint.as_deref(),
+            Some("[E] Подобрать")
         );
     }
 }
