@@ -44,6 +44,55 @@ pub struct LootEntry {
     pub count: u32,
 }
 
+/// Вид аномалии (M4c).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AnomalyKind {
+    /// Жгучая: наносит урон, пока цель внутри сферы.
+    Heat,
+    /// Гравитационная: тянет цель к центру, урона нет.
+    Gravity,
+}
+
+/// Аномалия в сцене: сфера радиуса `radius` с центром `position + (0, radius, 0)`
+/// (якорь `position` лежит на полу — сфера касается пола). Аномалии не входят в
+/// геометрию столкновений: эффекты считает симуляция, визуал — клиент.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneAnomaly {
+    pub position: Vec3,
+    pub radius: f32,
+    pub kind: AnomalyKind,
+    /// Ключ предмета из каталога: артефакт появляется на полу в якоре при старте матча.
+    #[serde(default)]
+    pub artifact: Option<String>,
+}
+
+impl SceneAnomaly {
+    pub fn new(position: Vec3, radius: f32, kind: AnomalyKind) -> Self {
+        Self {
+            position,
+            radius,
+            kind,
+            artifact: None,
+        }
+    }
+
+    pub fn with_artifact(mut self, item: impl Into<String>) -> Self {
+        self.artifact = Some(item.into());
+        self
+    }
+
+    /// Центр сферы в мире.
+    pub fn center(&self) -> Vec3 {
+        self.position + Vec3::Y * self.radius
+    }
+
+    /// Точка внутри сферы аномалии?
+    pub fn contains(&self, point: Vec3) -> bool {
+        point.distance_squared(self.center()) <= self.radius * self.radius
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneObject {
     pub position: Vec3,
@@ -205,6 +254,9 @@ pub struct Scene {
     pub spawn_yaw: f32,
     #[serde(default)]
     pub objects: Vec<SceneObject>,
+    /// Аномалии уровня (M4c): не коллайдеры, влияют на игроков и болты.
+    #[serde(default)]
+    pub anomalies: Vec<SceneAnomaly>,
 }
 
 impl Scene {
@@ -214,11 +266,17 @@ impl Scene {
             spawn: Vec3::new(0.0, 2.0, 0.0),
             spawn_yaw: 0.0,
             objects: Vec::new(),
+            anomalies: Vec::new(),
         }
     }
 
     pub fn add(&mut self, object: SceneObject) -> &mut Self {
         self.objects.push(object);
+        self
+    }
+
+    pub fn add_anomaly(&mut self, anomaly: SceneAnomaly) -> &mut Self {
+        self.anomalies.push(anomaly);
         self
     }
 
@@ -371,6 +429,23 @@ impl Scene {
         for object in crates {
             scene.add(object);
         }
+
+        // Аномалии M4c: две жгучие (урон в радиусе) и одна гравитационная
+        // (тянет к центру). В двух из них с начала матча лежат артефакты
+        // («Жар-камень» и «Тягун»); появление предметов — работа симуляции.
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(15.0, 0.0, 15.0), 3.0, AnomalyKind::Heat)
+                .with_artifact("artifact_heat"),
+        );
+        scene.add_anomaly(SceneAnomaly::new(
+            Vec3::new(3.0, 0.0, -21.0),
+            3.0,
+            AnomalyKind::Heat,
+        ));
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(-15.0, 0.0, 15.0), 3.5, AnomalyKind::Gravity)
+                .with_artifact("artifact_gravity"),
+        );
 
         scene
     }

@@ -379,10 +379,19 @@ mod tests {
     fn shipped_catalog_loads_and_validates() {
         let catalog = ItemCatalog::load_ron("../content/items/items.ron")
             .expect("game/content/items/items.ron должен загружаться");
-        assert_eq!(catalog.len(), 6);
+        assert_eq!(catalog.len(), 8);
         assert!(catalog.index_of("medkit").is_some());
         assert!(catalog.index_of("bandage").is_some());
         assert!(catalog.get_by_key("medkit").unwrap().use_effect.is_some());
+        let artifact = catalog
+            .get_by_key("artifact_heat")
+            .expect("Жар-камень должен быть в каталоге");
+        assert_eq!(artifact.stack_max, 1);
+        assert!(
+            artifact.use_effect.is_none(),
+            "артефакты пока не используются"
+        );
+        assert!(catalog.index_of("artifact_gravity").is_some());
     }
 
     fn expect_validation_error(text: &str) {

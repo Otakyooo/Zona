@@ -1,6 +1,20 @@
 (
     items: [
         (
+            key: "artifact_gravity",
+            display_name: "Тягун",
+            weight_kg: 0.5,
+            stack_max: 1,
+            color: (0.55, 0.3, 0.95),
+        ),
+        (
+            key: "artifact_heat",
+            display_name: "Жар-камень",
+            weight_kg: 0.4,
+            stack_max: 1,
+            color: (1.0, 0.45, 0.15),
+        ),
+        (
             key: "ammo_545",
             display_name: "Патроны 5.45",
             weight_kg: 0.015,

@@ -854,4 +854,24 @@
             ]),
         ),
     ],
+    anomalies: [
+        (
+            position: (15.0, 0.0, 15.0),
+            radius: 3.0,
+            kind: heat,
+            artifact: Some("artifact_heat"),
+        ),
+        (
+            position: (3.0, 0.0, -21.0),
+            radius: 3.0,
+            kind: heat,
+            artifact: None,
+        ),
+        (
+            position: (-15.0, 0.0, 15.0),
+            radius: 3.5,
+            kind: gravity,
+            artifact: Some("artifact_gravity"),
+        ),
+    ],
 )

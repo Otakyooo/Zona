@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use glam::Vec3;
-    use zn_scene::{ColliderShape, LootEntry, Scene, SceneObject, BUILTIN_CUBE};
+    use zn_scene::{
+        AnomalyKind, ColliderShape, LootEntry, Scene, SceneAnomaly, SceneObject, BUILTIN_CUBE,
+    };
 
     #[test]
     fn ron_roundtrip_preserves_scene() {
@@ -68,6 +70,7 @@ mod tests {
         assert_eq!(object.effective_collider(), Some(ColliderShape::Box));
         assert_eq!(object.loot, None);
         assert!(!object.is_container());
+        assert!(scene.anomalies.is_empty());
     }
 
     #[test]
@@ -211,5 +214,73 @@ mod tests {
         let mut c = b.clone();
         c.objects[0].position.x = 5.0;
         assert_ne!(c.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn anomaly_roundtrip_through_ron() {
+        let mut scene = Scene::new("anomalies");
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(1.0, 0.0, 2.0), 3.0, AnomalyKind::Heat)
+                .with_artifact("artifact_heat"),
+        );
+        scene.add_anomaly(SceneAnomaly::new(
+            Vec3::new(-4.0, 0.0, 5.0),
+            3.5,
+            AnomalyKind::Gravity,
+        ));
+
+        let text = scene.to_ron().unwrap();
+        assert!(
+            text.contains("heat") && text.contains("gravity"),
+            "вид аномалии пишется в lowercase: {text}"
+        );
+        let loaded = Scene::from_ron(&text).unwrap();
+        assert_eq!(loaded, scene);
+        assert_eq!(
+            loaded.anomalies[0].artifact.as_deref(),
+            Some("artifact_heat")
+        );
+        assert_eq!(loaded.anomalies[1].artifact, None);
+
+        // Центр сферы — на высоте радиуса над якорем; contains учитывает радиус.
+        let gravity = &loaded.anomalies[1];
+        assert_eq!(gravity.center(), Vec3::new(-4.0, 3.5, 5.0));
+        assert!(gravity.contains(Vec3::new(-4.0, 3.5, 5.0)));
+        assert!(!gravity.contains(Vec3::new(-4.0, 3.5, 5.0 + 3.6)));
+    }
+
+    #[test]
+    fn demo_zone_has_anomalies_with_artifacts() {
+        let scene = Scene::demo_zone();
+        assert_eq!(scene.anomalies.len(), 3);
+        let kinds: Vec<_> = scene.anomalies.iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![AnomalyKind::Heat, AnomalyKind::Heat, AnomalyKind::Gravity]
+        );
+        let artifacts: Vec<&str> = scene
+            .anomalies
+            .iter()
+            .filter_map(|a| a.artifact.as_deref())
+            .collect();
+        assert_eq!(artifacts, vec!["artifact_heat", "artifact_gravity"]);
+        for anomaly in &scene.anomalies {
+            assert!(anomaly.radius > 0.0);
+            // Якорь — на полу в пределах арены.
+            assert_eq!(anomaly.position.y, 0.0);
+            assert!(anomaly.position.x.abs() < 28.0 && anomaly.position.z.abs() < 28.0);
+        }
+    }
+
+    #[test]
+    fn content_hash_distinguishes_anomalies() {
+        let mut plain = Scene::new("hash");
+        plain.add(SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE));
+
+        let mut with_anomaly = Scene::new("hash");
+        with_anomaly.add(SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE));
+        with_anomaly.add_anomaly(SceneAnomaly::new(Vec3::ZERO, 3.0, AnomalyKind::Heat));
+
+        assert_ne!(with_anomaly.content_hash(), plain.content_hash());
     }
 }
