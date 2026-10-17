@@ -859,6 +859,8 @@ impl ClientApp {
                         self.start_healing_view(*ticks, now);
                     }
                 }
+                // Яркая подсветка аномалии и вспышка — визуал клиента (M4c).
+                GameEvent::AnomalyRevealed { .. } => {}
             }
         }
     }
@@ -901,6 +903,7 @@ impl ClientApp {
             Some(net) => match action {
                 PlayerAction::Interact => net.send_interact(tick),
                 PlayerAction::Inventory(inventory) => net.send_inventory_action(tick, inventory),
+                PlayerAction::ThrowBolt => net.send_throw_bolt(tick),
             },
             None => self.simulation.queue_action(self.player_id, action),
         }
@@ -1165,6 +1168,7 @@ impl ClientApp {
                     loot,
                     corpses,
                     events,
+                    bolts: _,
                 } => {
                     // Мировые списки лута/трупов — прямое замещение снапшотом.
                     self.world_loot = loot;

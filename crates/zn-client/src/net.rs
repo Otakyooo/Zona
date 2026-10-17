@@ -8,7 +8,7 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Instant;
 
 use zn_net::{
-    decode_message, encode_message, ClientInput, CorpseNet, GameEvent, GroundItemNet,
+    decode_message, encode_message, BoltNet, ClientInput, CorpseNet, GameEvent, GroundItemNet,
     InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason, CLIENT_TIMEOUT,
     HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL, PROTOCOL_VERSION,
 };
@@ -30,6 +30,8 @@ pub enum NetEvent {
         loot: Vec<GroundItemNet>,
         /// Трупы игроков (M4b).
         corpses: Vec<CorpseNet>,
+        /// Летящие болты (M4c).
+        bolts: Vec<BoltNet>,
         /// События боя с прошлого снапшота (трейсеры, килл-фид).
         events: Vec<GameEvent>,
     },
@@ -177,6 +179,16 @@ impl NetClient {
         }
     }
 
+    /// Отправляет бросок болта (G) с тем же повтором.
+    pub fn send_throw_bolt(&mut self, tick: u64) {
+        if self.status != NetStatus::Connected {
+            return;
+        }
+        for _ in 0..INPUT_REDUNDANCY {
+            self.send(&Message::ThrowBolt { tick });
+        }
+    }
+
     fn poll_timers(&mut self, now: Instant) {
         match self.status {
             NetStatus::Connecting => {
@@ -291,6 +303,7 @@ impl NetClient {
                 players,
                 loot,
                 corpses,
+                bolts,
                 events,
             } => {
                 if self.status != NetStatus::Connected {
@@ -303,6 +316,7 @@ impl NetClient {
                     players,
                     loot,
                     corpses,
+                    bolts,
                     events,
                 })
             }
@@ -570,6 +584,11 @@ mod tests {
                 players: vec![],
                 loot: vec![],
                 corpses: vec![],
+                bolts: vec![BoltNet {
+                    id: 3,
+                    owner: 1,
+                    pos: [150, 30, 150],
+                }],
                 events: vec![],
             },
         );
@@ -582,6 +601,11 @@ mod tests {
                 players: vec![],
                 loot: vec![],
                 corpses: vec![],
+                bolts: vec![BoltNet {
+                    id: 3,
+                    owner: 1,
+                    pos: [150, 30, 150],
+                }],
                 events: vec![],
             }]
         );

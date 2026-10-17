@@ -74,6 +74,7 @@ fn all_message_variants_roundtrip_through_bincode() {
                 index: 0,
             },
         },
+        Message::ThrowBolt { tick: 43 },
         Message::Ping { nonce: 9 },
         Message::ClientBye,
         Message::ServerWelcome {
@@ -106,6 +107,11 @@ fn all_message_variants_roundtrip_through_bincode() {
                 pos: [-1, -2, 140],
                 yaw: 200,
             }],
+            bolts: vec![BoltNet {
+                id: 7,
+                owner: 1,
+                pos: [150, 30, 150],
+            }],
             events: vec![
                 GameEvent::Shot {
                     shooter: 1,
@@ -115,6 +121,10 @@ fn all_message_variants_roundtrip_through_bincode() {
                 GameEvent::UseStarted {
                     player: 2,
                     ticks: 120,
+                },
+                GameEvent::AnomalyRevealed {
+                    anomaly: 1,
+                    position: [15.0, 0.0, 15.0],
                 },
                 GameEvent::Death {
                     victim: 2,
@@ -214,6 +224,14 @@ fn full_snapshot_fits_udp_mtu() {
                 yaw: 200,
             })
             .collect(),
+        // Лимит болтов в полёте (`BOLTS_MAX` в zn-sim) — 12.
+        bolts: (0..12)
+            .map(|i| BoltNet {
+                id: i,
+                owner: u64::from(i % 3),
+                pos: [i as i16 * 10, 30, 150],
+            })
+            .collect(),
         events: vec![
             GameEvent::Shot {
                 shooter: 3,
@@ -224,6 +242,10 @@ fn full_snapshot_fits_udp_mtu() {
                 player: 5,
                 ticks: 120,
             },
+            GameEvent::AnomalyRevealed {
+                anomaly: 2,
+                position: [-15.0, 0.0, 15.0],
+            },
             GameEvent::Death {
                 victim: 5,
                 victim_name: "Охотник".to_string(),
@@ -233,8 +255,9 @@ fn full_snapshot_fits_udp_mtu() {
         ],
     };
     let bytes = encode_message(&message).unwrap();
+    // Ethernet MTU 1500 − 20 IP − 8 UDP = 1472: держим запас на будущие поля.
     assert!(
-        bytes.len() <= 1200,
+        bytes.len() <= 1400,
         "снапшот на {} игроков занял {} байт",
         MAX_PLAYERS_PER_SESSION,
         bytes.len()
@@ -265,7 +288,7 @@ fn position_and_yaw_quantization_roundtrip() {
 
 #[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);

@@ -2,11 +2,12 @@ use std::time::Duration;
 
 use glam::Vec3;
 use zn_net::{ClientInput, GameEvent, InventoryAction, ItemStackNet};
-use zn_scene::{Scene, SceneObject};
+use zn_scene::{AnomalyKind, Scene, SceneAnomaly, SceneObject};
 use zn_sim::{
     aim_forward, crate_container_id, inventory_weight_grams, is_corpse_container, zone_damage,
-    PlayerAction, Simulation, Stack, CORPSE_LIFETIME_TICKS, EYE_HEIGHT, FLAG_FIRE, FLAG_SPRINTING,
-    MAX_CARRY_GRAMS, MAX_HEALTH, ZONE_HEAD_MIN, ZONE_TORSO_MIN,
+    PlayerAction, Simulation, Stack, ANOMALY_DAMAGE_INTERVAL_TICKS, BOLT_THROW_COOLDOWN_TICKS,
+    CORPSE_LIFETIME_TICKS, EYE_HEIGHT, FLAG_FIRE, FLAG_SPRINTING, MAX_CARRY_GRAMS, MAX_HEALTH,
+    RESPAWN_DELAY_TICKS, ZONE_HEAD_MIN, ZONE_TORSO_MIN,
 };
 
 const SIM_STEPS: u64 = 60;
@@ -930,4 +931,239 @@ fn demo_zone_crates_fill_from_catalog() {
     let container = crate_container_id(u32::try_from(index).unwrap());
     let items = sim.container_items(container).expect("ящик существует");
     assert!(!items.is_empty(), "ящик наполнен по каталогу");
+}
+
+// ── Аномалии и болты (M4c) ──────────────────────────────────────────────
+
+/// Сцена теста аномалий: пол 60×60 (верх на y = 0), без ящиков; спавн в
+/// начале координат, прицел yaw = 0 → +X. Опционально — одна аномалия.
+fn anomaly_scene(anomaly: Option<(AnomalyKind, Vec3, f32, Option<&str>)>) -> Scene {
+    let mut scene = Scene::new("anomaly");
+    scene.spawn = Vec3::ZERO;
+    scene.add(SceneObject::new(
+        Vec3::new(0.0, -0.5, 0.0),
+        Vec3::new(60.0, 1.0, 60.0),
+        glam::Vec4::ONE,
+    ));
+    if let Some((kind, position, radius, artifact)) = anomaly {
+        let mut anomaly = SceneAnomaly::new(position, radius, kind);
+        if let Some(key) = artifact {
+            anomaly = anomaly.with_artifact(key);
+        }
+        scene.add_anomaly(anomaly);
+    }
+    scene
+}
+
+/// Сколько болтов (предметов `item`) лежит в инвентаре игрока.
+fn bolt_count(sim: &mut Simulation, id: u64, item: u16) -> u32 {
+    sim.player_state(id)
+        .unwrap()
+        .inventory
+        .iter()
+        .filter_map(|slot| *slot)
+        .filter(|stack| stack.item == item)
+        .map(|stack| stack.count)
+        .sum()
+}
+
+#[test]
+fn artifact_spawns_in_anomaly_at_start() {
+    let catalog = test_catalog();
+    let artifact = catalog.index_of("artifact_heat").unwrap();
+    let scene = anomaly_scene(Some((
+        AnomalyKind::Heat,
+        Vec3::new(5.0, 0.0, 0.0),
+        2.5,
+        Some("artifact_heat"),
+    )));
+    let sim = Simulation::with_scene_and_catalog(&scene, catalog);
+
+    assert_eq!(sim.anomaly_count(), 1);
+    let loot = sim.snapshot_loot();
+    assert_eq!(loot.len(), 1, "артефакт лежит в аномалии: {loot:?}");
+    assert_eq!(loot[0].item, artifact);
+    assert_eq!(loot[0].count, 1);
+    // Якорь аномалии — на полу.
+    assert_eq!(loot[0].pos, [50, 0, 0]);
+}
+
+#[test]
+fn heat_anomaly_damages_and_kills_player() {
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let scene = anomaly_scene(Some((AnomalyKind::Heat, Vec3::ZERO, 3.0, None)));
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+    assert_eq!(sim.debug_give(id, medkit, 1), 1);
+
+    // Тик 0 — первый тик урона: «сердце» (0, 0.9, 0) в 2.1 м от центра
+    // (0, 3, 0) при радиусе 3 → урон 2 + 4·0.3 ≈ 3.
+    sim.step_once();
+    assert_eq!(sim.player_state(id).unwrap().health, MAX_HEALTH - 3);
+
+    // Следующий тик урона — только через ANOMALY_DAMAGE_INTERVAL_TICKS.
+    for _ in 0..ANOMALY_DAMAGE_INTERVAL_TICKS {
+        sim.step_once();
+    }
+    assert_eq!(sim.player_state(id).unwrap().health, MAX_HEALTH - 6);
+
+    // Досчитываем до смерти (с запасом на тики урона).
+    for _ in 0..ANOMALY_DAMAGE_INTERVAL_TICKS * 40 {
+        if sim.player_state(id).unwrap().health == 0 {
+            break;
+        }
+        sim.step_once();
+    }
+    assert_eq!(sim.player_state(id).unwrap().health, 0, "жгучая убивает");
+
+    // Смерть без игрока-убийцы (killer = 0) и обычный труп с лутом.
+    let corpses = sim.snapshot_corpses();
+    assert_eq!(corpses.len(), 1);
+    assert_eq!(corpses[0].owner, id);
+    assert_eq!(
+        sim.container_items(corpses[0].container),
+        Some(vec![Stack::new(medkit, 1)])
+    );
+    let events = sim.take_events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GameEvent::Death { victim, killer: 0, .. } if *victim == id
+        )),
+        "событие смерти от аномалии: {events:?}"
+    );
+
+    // Респавн — на точке спавна с полным здоровьем.
+    let death_tick = sim.tick();
+    while sim.tick() <= death_tick + RESPAWN_DELAY_TICKS {
+        sim.step_once();
+    }
+    let state = sim.player_state(id).unwrap();
+    assert_eq!(state.health, MAX_HEALTH);
+    assert!(state.position.distance(Vec3::ZERO) < 0.5);
+}
+
+#[test]
+fn gravity_anomaly_pulls_and_sprint_escapes() {
+    let scene = anomaly_scene(Some((AnomalyKind::Gravity, Vec3::ZERO, 4.0, None)));
+
+    // Без движения притяжение тащит к оси аномалии (инпуты, как у клиента,
+    // приходят каждый тик: нулевые).
+    let mut sim = Simulation::with_scene_and_catalog(&scene, test_catalog());
+    let id = sim.spawn_player(Vec3::new(0.0, 0.0, 2.0));
+    for tick in 0..120u64 {
+        sim.queue_input(id, input(tick, 0.0, 0.0, false));
+        sim.step_once();
+    }
+    let pulled = sim.player_state(id).unwrap().position;
+    assert!(
+        pulled.length() < 0.8,
+        "должно притянуть к центру: {pulled:?}"
+    );
+
+    // Спринт наружу (8.5 м/с против тяги до 5) выносит из сферы.
+    let mut sim = Simulation::with_scene_and_catalog(&scene, test_catalog());
+    let id = sim.spawn_player(Vec3::new(0.0, 0.0, 2.0));
+    let mut turn = input(0, 0.0, 0.0, false);
+    turn.yaw_delta = std::f32::consts::FRAC_PI_2; // прицел на +Z — прочь от центра
+    sim.queue_input(id, turn);
+    sim.step_once();
+    for tick in 1..90u64 {
+        let mut run = input(tick, 1.0, 0.0, false);
+        run.buttons = FLAG_SPRINTING;
+        sim.queue_input(id, run);
+        sim.step_once();
+    }
+    let escaped = sim.player_state(id).unwrap().position;
+    assert!(
+        escaped.z > 6.0,
+        "спринт должен вынести из сферы: {escaped:?}"
+    );
+}
+
+#[test]
+fn throw_bolt_consumes_item_and_lands_with_cooldown() {
+    let catalog = test_catalog();
+    let bolt = catalog.index_of("bolt").unwrap();
+    let scene = anomaly_scene(None);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+    assert_eq!(sim.debug_give(id, bolt, 2), 2);
+
+    // Бросок: болт в полёте, из инвентаря ушла одна штука.
+    sim.queue_action(id, PlayerAction::ThrowBolt);
+    sim.step_once();
+    assert_eq!(sim.snapshot_bolts().len(), 1, "болт летит");
+    assert_eq!(bolt_count(&mut sim, id, bolt), 1);
+
+    // Кулдаун: повторный бросок раньше срока игнорируется.
+    for _ in 0..5 {
+        sim.step_once();
+    }
+    assert!(sim.tick() < BOLT_THROW_COOLDOWN_TICKS);
+    sim.queue_action(id, PlayerAction::ThrowBolt);
+    sim.step_once();
+    assert_eq!(sim.snapshot_bolts().len(), 1, "кулдаун держит");
+    assert_eq!(bolt_count(&mut sim, id, bolt), 1, "второй болт не потрачен");
+
+    // Полёт ~0.42 с: болт приземляется и лежит как обычный предмет.
+    for _ in 0..120 {
+        if sim.snapshot_bolts().is_empty() {
+            break;
+        }
+        sim.step_once();
+    }
+    assert!(sim.snapshot_bolts().is_empty(), "болт должен приземлиться");
+    let loot = sim.snapshot_loot();
+    assert_eq!(loot.len(), 1, "подобранный болт на земле: {loot:?}");
+    assert_eq!(loot[0].item, bolt);
+
+    // После кулдауна второй бросок срабатывает и дотрачивает запас.
+    while sim.tick() < BOLT_THROW_COOLDOWN_TICKS {
+        sim.step_once();
+    }
+    sim.queue_action(id, PlayerAction::ThrowBolt);
+    sim.step_once();
+    assert_eq!(sim.snapshot_bolts().len(), 1);
+    assert_eq!(bolt_count(&mut sim, id, bolt), 0);
+}
+
+#[test]
+fn bolt_dies_in_anomaly_and_reveals_it() {
+    let catalog = test_catalog();
+    let bolt = catalog.index_of("bolt").unwrap();
+    let scene = anomaly_scene(Some((
+        AnomalyKind::Heat,
+        Vec3::new(10.0, 0.0, 0.0),
+        3.0,
+        None,
+    )));
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    // Игрок у границы сферы (снаружи) бросает болт в аномалию.
+    let id = sim.spawn_player(Vec3::new(7.0, 0.0, 0.0));
+    assert_eq!(sim.debug_give(id, bolt, 1), 1);
+
+    sim.queue_action(id, PlayerAction::ThrowBolt);
+    sim.step_once();
+    assert!(
+        sim.snapshot_bolts().is_empty(),
+        "болт гибнет в аномалии сразу"
+    );
+    assert!(
+        sim.snapshot_loot().is_empty(),
+        "болт в аномалии не падает на землю"
+    );
+    let events = sim.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, GameEvent::AnomalyRevealed { anomaly: 0, .. })),
+        "вспышка обнаружения: {events:?}"
+    );
+    assert_eq!(
+        sim.player_state(id).unwrap().health,
+        MAX_HEALTH,
+        "сам игрок снаружи сферы — невредим"
+    );
 }

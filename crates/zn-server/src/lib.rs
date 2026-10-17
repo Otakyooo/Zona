@@ -285,6 +285,7 @@ impl Session {
             Message::InventoryAction { tick, action } => {
                 self.handle_inventory_action(addr, tick, action);
             }
+            Message::ThrowBolt { tick } => self.handle_throw_bolt(addr, tick),
             Message::Ping { nonce } => {
                 if let Some(client) = self.clients.get_mut(&addr) {
                     client.last_seen = self.now;
@@ -421,12 +422,28 @@ impl Session {
             .queue_action(player_id, PlayerAction::Inventory(action));
     }
 
+    /// Бросок болта (G): дедупликация по `tick`, общий счётчик с действиями.
+    fn handle_throw_bolt(&mut self, addr: SocketAddr, tick: u64) {
+        let Some(client) = self.clients.get_mut(&addr) else {
+            return;
+        };
+        client.last_seen = self.now;
+        if tick <= client.last_action_tick {
+            return;
+        }
+        client.last_action_tick = tick;
+        let player_id = client.player_id;
+        self.simulation
+            .queue_action(player_id, PlayerAction::ThrowBolt);
+    }
+
     fn send_snapshots(&mut self) {
         let players = self.simulation.snapshot();
         let server_tick = self.simulation.tick();
         let loot = self.simulation.snapshot_loot();
         let mut corpses = self.simulation.snapshot_corpses();
         self.fill_corpse_names(&mut corpses);
+        let bolts = self.simulation.snapshot_bolts();
         let events = self.simulation.take_events();
         let events = self.enrich_events(events);
         let updates = self.simulation.take_net_updates();
@@ -449,6 +466,7 @@ impl Session {
                     players: players.clone(),
                     loot: loot.clone(),
                     corpses: corpses.clone(),
+                    bolts: bolts.clone(),
                     events: events.clone(),
                 },
             );
@@ -506,7 +524,12 @@ impl Session {
                     victim,
                     victim_name: self.names.get(&victim).cloned().unwrap_or_default(),
                     killer,
-                    killer_name: self.names.get(&killer).cloned().unwrap_or_default(),
+                    // killer = 0 — смерть без игрока-убийцы (аномалия).
+                    killer_name: if killer == 0 {
+                        "Аномалия".to_string()
+                    } else {
+                        self.names.get(&killer).cloned().unwrap_or_default()
+                    },
                 },
                 other => other,
             })

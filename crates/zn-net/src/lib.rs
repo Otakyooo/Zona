@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 /// Версия протокола. v2 — сетевое движение (M3): handshake, input-пакеты с
 /// redundancy, персональные снапшоты, ping; v3 — бой (M4a): здоровье в
 /// состояниях, события выстрелов/смертей; v4 — лут (M4b): хэш каталога
-/// предметов в Hello, обыск и действия инвентаря, предметы/трупы в снапшотах.
-/// Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// предметов в Hello, обыск и действия инвентаря, предметы/трупы в снапшотах;
+/// v5 — аномалии (M4c): броски болтов, снаряды в снапшотах, событие
+/// обнаружения аномалии. Несовпадение версий отвергается.
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -104,6 +105,15 @@ pub struct GroundItemNet {
     pub pos: [i16; 3],
 }
 
+/// Летящий болт в снапшоте (M4c): позиция квантована до `POS_QUANTUM`;
+/// клиент рисует болты с интерполяцией между снапшотами.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoltNet {
+    pub id: u32,
+    pub owner: u64,
+    pub pos: [i16; 3],
+}
+
 /// Труп игрока в снапшоте: тело для рендера и id контейнера для обыска.
 /// Имя жертвы заполняет серверная сессия из своей истории имён.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -166,6 +176,10 @@ pub enum GameEvent {
     /// Начато использование предмета: клиенты рисуют прогресс на `ticks`
     /// тиков (лечение завершит сервер, даже если клиент отстал).
     UseStarted { player: u64, ticks: u16 },
+    /// Болт попал в аномалию: клиенты ярко подсвечивают её на несколько
+    /// секунд и рисуют вспышку. `anomaly` — индекс в `Scene::anomalies`,
+    /// `position` — точка срабатывания болта (место вспышки).
+    AnomalyRevealed { anomaly: u32, position: [f32; 3] },
 }
 
 /// Причина отказа в подключении (`ServerReject`).
@@ -207,6 +221,10 @@ pub enum Message {
         tick: u64,
         action: InventoryAction,
     },
+    /// Бросок болта (G); `tick` — для дедупликации повторов.
+    ThrowBolt {
+        tick: u64,
+    },
     Ping {
         nonce: u32,
     },
@@ -232,6 +250,8 @@ pub enum Message {
         loot: Vec<GroundItemNet>,
         /// Трупы: место и поворот тела; лут — персональным `ContainerUpdate`.
         corpses: Vec<CorpseNet>,
+        /// Летящие болты (M4c); приземлившиеся становятся `loot`.
+        bolts: Vec<BoltNet>,
         /// События с прошлого снапшота (выстрелы, смерти, лечение) — всем клиентам.
         events: Vec<GameEvent>,
     },
@@ -259,6 +279,7 @@ impl Message {
             Self::InputPacket { .. } => "InputPacket",
             Self::Interact { .. } => "Interact",
             Self::InventoryAction { .. } => "InventoryAction",
+            Self::ThrowBolt { .. } => "ThrowBolt",
             Self::Ping { .. } => "Ping",
             Self::ClientBye => "ClientBye",
             Self::ServerWelcome { .. } => "ServerWelcome",

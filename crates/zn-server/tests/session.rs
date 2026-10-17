@@ -12,7 +12,7 @@ use zn_net::{
 };
 use zn_scene::Scene;
 use zn_server::{Session, SessionConfig};
-use zn_sim::crate_container_id;
+use zn_sim::{crate_container_id, Simulation, Vec3};
 
 struct TestClient {
     socket: UdpSocket,
@@ -625,17 +625,20 @@ fn drop_slot_replicates_ground_loot() {
     assert_eq!(session.debug_give(player_id, "bolt", 3).unwrap(), 3);
     client.inventory_action(1, InventoryAction::Drop { slot: 0 });
 
-    let update = expect_message(
-        &mut session,
-        &client,
-        |message| matches!(message, Message::Snapshot { loot, .. } if !loot.is_empty()),
-    );
+    // В demo_zone артефакты лежат на земле с начала рейда — ищем именно болты.
+    let update = expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::Snapshot { loot, .. }
+                if loot.iter().any(|item| item.item == bolt && item.count == 3)
+        )
+    });
     let Message::Snapshot { loot, .. } = update else {
         unreachable!("предикат гарантирует Snapshot")
     };
-    assert_eq!(loot.len(), 1);
-    assert_eq!(loot[0].item, bolt);
-    assert_eq!(loot[0].count, 3);
+    let dropped: Vec<_> = loot.iter().filter(|item| item.item == bolt).collect();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].count, 3);
 
     // Инвентарь опустел: приходит персональный апдейт с пустыми ячейками.
     expect_message(&mut session, &client, |message| {
@@ -736,4 +739,277 @@ fn medkit_heals_over_udp() {
     assert!(healed, "аптечка должна вылечить до максимума");
     let state = session.simulation().player_state(player_id).unwrap();
     assert!(state.inventory[0].is_none(), "аптечка израсходована");
+}
+
+// ── Аномалии и болты (M4c) ──────────────────────────────────────────────
+
+/// Индекс аномалии demo_zone в указанной точке (проверка квантов сцены).
+fn anomaly_index_at(scene: &Scene, position: Vec3) -> u32 {
+    let index = scene
+        .anomalies
+        .iter()
+        .position(|anomaly| anomaly.position.distance(position) < 0.01)
+        .expect("аномалия в точке есть в demo_zone");
+    u32::try_from(index).unwrap()
+}
+
+/// Ведёт игрока к точке напрямую инпутами в симуляцию (без сети): поворот в
+/// цель за один тик, затем шаг вперёд до дистанции `stop`. Завершается
+/// нулевым инпутом: сервер повторяет последний, иначе игрок шагал бы вечно.
+fn walk_to(sim: &mut Simulation, player_id: u64, target: Vec3, stop: f32) {
+    let state = sim.player_state(player_id).unwrap();
+    let to = target - state.position;
+    let mut turn = ClientInput::new(sim.tick());
+    turn.yaw_delta = to.z.atan2(to.x) - state.yaw;
+    sim.queue_input(player_id, turn);
+    sim.step_once();
+
+    for _ in 0..1200 {
+        let state = sim.player_state(player_id).unwrap();
+        if state.position.distance(target) <= stop {
+            let stand = ClientInput::new(sim.tick());
+            sim.queue_input(player_id, stand);
+            sim.step_once();
+            return;
+        }
+        let mut command = ClientInput::new(sim.tick());
+        command.move_forward = 1.0;
+        sim.queue_input(player_id, command);
+        sim.step_once();
+    }
+    panic!("игрок не дошёл до {target:?}");
+}
+
+/// Наводит прицел точно на точку: yaw — по горизонтали, pitch — явно (возврат
+/// состояния вместо инпутов: повторяемый `yaw_delta` крутил бы игрока).
+fn aim_at(sim: &mut Simulation, player_id: u64, target: Vec3, pitch: f32) {
+    let state = sim.player_state(player_id).unwrap();
+    let to = target - state.position;
+    let mut net = state.net_state();
+    net.yaw = to.z.atan2(to.x);
+    net.pitch = pitch;
+    assert!(sim.restore_player(player_id, &net), "игрок существует");
+}
+
+#[test]
+fn throw_bolt_replicates_lands_and_dedupes() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(Scene::demo_zone().content_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    let catalog = test_catalog();
+    let bolt = catalog.index_of("bolt").unwrap();
+    assert_eq!(session.debug_give(player_id, "bolt", 2).unwrap(), 2);
+
+    // Прицел на -X (вдоль коридора мимо колонн), затем бросок через UDP.
+    // Повторный пакет с тем же tick сервер отбрасывает.
+    let spawn = Vec3::new(0.0, 0.0, 14.0);
+    aim_at(session.simulation(), player_id, spawn - Vec3::X, 0.0);
+    client.send(&Message::ThrowBolt { tick: 100 });
+    client.send(&Message::ThrowBolt { tick: 100 });
+
+    let mut saw_bolt = false;
+    let mut max_flying = 0usize;
+    for _ in 0..60 {
+        session.poll(Duration::from_millis(33));
+        while let Some(message) = client.try_recv() {
+            if let Message::Snapshot { bolts, .. } = message {
+                max_flying = max_flying.max(bolts.len());
+                if bolts.iter().any(|bolt| bolt.owner == player_id) {
+                    saw_bolt = true;
+                }
+            }
+        }
+        if saw_bolt {
+            break;
+        }
+    }
+    assert!(saw_bolt, "болт должен реплицироваться в снапшотах");
+    assert_eq!(max_flying, 1, "дубликат ThrowBolt не создаёт второй болт");
+
+    // Один болт потрачен из инвентаря, один остался.
+    let state = session.simulation().player_state(player_id).unwrap();
+    let left: u32 = state
+        .inventory
+        .iter()
+        .flatten()
+        .filter(|stack| stack.item == bolt)
+        .map(|stack| stack.count)
+        .sum();
+    assert_eq!(left, 1);
+
+    // Болт приземляется и лежит на земле как обычный предмет.
+    let mut landed = false;
+    for _ in 0..80 {
+        session.poll(Duration::from_millis(33));
+        while let Some(message) = client.try_recv() {
+            if let Message::Snapshot { loot, bolts, .. } = message {
+                if loot.iter().any(|item| item.item == bolt) {
+                    landed = true;
+                }
+                assert!(bolts.len() <= 1, "лишние болты в полёте: {bolts:?}");
+            }
+        }
+        if landed {
+            break;
+        }
+    }
+    assert!(landed, "болт должен приземлиться и стать предметом");
+}
+
+#[test]
+fn bolt_in_anomaly_reveals_it_over_udp() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    let scene = Scene::demo_zone();
+    client.hello(scene.content_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    let catalog = test_catalog();
+    let bolt = catalog.index_of("bolt").unwrap();
+    assert_eq!(session.debug_give(player_id, "bolt", 1).unwrap(), 1);
+
+    // Подходим к жгучей аномалии (15, 15) на 5.5 м — снаружи сферы — и
+    // бросаем болт: он влетает в сферу до того, как упадёт на пол.
+    let heat = Vec3::new(15.0, 0.0, 15.0);
+    let index = anomaly_index_at(&scene, heat);
+    walk_to(session.simulation(), player_id, heat, 5.5);
+    aim_at(session.simulation(), player_id, heat, 0.0);
+    client.send(&Message::ThrowBolt { tick: 300 });
+
+    let mut revealed = false;
+    let mut saw_bolt = false;
+    for _ in 0..60 {
+        session.poll(Duration::from_millis(33));
+        while let Some(message) = client.try_recv() {
+            if let Message::Snapshot {
+                bolts,
+                events,
+                loot,
+                ..
+            } = message
+            {
+                if !bolts.is_empty() {
+                    saw_bolt = true;
+                }
+                if events.iter().any(|event| {
+                    matches!(event, GameEvent::AnomalyRevealed { anomaly, .. } if *anomaly == index)
+                }) {
+                    revealed = true;
+                }
+                assert!(
+                    !loot.iter().any(|item| item.item == bolt),
+                    "болт в аномалии гибнет, а не падает на землю"
+                );
+            }
+        }
+        if revealed {
+            break;
+        }
+    }
+    assert!(saw_bolt, "летящий болт виден в снапшотах");
+    assert!(revealed, "AnomalyRevealed должен дойти до клиента");
+}
+
+#[test]
+fn heat_anomaly_kills_player_with_anomaly_killer() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(Scene::demo_zone().content_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    assert_eq!(session.debug_give(player_id, "medkit", 1).unwrap(), 1);
+
+    // Идём в центр жгучей аномалии (15, 15): урон копится, пока стоит.
+    walk_to(
+        session.simulation(),
+        player_id,
+        Vec3::new(15.0, 0.0, 15.0),
+        0.5,
+    );
+    assert!(
+        session.simulation().player_state(player_id).unwrap().health < 100,
+        "стоя в аномалии, игрок получает урон"
+    );
+
+    let mut corpses = Vec::new();
+    let mut death_named = false;
+    for round in 0..600u64 {
+        if round % 20 == 0 {
+            client.send(&Message::Ping {
+                nonce: round as u32,
+            });
+        }
+        session.poll(Duration::from_millis(33));
+        while let Some(message) = client.try_recv() {
+            if let Message::Snapshot {
+                corpses: seen,
+                events,
+                ..
+            } = message
+            {
+                if !seen.is_empty() {
+                    corpses = seen;
+                }
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        GameEvent::Death { victim, killer: 0, killer_name, .. }
+                            if *victim == player_id && killer_name == "Аномалия"
+                    )
+                }) {
+                    death_named = true;
+                }
+            }
+        }
+        if death_named {
+            break;
+        }
+    }
+
+    assert!(death_named, "в килл-фиде смерть подписана «Аномалия»");
+    assert_eq!(corpses.len(), 1, "должен появиться обычный труп");
+    assert_eq!(corpses[0].owner, player_id);
+    assert_eq!(corpses[0].name, "Тестер");
+    let items = session
+        .simulation()
+        .container_items(corpses[0].container)
+        .expect("контейнер трупа существует");
+    assert!(
+        items
+            .iter()
+            .any(|stack| stack.item == medkit && stack.count == 1),
+        "лут жертвы в трупе: {items:?}"
+    );
+}
+
+#[test]
+fn artifact_picked_up_in_anomaly() {
+    let (mut session, addr) = test_session(10);
+    let client = TestClient::connect(addr);
+    let scene = Scene::demo_zone();
+    client.hello(scene.content_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    let catalog = test_catalog();
+    let artifact = catalog.index_of("artifact_heat").unwrap();
+
+    // Артефакт «Жар-камень» лежит в якоре жгучей аномалии (15, 15) с начала рейда.
+    let heat = Vec3::new(15.0, 0.0, 15.0);
+    let index = anomaly_index_at(&scene, heat);
+    assert_eq!(
+        scene.anomalies[usize::try_from(index).unwrap()]
+            .artifact
+            .as_deref(),
+        Some("artifact_heat")
+    );
+
+    // Подходим почти вплотную и смотрим вниз (предмет на полу под ногами).
+    walk_to(session.simulation(), player_id, heat, 0.8);
+    aim_at(session.simulation(), player_id, heat, -1.05);
+
+    client.interact(500);
+    expect_message(&mut session, &client, |message| {
+        matches!(message, Message::InventoryUpdate { slots }
+            if slots.iter().flatten().any(|stack| stack.item == artifact))
+    });
 }

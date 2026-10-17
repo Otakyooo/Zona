@@ -1,15 +1,16 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use glam::Vec3;
+pub use glam::Vec3;
 use zn_content::{Item, ItemCatalog};
 use zn_core::{Entity, FixedStep, Schedule, World, SIMULATION_HZ, SIMULATION_STEP};
 use zn_net::{
-    quantize_pos, quantize_yaw, CorpseNet, GameEvent, GroundItemNet, InventoryAction, ItemStackNet,
+    quantize_pos, quantize_yaw, BoltNet, CorpseNet, GameEvent, GroundItemNet, InventoryAction,
+    ItemStackNet,
 };
 pub use zn_net::{ClientInput, PlayerNetState, FLAG_FIRE, FLAG_GROUNDED, FLAG_SPRINTING};
 use zn_physics::{PhysicsWorld, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
-use zn_scene::Scene;
+use zn_scene::{AnomalyKind, Scene};
 
 pub const WALK_SPEED: f32 = 5.5;
 pub const SPRINT_SPEED: f32 = 8.5;
@@ -68,6 +69,30 @@ pub const ACTION_QUEUE_CAP: usize = 16;
 /// Максимум отложенных инпутов на игрока (защита от переполнения при джиттере).
 pub const INPUT_QUEUE_CAP: usize = 64;
 
+// ── Аномалии и болты (M4c) ──────────────────────────────────────────────
+/// Высота «сердца» над ступнями — точка проверки входа игрока в аномалию.
+pub const ANOMALY_HEART_HEIGHT: f32 = 0.9;
+/// Период тика урона жгучей аномалии (4 раза в секунду).
+pub const ANOMALY_DAMAGE_INTERVAL_TICKS: u64 = 15;
+/// Урон жгучей за тик у центра и у границы сферы (линейно по дистанции).
+pub const ANOMALY_DAMAGE_CENTER: u16 = 6;
+pub const ANOMALY_DAMAGE_EDGE: u16 = 2;
+/// Скорость притяжения гравитационной (м/с) по горизонтальной дистанции до
+/// оси: у края почти не мешает, в центре — сильнее пешего шага, но спринт
+/// уносит ноги.
+pub const GRAVITY_PULL_CENTER: f32 = 5.0;
+pub const GRAVITY_PULL_EDGE: f32 = 1.5;
+/// Ключ предмета «болт» в каталоге.
+pub const BOLT_ITEM_KEY: &str = "bolt";
+/// Начальная скорость брошенного болта (м/с); падение — общая `GRAVITY`.
+pub const BOLT_SPEED: f32 = 18.0;
+/// Кулдаун между бросками болтов.
+pub const BOLT_THROW_COOLDOWN_TICKS: u64 = 20;
+/// Максимум болтов в полёте (бюджет MTU снапшота: 12 × ~18 Б).
+pub const BOLTS_MAX: usize = 12;
+/// Болт летит не дольше 10 секунд, затем приземляется.
+pub const BOLT_LIFETIME_TICKS: u64 = 10 * SIMULATION_HZ as u64;
+
 /// Полуразмер невидимого пола «пустой» сцены (`Simulation::new`); верх — y = 0.
 const EMPTY_SCENE_GROUND_HALF_EXTENT: f32 = 256.0;
 
@@ -112,6 +137,8 @@ pub struct PlayerState {
     pub respawn_at: u64,
     /// Раньше этого tick стрелять нельзя (кулдаун оружия).
     pub next_fire_tick: u64,
+    /// Раньше этого tick бросать болт нельзя (кулдаун броска).
+    pub next_throw_tick: u64,
     /// Ячейки инвентаря (сетка `INVENTORY_COLS`×`INVENTORY_ROWS`).
     pub inventory: [Option<Stack>; INVENTORY_SLOTS],
     /// Открытый контейнер (ящик/труп) — панель обыска.
@@ -134,6 +161,7 @@ impl PlayerState {
             firing: false,
             respawn_at: 0,
             next_fire_tick: 0,
+            next_throw_tick: 0,
             inventory: [None; INVENTORY_SLOTS],
             open_container: None,
             healing: None,
@@ -254,6 +282,57 @@ pub struct GroundItem {
     pub spawn_seq: u64,
 }
 
+/// Аномалии уровня (M4c): id аномалии — индекс в списке (порядок сцены).
+#[derive(Clone, Debug, Default)]
+pub struct Anomalies(pub Vec<AnomalyState>);
+
+#[derive(Clone, Copy, Debug)]
+pub struct AnomalyState {
+    /// Центр сферы (якорь сцены + `(0, radius, 0)`).
+    pub center: Vec3,
+    pub radius: f32,
+    pub kind: AnomalyKind,
+}
+
+impl AnomalyState {
+    /// Точка внутри сферы аномалии?
+    pub fn contains(&self, point: Vec3) -> bool {
+        point.distance_squared(self.center) <= self.radius * self.radius
+    }
+}
+
+/// Летящие болты (M4c): позиции репликуются снапшотами; приземлившиеся
+/// болты становятся обычными предметами на земле.
+#[derive(Clone, Debug, Default)]
+pub struct Bolts {
+    pub items: Vec<BoltProjectile>,
+    next_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BoltProjectile {
+    pub id: u32,
+    pub owner: u64,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub spawn_tick: u64,
+}
+
+impl Bolts {
+    /// Добавляет болт в полёт и возвращает его сетевой id.
+    fn spawn(&mut self, owner: u64, position: Vec3, velocity: Vec3, tick: u64) -> u32 {
+        self.next_id += 1;
+        self.items.push(BoltProjectile {
+            id: self.next_id,
+            owner,
+            position,
+            velocity,
+            spawn_tick: tick,
+        });
+        self.next_id
+    }
+}
+
 /// Клиентское действие вне инпутов; сервер уже отфильтровал дубли по tick.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlayerAction {
@@ -261,6 +340,8 @@ pub enum PlayerAction {
     Interact,
     /// Действие с инвентарём (взять/всё/выбросить/использовать).
     Inventory(InventoryAction),
+    /// Бросок болта (G).
+    ThrowBolt,
 }
 
 /// Очередь клиентских действий по игрокам — обрабатывается в тике.
@@ -430,18 +511,20 @@ impl Simulation {
     }
 
     /// Симуляция уровня вместе с каталогом предметов: ящики сцены получают
-    /// стартовое содержимое.
+    /// стартовое содержимое, артефакты аномалий появляются на полу.
     pub fn with_scene_and_catalog(scene: &Scene, catalog: ItemCatalog) -> Self {
         let mut simulation = Self::build(scene.spawn, scene.spawn_yaw, false);
         if let Some(resource) = simulation.world.get_resource_mut::<LootCatalog>() {
             resource.0 = catalog;
         }
         simulation.rebuild_static(scene);
+        simulation.spawn_artifacts(scene);
         simulation
     }
 
-    /// Пересобирает статические коллайдеры сцены, точку спавна и ящики: единый
-    /// путь загрузки уровня (ручная пол-плита пустой сцены не трогается).
+    /// Пересобирает статические коллайдеры сцены, точку спавна, ящики и
+    /// аномалии: единый путь загрузки уровня (ручная пол-плита пустой сцены
+    /// не трогается).
     pub fn rebuild_static(&mut self, scene: &Scene) {
         self.spawn = scene.spawn;
         self.spawn_yaw = scene.spawn_yaw;
@@ -453,11 +536,30 @@ impl Simulation {
         if let Some(containers) = self.world.get_resource_mut::<Containers>() {
             containers.0 = build_containers(scene, &catalog);
         }
+        if let Some(anomalies) = self.world.get_resource_mut::<Anomalies>() {
+            anomalies.0 = build_anomalies(scene);
+        }
         let physics = self
             .world
             .get_resource_mut::<PhysicsWorld>()
             .expect("physics resource initialized in build()");
         physics.rebuild_static(&scene.objects);
+    }
+
+    /// Артефакты из аномалий сцены: предмет лежит на полу в якоре с начала
+    /// матча; забрал — до конца матча новых нет.
+    fn spawn_artifacts(&mut self, scene: &Scene) {
+        let catalog = self.catalog();
+        for anomaly in &scene.anomalies {
+            let Some(key) = anomaly.artifact.as_deref() else {
+                continue;
+            };
+            let Some(item) = catalog.index_of(key) else {
+                log::warn!("аномалия: артефакт '{key}' отсутствует в каталоге — пропущен");
+                continue;
+            };
+            spawn_ground_item(&mut self.world, Stack::new(item, 1), anomaly.position);
+        }
     }
 
     fn build(spawn: Vec3, spawn_yaw: f32, ground_plate: bool) -> Self {
@@ -473,6 +575,8 @@ impl Simulation {
         world.insert_resource(Containers::default());
         world.insert_resource(Corpses::default());
         world.insert_resource(GroundItems::default());
+        world.insert_resource(Anomalies::default());
+        world.insert_resource(Bolts::default());
         world.insert_resource(ActionQueue::default());
         world.insert_resource(NetUpdates::default());
 
@@ -693,6 +797,32 @@ impl Simulation {
             .unwrap_or_default()
     }
 
+    /// Летящие болты для снапшота (позиции квантованы).
+    pub fn snapshot_bolts(&self) -> Vec<BoltNet> {
+        self.world
+            .get_resource::<Bolts>()
+            .map(|bolts| {
+                bolts
+                    .items
+                    .iter()
+                    .map(|bolt| BoltNet {
+                        id: bolt.id,
+                        owner: bolt.owner,
+                        pos: quantize_pos(bolt.position.to_array()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Число аномалий уровня (тесты и диагностика).
+    pub fn anomaly_count(&self) -> usize {
+        self.world
+            .get_resource::<Anomalies>()
+            .map(|anomalies| anomalies.0.len())
+            .unwrap_or(0)
+    }
+
     /// Индекс предмета в каталоге по ключу (отладочная консоль сервера).
     pub fn catalog_index_of(&self, key: &str) -> Option<u16> {
         self.world
@@ -741,9 +871,11 @@ impl Simulation {
 fn build_schedule() -> Schedule {
     let mut schedule = Schedule::new();
     schedule.add("player_apply_input", apply_input);
+    schedule.add("anomaly_effects", anomaly_effects);
     schedule.add("player_move", move_players);
     schedule.add("player_combat", player_combat);
     schedule.add("player_actions", player_actions);
+    schedule.add("player_bolts", bolts_update);
     schedule.add("player_healing", player_healing);
     schedule.add("corpse_decay", corpse_decay);
     schedule.add("player_respawn", player_respawn);
@@ -1029,20 +1161,17 @@ fn player_combat(world: &mut World) {
             if fired.contains(&state.id) {
                 state.next_fire_tick = tick + FIRE_INTERVAL_TICKS;
             }
-            for (_, killer, damage) in hits.iter().filter(|(victim, _, _)| *victim == state.id) {
+            // id — в локальную копию: фильтр не должен держать заимствование
+            // `state`, иначе `kill_player` не возьмёт `&mut PlayerState`.
+            let id = state.id;
+            for (_, killer, damage) in hits.iter().filter(|(victim, _, _)| *victim == id) {
                 if state.health == 0 {
                     // Добивание в том же тике смертью не считается.
                     continue;
                 }
                 state.health = state.health.saturating_sub(*damage);
                 if state.health == 0 {
-                    state.velocity = Vec3::ZERO;
-                    state.sprinting = false;
-                    state.firing = false;
-                    state.respawn_at = tick + RESPAWN_DELAY_TICKS;
-                    state.healing = None;
-                    state.open_container = None;
-                    let items = drain_inventory(&mut state.inventory);
+                    let items = kill_player(state, tick);
                     deaths.push((state.id, *killer, items, state.position, state.yaw));
                 }
             }
@@ -1064,6 +1193,96 @@ fn player_combat(world: &mut World) {
     }
 }
 
+/// Смертельная развязка (вызывать при `health == 0`): игрок замирает,
+/// ставится таймер респавна, лечение и обыск отменяются, инвентарь
+/// вынимается как лут трупа.
+fn kill_player(state: &mut PlayerState, tick: u64) -> Vec<Stack> {
+    state.velocity = Vec3::ZERO;
+    state.sprinting = false;
+    state.firing = false;
+    state.respawn_at = tick + RESPAWN_DELAY_TICKS;
+    state.healing = None;
+    state.open_container = None;
+    drain_inventory(&mut state.inventory)
+}
+
+/// Аномалии (M4c): жгучая наносит урон «сердцу» игрока в радиусе сферы
+/// (каждые `ANOMALY_DAMAGE_INTERVAL_TICKS` тиков), гравитационная добавляет
+/// к желаемой скорости притяжение к центру. Работает только первая аномалия,
+/// содержащая точку.
+fn anomaly_effects(world: &mut World) {
+    let tick = tick_now(world);
+    let anomalies = world
+        .get_resource::<Anomalies>()
+        .map(|anomalies| anomalies.0.clone())
+        .unwrap_or_default();
+    if anomalies.is_empty() {
+        return;
+    }
+
+    let mut deaths: Vec<(u64, Vec<Stack>, Vec3, f32)> = Vec::new();
+    {
+        let mut query = world.query::<&mut PlayerState>();
+        for state in query.iter() {
+            if state.health == 0 {
+                continue;
+            }
+            let heart = state.position + Vec3::Y * ANOMALY_HEART_HEIGHT;
+            for anomaly in &anomalies {
+                if !anomaly.contains(heart) {
+                    continue;
+                }
+                match anomaly.kind {
+                    AnomalyKind::Heat => {
+                        if tick.is_multiple_of(ANOMALY_DAMAGE_INTERVAL_TICKS) {
+                            let distance = heart.distance(anomaly.center);
+                            let closeness = (1.0 - distance / anomaly.radius).clamp(0.0, 1.0);
+                            let damage = f32::from(ANOMALY_DAMAGE_EDGE)
+                                + (f32::from(ANOMALY_DAMAGE_CENTER)
+                                    - f32::from(ANOMALY_DAMAGE_EDGE))
+                                    * closeness;
+                            state.health = state.health.saturating_sub(damage.round() as u16);
+                        }
+                        if state.health == 0 {
+                            let items = kill_player(state, tick);
+                            deaths.push((state.id, items, state.position, state.yaw));
+                        }
+                    }
+                    AnomalyKind::Gravity => {
+                        let to_center = anomaly.center - heart;
+                        let horizontal = Vec3::new(to_center.x, 0.0, to_center.z);
+                        if let Some(direction) = horizontal.try_normalize() {
+                            // Тяга растёт к оси аномалии (по горизонтальной
+                            // дистанции): у края почти не мешает, в центре
+                            // сильнее пешего шага, но слабее спринта.
+                            let closeness =
+                                (1.0 - horizontal.length() / anomaly.radius).clamp(0.0, 1.0);
+                            let pull = GRAVITY_PULL_EDGE
+                                + (GRAVITY_PULL_CENTER - GRAVITY_PULL_EDGE) * closeness;
+                            state.velocity.x += direction.x * pull;
+                            state.velocity.z += direction.z * pull;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    for (victim, items, position, yaw) in deaths {
+        // killer = 0 — смерть без игрока-убийцы (аномалия).
+        if let Some(events) = world.get_resource_mut::<CombatEvents>() {
+            events.0.push(GameEvent::Death {
+                victim,
+                victim_name: String::new(),
+                killer: 0,
+                killer_name: String::new(),
+            });
+        }
+        spawn_corpse(world, victim, position, yaw, items, tick);
+    }
+}
+
 /// Обыск, инвентарь и жизненный цикл открытых контейнеров: действия из
 /// `ActionQueue` (сервер уже отфильтровал дубли) и авто-закрытие панелей.
 fn player_actions(world: &mut World) {
@@ -1077,10 +1296,139 @@ fn player_actions(world: &mut World) {
         match action {
             PlayerAction::Interact => interact(world, player_id),
             PlayerAction::Inventory(action) => inventory_action(world, player_id, action, tick),
+            PlayerAction::ThrowBolt => throw_bolt(world, player_id, tick),
         }
     }
 
     maintain_open_containers(world);
+}
+
+/// Бросок болта (G): жив, кулдаун прошёл, есть болт в инвентаре (тратится
+/// одна штука). Болтов в полёте не больше `BOLTS_MAX`.
+fn throw_bolt(world: &mut World, player_id: u64, tick: u64) {
+    let catalog = catalog_of(world);
+    let Some(bolt_item) = catalog.index_of(BOLT_ITEM_KEY) else {
+        return;
+    };
+    let flying = world
+        .get_resource::<Bolts>()
+        .map(|bolts| bolts.items.len())
+        .unwrap_or(0);
+    if flying >= BOLTS_MAX {
+        return;
+    }
+
+    let thrown = with_player(world, player_id, |state| {
+        if state.health == 0 || tick < state.next_throw_tick {
+            return None;
+        }
+        let slot = state
+            .inventory
+            .iter()
+            .position(|cell| cell.is_some_and(|stack| stack.item == bolt_item))?;
+        let emptied = {
+            let stack = state.inventory[slot].as_mut()?;
+            stack.count -= 1;
+            stack.count == 0
+        };
+        if emptied {
+            state.inventory[slot] = None;
+        }
+        state.next_throw_tick = tick + BOLT_THROW_COOLDOWN_TICKS;
+        Some((
+            state.position + Vec3::Y * EYE_HEIGHT,
+            aim_forward(state.yaw, state.pitch),
+        ))
+    })
+    .flatten();
+    let Some((eye, direction)) = thrown else {
+        return;
+    };
+
+    // Чуть вперёд от глаз, чтобы болт не стартовал внутри капсулы игрока.
+    let position = eye + direction * 0.4;
+    if let Some(bolts) = world.get_resource_mut::<Bolts>() {
+        bolts.spawn(player_id, position, direction * BOLT_SPEED, tick);
+    }
+    push_inventory_update_of(world, player_id);
+}
+
+/// Полёт болтов: гравитация, столкновения со статикой (приземление —
+/// обычный предмет), гибель в аномалии с событием обнаружения.
+fn bolts_update(world: &mut World) {
+    let tick = tick_now(world);
+    let dt = tick_dt(world);
+    let current = world
+        .get_resource::<Bolts>()
+        .map(|bolts| bolts.items.clone())
+        .unwrap_or_default();
+    if current.is_empty() {
+        return;
+    }
+    let anomalies = world
+        .get_resource::<Anomalies>()
+        .map(|anomalies| anomalies.0.clone())
+        .unwrap_or_default();
+    let catalog = catalog_of(world);
+    let Some(bolt_item) = catalog.index_of(BOLT_ITEM_KEY) else {
+        return;
+    };
+
+    let mut survivors: Vec<BoltProjectile> = Vec::with_capacity(current.len());
+    let mut landed: Vec<Vec3> = Vec::new();
+    let mut revealed: Vec<GameEvent> = Vec::new();
+    {
+        let physics = world.get_resource::<PhysicsWorld>();
+        for mut bolt in current {
+            let step = bolt.velocity * dt;
+            let target = bolt.position + step;
+            bolt.velocity.y = (bolt.velocity.y - GRAVITY * dt).max(-MAX_FALL_SPEED);
+
+            // Вход в аномалию: болт гибнет, аномалия проявляется.
+            if let Some((index, _)) = anomalies
+                .iter()
+                .enumerate()
+                .find(|(_, anomaly)| anomaly.contains(target))
+            {
+                revealed.push(GameEvent::AnomalyRevealed {
+                    anomaly: u32::try_from(index).unwrap_or(u32::MAX),
+                    position: target.to_array(),
+                });
+                continue;
+            }
+
+            // Стены и пол: сегментный рейкаст от текущей позиции к новой.
+            let length = step.length();
+            if length > 1e-6 {
+                let dir = step / length;
+                let hit =
+                    physics.and_then(|physics| physics.cast_ray_glam(bolt.position, dir, length));
+                if let Some(toi) = hit {
+                    landed.push(bolt.position + dir * toi);
+                    continue;
+                }
+            }
+
+            bolt.position = target;
+            if tick.saturating_sub(bolt.spawn_tick) >= BOLT_LIFETIME_TICKS {
+                landed.push(bolt.position);
+                continue;
+            }
+            survivors.push(bolt);
+        }
+    }
+
+    if let Some(bolts) = world.get_resource_mut::<Bolts>() {
+        bolts.items = survivors;
+    }
+    for position in landed {
+        spawn_ground_item(world, Stack::new(bolt_item, 1), position);
+    }
+    if !revealed.is_empty() {
+        if let Some(events) = world.get_resource_mut::<CombatEvents>() {
+            events.0.extend(revealed);
+        }
+    }
 }
 
 /// Нажатие E: контейнер в прицеле открывается/закрывается, предмет на земле
@@ -1404,6 +1752,7 @@ fn player_respawn(world: &mut World) {
             state.health = MAX_HEALTH;
             state.respawn_at = 0;
             state.next_fire_tick = 0;
+            state.next_throw_tick = 0;
             state.healing = None;
             state.open_container = None;
         }
@@ -1860,6 +2209,19 @@ fn set_container_items(world: &mut World, container: u64, items: Vec<Stack>) {
 /// Горизонтальная дистанция между точками (высота не учитывается).
 fn horizontal_distance(left: Vec3, right: Vec3) -> f32 {
     ((left.x - right.x).powi(2) + (left.z - right.z).powi(2)).sqrt()
+}
+
+/// Аномалии сцены → состояние симуляции (центр сферы, радиус, вид).
+fn build_anomalies(scene: &Scene) -> Vec<AnomalyState> {
+    scene
+        .anomalies
+        .iter()
+        .map(|anomaly| AnomalyState {
+            center: anomaly.center(),
+            radius: anomaly.radius,
+            kind: anomaly.kind,
+        })
+        .collect()
 }
 
 /// Собирает ящики уровня: объекты сцены с `loot`, наполненные по каталогу.
