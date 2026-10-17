@@ -4,6 +4,7 @@ use std::sync::mpsc::channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use zn_content::ItemCatalog;
 use zn_net::{MAX_PLAYERS_PER_SESSION, PROTOCOL_VERSION, SIMULATION_HZ, SNAPSHOT_HZ};
 use zn_scene::Scene;
 use zn_server::{Session, SessionConfig, DEFAULT_PORT};
@@ -88,6 +89,7 @@ fn main() {
     };
 
     let scene = load_scene(&args.content_root, &args.level);
+    let catalog = load_catalog(&args.content_root);
     let config = SessionConfig {
         max_players: args.max_players,
         out_latency: Duration::from_millis(args.sim_latency_ms),
@@ -96,7 +98,7 @@ fn main() {
     };
 
     let bind_addr = format!("{}:{}", args.bind, args.port);
-    let mut session = match Session::bind(&bind_addr, &scene, config) {
+    let mut session = match Session::bind(&bind_addr, &scene, catalog, config) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("error: не удалось забиндить {bind_addr}: {error}");
@@ -153,16 +155,22 @@ protocol={PROTOCOL_VERSION}, max_players={}, уровень '{}'",
                     let id = session.debug_spawn();
                     println!("spawned player {id}");
                 }
-                other => match other.strip_prefix("kick ") {
-                    Some(id) => match id.trim().parse::<u64>() {
-                        Ok(id) if session.kick(id) => println!("kicked player {id}"),
-                        Ok(id) => println!("player {id} not found"),
-                        Err(_) => println!("usage: kick <player_id>"),
-                    },
-                    None => println!(
-                        "unknown command: {other} (try: status, list, kick <id>, spawn, quit)"
-                    ),
-                },
+                other => {
+                    if let Some(id) = other.strip_prefix("kick ") {
+                        match id.trim().parse::<u64>() {
+                            Ok(id) if session.kick(id) => println!("kicked player {id}"),
+                            Ok(id) => println!("player {id} not found"),
+                            Err(_) => println!("usage: kick <player_id>"),
+                        }
+                    } else if let Some(rest) = other.strip_prefix("loot ") {
+                        print_loot(&mut session, rest);
+                    } else {
+                        println!(
+                            "unknown command: {other} (try: status, list, kick <id>, spawn, \
+loot <id> <item> <count>, quit)"
+                        );
+                    }
+                }
             }
         }
 
@@ -201,10 +209,31 @@ fn load_scene(content_root: &Path, level: &str) -> Scene {
     }
 }
 
+fn load_catalog(content_root: &Path) -> ItemCatalog {
+    let path = content_root.join("items").join("items.ron");
+    match ItemCatalog::load_ron(&path) {
+        Ok(catalog) => {
+            log::info!(
+                "каталог предметов загружен из {} ({} позиций)",
+                path.display(),
+                catalog.len()
+            );
+            catalog
+        }
+        Err(error) => {
+            log::warn!(
+                "каталог предметов не прочитан ({}): {error} — предметы отключены",
+                path.display()
+            );
+            ItemCatalog::default()
+        }
+    }
+}
+
 fn print_status(session: &mut Session, args: &ServerArgs, boot: Instant) {
     let stats = session.stats();
     println!(
-        "status: uptime={:?} tick={} players={}/{} packets: rx={} tx={} drop={} protocol={} hash={:#018x}",
+        "status: uptime={:?} tick={} players={}/{} packets: rx={} tx={} drop={} protocol={} hash={:#018x} items={:#018x}",
         boot.elapsed(),
         session.tick(),
         session.player_count(),
@@ -214,7 +243,26 @@ fn print_status(session: &mut Session, args: &ServerArgs, boot: Instant) {
         stats.dropped,
         PROTOCOL_VERSION,
         session.content_hash(),
+        session.items_hash(),
     );
+    let _ = std::io::stdout().flush();
+}
+
+/// Консоль `loot <player_id> <item_key> <count>`: выдать предмет игроку.
+fn print_loot(session: &mut Session, rest: &str) {
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let [id, key, count] = parts.as_slice() else {
+        println!("usage: loot <player_id> <item_key> <count>");
+        return;
+    };
+    let (Ok(id), Ok(count)) = (id.parse::<u64>(), count.parse::<u32>()) else {
+        println!("usage: loot <player_id> <item_key> <count>");
+        return;
+    };
+    match session.debug_give(id, key, count) {
+        Ok(moved) => println!("gave {moved}/{count} '{key}' to player {id}"),
+        Err(error) => println!("loot: {error}"),
+    }
     let _ = std::io::stdout().flush();
 }
 

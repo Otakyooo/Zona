@@ -356,7 +356,7 @@ impl Scene {
         // патронов 180, болтов 30, консервов 3, водки 4.
         let crates = [
             crate_object(2.5, 12.0, &[("medkit", 1), ("bandage", 2)]),
-            crate_object(-3.0, 12.5, &[("ammo_545", 60), ("bolt", 10)]),
+            crate_object(-1.3, 15.0, &[("ammo_545", 60), ("bolt", 10)]),
             crate_object(8.0, 16.0, &[("canned_food", 2), ("vodka", 1)]),
             crate_object(-9.0, 6.0, &[("medkit", 2), ("bandage", 2)]),
             crate_object(12.0, 2.0, &[("bolt", 20), ("ammo_545", 30)]),

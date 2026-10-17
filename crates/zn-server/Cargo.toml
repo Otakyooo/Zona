@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 env_logger = { workspace = true }
 log = { workspace = true }
+zn-content = { path = "../../game/zn-content" }
 zn-net = { path = "../zn-net" }
 zn-scene = { path = "../zn-scene" }
 zn-sim = { path = "../../game/zn-sim" }

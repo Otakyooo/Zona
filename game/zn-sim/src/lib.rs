@@ -1,9 +1,12 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
 use glam::Vec3;
+use zn_content::{Item, ItemCatalog};
 use zn_core::{Entity, FixedStep, Schedule, World, SIMULATION_HZ, SIMULATION_STEP};
-use zn_net::GameEvent;
+use zn_net::{
+    quantize_pos, quantize_yaw, CorpseNet, GameEvent, GroundItemNet, InventoryAction, ItemStackNet,
+};
 pub use zn_net::{ClientInput, PlayerNetState, FLAG_FIRE, FLAG_GROUNDED, FLAG_SPRINTING};
 use zn_physics::{PhysicsWorld, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_scene::Scene;
@@ -38,11 +41,58 @@ pub const FIRE_INTERVAL_TICKS: u64 = 8;
 /// Задержка респавна после смерти (3 с); публична для экрана смерти клиента.
 pub const RESPAWN_DELAY_TICKS: u64 = 180;
 
+// ── Лут (M4b) ───────────────────────────────────────────────────────────
+/// Предельный вес переносимого (кг): сверх лимита предметы не берутся.
+pub const MAX_CARRY_WEIGHT_KG: f32 = 50.0;
+/// Тот же лимит в граммах — точные сравнения без плавающей точки.
+pub const MAX_CARRY_GRAMS: u32 = (MAX_CARRY_WEIGHT_KG * 1000.0) as u32;
+/// Сетка инвентаря 8×5: ячейка — одна стопка.
+pub const INVENTORY_COLS: usize = 8;
+pub const INVENTORY_ROWS: usize = 5;
+pub const INVENTORY_SLOTS: usize = INVENTORY_COLS * INVENTORY_ROWS;
+/// Радиус наведения при обыске/подборе (м, по горизонтали).
+pub const INTERACT_RANGE_M: f32 = 2.0;
+/// Минимальный косинус угла между прицелом и целью (~53°).
+pub const INTERACT_MIN_DOT: f32 = 0.6;
+/// На этой дистанции открытый контейнер закрывается сам (м).
+pub const CONTAINER_CLOSE_DISTANCE_M: f32 = 3.0;
+/// Труп исчезает через 5 минут.
+pub const CORPSE_LIFETIME_TICKS: u64 = 5 * 60 * SIMULATION_HZ as u64;
+/// Лимит предметов на земле: сверх — гаснут самые старые.
+pub const GROUND_ITEMS_MAX: usize = 32;
+/// База id контейнеров-трупов (ящики — индекс объекта сцены + 1).
+pub const CORPSE_CONTAINER_BASE: u64 = 1 << 62;
+/// Максимум действий в очереди одного игрока (защита от переполнения).
+pub const ACTION_QUEUE_CAP: usize = 16;
+
 /// Максимум отложенных инпутов на игрока (защита от переполнения при джиттере).
 pub const INPUT_QUEUE_CAP: usize = 64;
 
 /// Полуразмер невидимого пола «пустой» сцены (`Simulation::new`); верх — y = 0.
 const EMPTY_SCENE_GROUND_HALF_EXTENT: f32 = 256.0;
+
+/// Стопка предметов в инвентаре, контейнере или на земле: `item` — индекс в
+/// каталоге (`ItemCatalog`), `count` ≤ `stack_max` предмета.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stack {
+    pub item: u16,
+    pub count: u32,
+}
+
+impl Stack {
+    pub fn new(item: u16, count: u32) -> Self {
+        Self { item, count }
+    }
+}
+
+/// Активное использование предмета (лечение): завершится на `until_tick`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Healing {
+    /// Ячейка инвентаря с используемым предметом.
+    pub slot: u8,
+    /// Tick, на котором препарат подействует.
+    pub until_tick: u64,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerState {
@@ -62,6 +112,12 @@ pub struct PlayerState {
     pub respawn_at: u64,
     /// Раньше этого tick стрелять нельзя (кулдаун оружия).
     pub next_fire_tick: u64,
+    /// Ячейки инвентаря (сетка `INVENTORY_COLS`×`INVENTORY_ROWS`).
+    pub inventory: [Option<Stack>; INVENTORY_SLOTS],
+    /// Открытый контейнер (ящик/труп) — панель обыска.
+    pub open_container: Option<u64>,
+    /// Идущее использование предмета (лечение).
+    pub healing: Option<Healing>,
 }
 
 impl PlayerState {
@@ -78,6 +134,9 @@ impl PlayerState {
             firing: false,
             respawn_at: 0,
             next_fire_tick: 0,
+            inventory: [None; INVENTORY_SLOTS],
+            open_container: None,
+            healing: None,
         }
     }
 
@@ -125,10 +184,159 @@ pub struct SpawnPoint {
     pub yaw: f32,
 }
 
-/// Очередь событий боя (выстрелы, смерти) с прошлого снапшота; забирает
-/// серверная сессия. Имена в `Death` заполняет сессия — симуляция их не знает.
+/// Очередь игровых событий (выстрелы, смерти, начало лечения) с прошлого
+/// снапшота; забирает серверная сессия. Имена в `Death` заполняет сессия —
+/// симуляция их не знает.
 #[derive(Clone, Debug, Default)]
 pub struct CombatEvents(pub Vec<GameEvent>);
+
+/// Каталог предметов уровня. Пустой каталог — ящики сцены не наполняются
+/// (симуляциям движения и боя каталог не нужен).
+#[derive(Clone, Debug, Default)]
+pub struct LootCatalog(pub ItemCatalog);
+
+/// Ящики уровня: содержимое и центр для проверки дистанции. id в сети —
+/// `scene_index + 1`; трупы живут отдельным списком (`Corpses`).
+#[derive(Clone, Debug, Default)]
+pub struct Containers(pub Vec<ContainerState>);
+
+#[derive(Clone, Debug)]
+pub struct ContainerState {
+    /// Индекс объекта сцены (id контейнера = индекс + 1).
+    pub scene_index: u32,
+    /// Центр ящика — для проверки дистанции наведения.
+    pub position: Vec3,
+    pub items: Vec<Stack>,
+}
+
+/// Трупы игроков: контейнеры с лутом, живут `CORPSE_LIFETIME_TICKS`.
+#[derive(Clone, Debug, Default)]
+pub struct Corpses {
+    pub entries: Vec<Corpse>,
+    next_raw_id: u64,
+}
+
+impl Corpses {
+    /// Добавляет труп и возвращает его id контейнера.
+    fn spawn(&mut self, mut corpse: Corpse) -> u64 {
+        self.next_raw_id += 1;
+        let id = CORPSE_CONTAINER_BASE + self.next_raw_id;
+        corpse.id = id;
+        self.entries.push(corpse);
+        id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Corpse {
+    /// id контейнера (`CORPSE_CONTAINER_BASE` + счётчик).
+    pub id: u64,
+    pub owner_id: u64,
+    /// Ступни на момент смерти (рендер и дистанция обыска).
+    pub position: Vec3,
+    pub yaw: f32,
+    pub items: Vec<Stack>,
+    pub despawn_tick: u64,
+}
+
+/// Предметы на земле; при переполнении гаснут самые старые.
+#[derive(Clone, Debug, Default)]
+pub struct GroundItems {
+    pub entries: Vec<GroundItem>,
+    next_seq: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroundItem {
+    pub stack: Stack,
+    pub position: Vec3,
+    /// Порядок появления — лимит земли вытесняет старейшие.
+    pub spawn_seq: u64,
+}
+
+/// Клиентское действие вне инпутов; сервер уже отфильтровал дубли по tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PlayerAction {
+    /// Обыск (E): открыть/закрыть контейнер или подобрать предмет.
+    Interact,
+    /// Действие с инвентарём (взять/всё/выбросить/использовать).
+    Inventory(InventoryAction),
+}
+
+/// Очередь клиентских действий по игрокам — обрабатывается в тике.
+#[derive(Clone, Debug, Default)]
+pub struct ActionQueue {
+    pending: HashMap<u64, VecDeque<PlayerAction>>,
+}
+
+impl ActionQueue {
+    fn push(&mut self, id: u64, action: PlayerAction) {
+        let queue = self.pending.entry(id).or_default();
+        while queue.len() >= ACTION_QUEUE_CAP {
+            queue.pop_front();
+        }
+        queue.push_back(action);
+    }
+
+    fn take_all(&mut self) -> Vec<(u64, PlayerAction)> {
+        let mut actions = Vec::new();
+        for (id, queue) in self.pending.drain() {
+            actions.extend(queue.into_iter().map(|action| (id, action)));
+        }
+        actions
+    }
+
+    fn clear(&mut self, id: u64) {
+        self.pending.remove(&id);
+    }
+}
+
+/// Персональный апдейт контейнера для сети.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContainerUpdateData {
+    pub container: u64,
+    pub items: Vec<ItemStackNet>,
+}
+
+impl ContainerUpdateData {
+    /// Апдейт «контейнер закрыт».
+    pub fn closed() -> Self {
+        Self {
+            container: 0,
+            items: Vec::new(),
+        }
+    }
+}
+
+/// Изменения для персональной рассылки (создаёт симуляция, отправляет сессия).
+/// На клиенте не используется — истина приходит в снапшотах; очереди
+/// ограничены, чтобы предсказание без отправки не росло бесконечно.
+#[derive(Clone, Debug, Default)]
+pub struct NetUpdates {
+    /// Полное состояние ячеек инвентаря владельцу.
+    pub inventory: Vec<(u64, Vec<Option<ItemStackNet>>)>,
+    /// Состояние контейнера открывшему его игроку (`container = 0` — закрыт).
+    pub containers: Vec<(u64, ContainerUpdateData)>,
+}
+
+/// Максимум апдейтов каждого вида до вычитывания серверной сессией.
+const NET_UPDATES_CAP: usize = 128;
+
+impl NetUpdates {
+    fn push_inventory(&mut self, id: u64, slots: Vec<Option<ItemStackNet>>) {
+        while self.inventory.len() >= NET_UPDATES_CAP {
+            self.inventory.remove(0);
+        }
+        self.inventory.push((id, slots));
+    }
+
+    fn push_container(&mut self, id: u64, update: ContainerUpdateData) {
+        while self.containers.len() >= NET_UPDATES_CAP {
+            self.containers.remove(0);
+        }
+        self.containers.push((id, update));
+    }
+}
 
 /// Очереди клиентских инпутов по игрокам.
 ///
@@ -214,22 +422,36 @@ impl Simulation {
     }
 
     /// Симуляция уровня: статические коллайдеры строятся из объектов сцены
-    /// (`solid`), точка спавна — из сцены. Пол должен быть объектом сцены —
-    /// как в `demo_zone`.
+    /// (`solid`), точка спавна — из сцены. Каталог предметов пуст — ящики
+    /// сцены не наполняются (движению и бою каталог не нужен). Пол должен
+    /// быть объектом сцены — как в `demo_zone`.
     pub fn with_scene(scene: &Scene) -> Self {
+        Self::with_scene_and_catalog(scene, ItemCatalog::default())
+    }
+
+    /// Симуляция уровня вместе с каталогом предметов: ящики сцены получают
+    /// стартовое содержимое.
+    pub fn with_scene_and_catalog(scene: &Scene, catalog: ItemCatalog) -> Self {
         let mut simulation = Self::build(scene.spawn, scene.spawn_yaw, false);
+        if let Some(resource) = simulation.world.get_resource_mut::<LootCatalog>() {
+            resource.0 = catalog;
+        }
         simulation.rebuild_static(scene);
         simulation
     }
 
-    /// Пересобирает статические коллайдеры сцены и точку спавна: единый путь
-    /// загрузки уровня (ручная пол-пластина пустой сцены не трогается).
+    /// Пересобирает статические коллайдеры сцены, точку спавна и ящики: единый
+    /// путь загрузки уровня (ручная пол-плита пустой сцены не трогается).
     pub fn rebuild_static(&mut self, scene: &Scene) {
         self.spawn = scene.spawn;
         self.spawn_yaw = scene.spawn_yaw;
         if let Some(spawn_point) = self.world.get_resource_mut::<SpawnPoint>() {
             spawn_point.position = scene.spawn;
             spawn_point.yaw = scene.spawn_yaw;
+        }
+        let catalog = self.catalog();
+        if let Some(containers) = self.world.get_resource_mut::<Containers>() {
+            containers.0 = build_containers(scene, &catalog);
         }
         let physics = self
             .world
@@ -247,6 +469,12 @@ impl Simulation {
             yaw: spawn_yaw,
         });
         world.insert_resource(CombatEvents::default());
+        world.insert_resource(LootCatalog::default());
+        world.insert_resource(Containers::default());
+        world.insert_resource(Corpses::default());
+        world.insert_resource(GroundItems::default());
+        world.insert_resource(ActionQueue::default());
+        world.insert_resource(NetUpdates::default());
 
         let mut physics = PhysicsWorld::with_gravity_y(-GRAVITY, SIMULATION_STEP.as_secs_f32());
         if ground_plate {
@@ -325,6 +553,9 @@ impl Simulation {
             return false;
         };
         self.clear_inputs(id);
+        if let Some(queue) = self.world.get_resource_mut::<ActionQueue>() {
+            queue.clear(id);
+        }
         self.world.despawn(entity)
     }
 
@@ -403,6 +634,92 @@ impl Simulation {
             .unwrap_or_default()
     }
 
+    /// Очередь действия клиента (обыск/инвентарь); сервер уже отфильтровал
+    /// дубли по tick.
+    pub fn queue_action(&mut self, id: u64, action: PlayerAction) {
+        self.world
+            .get_resource_or_insert_with(ActionQueue::default)
+            .push(id, action);
+    }
+
+    /// Забирает персональные апдейты инвентарей/контейнеров (серверная сессия).
+    pub fn take_net_updates(&mut self) -> NetUpdates {
+        self.world
+            .get_resource_mut::<NetUpdates>()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Содержимое контейнера (копия) — диагностика, тесты и консоль сервера.
+    pub fn container_items(&self, container: u64) -> Option<Vec<Stack>> {
+        container_items_copy(&self.world, container)
+    }
+
+    /// Предметы на земле для снапшота (позиции квантованы).
+    pub fn snapshot_loot(&self) -> Vec<GroundItemNet> {
+        self.world
+            .get_resource::<GroundItems>()
+            .map(|items| {
+                items
+                    .entries
+                    .iter()
+                    .map(|entry| GroundItemNet {
+                        item: entry.stack.item,
+                        count: u16::try_from(entry.stack.count).unwrap_or(u16::MAX),
+                        pos: quantize_pos(entry.position.to_array()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Трупы для снапшота; имена заполняет серверная сессия.
+    pub fn snapshot_corpses(&self) -> Vec<CorpseNet> {
+        self.world
+            .get_resource::<Corpses>()
+            .map(|corpses| {
+                corpses
+                    .entries
+                    .iter()
+                    .map(|corpse| CorpseNet {
+                        container: corpse.id,
+                        owner: corpse.owner_id,
+                        name: String::new(),
+                        pos: quantize_pos(corpse.position.to_array()),
+                        yaw: quantize_yaw(corpse.yaw),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Индекс предмета в каталоге по ключу (отладочная консоль сервера).
+    pub fn catalog_index_of(&self, key: &str) -> Option<u16> {
+        self.world
+            .get_resource::<LootCatalog>()
+            .and_then(|catalog| catalog.0.index_of(key))
+    }
+
+    /// Отладка (консоль сервера): выдать предмет игроку — сколько влезет.
+    /// Возвращает число выданных единиц.
+    pub fn debug_give(&mut self, id: u64, item: u16, count: u32) -> u32 {
+        let catalog = self.catalog();
+        let moved = with_player(&mut self.world, id, |state| {
+            add_stack(&catalog, &mut state.inventory, Stack::new(item, count))
+        })
+        .unwrap_or(0);
+        if moved > 0 {
+            push_inventory_update_of(&mut self.world, id);
+        }
+        moved
+    }
+
+    /// Копия каталога предметов: мутации инвентаря не должны держать
+    /// заимствование ресурса.
+    fn catalog(&self) -> ItemCatalog {
+        catalog_of(&self.world)
+    }
+
     /// Точка попадания луча в статику уровня (конец трейсера для эффектов
     /// выстрела); `dir` — единичный вектор.
     pub fn cast_ray(&self, origin: Vec3, dir: Vec3, max_distance: f32) -> Option<Vec3> {
@@ -426,6 +743,9 @@ fn build_schedule() -> Schedule {
     schedule.add("player_apply_input", apply_input);
     schedule.add("player_move", move_players);
     schedule.add("player_combat", player_combat);
+    schedule.add("player_actions", player_actions);
+    schedule.add("player_healing", player_healing);
+    schedule.add("corpse_decay", corpse_decay);
     schedule.add("player_respawn", player_respawn);
     schedule
 }
@@ -435,6 +755,13 @@ fn tick_dt(world: &World) -> f32 {
         .get_resource::<TickInfo>()
         .map(|info| info.dt)
         .unwrap_or_else(|| SIMULATION_STEP.as_secs_f32())
+}
+
+fn tick_now(world: &World) -> u64 {
+    world
+        .get_resource::<TickInfo>()
+        .map(|info| info.tick)
+        .unwrap_or(0)
 }
 
 fn apply_input(world: &mut World) {
@@ -694,7 +1021,8 @@ fn player_combat(world: &mut World) {
     }
 
     // Фаза 2: кулдаун, урон, смерти (мутабельные заимствования).
-    let mut deaths: Vec<(u64, u64)> = Vec::new(); // (жертва, убийца)
+    // Лут снимается с трупа: (жертва, убийца, предметы, ступни, yaw).
+    let mut deaths: Vec<(u64, u64, Vec<Stack>, Vec3, f32)> = Vec::new();
     {
         let mut query = world.query::<&mut PlayerState>();
         for state in query.iter() {
@@ -712,23 +1040,340 @@ fn player_combat(world: &mut World) {
                     state.sprinting = false;
                     state.firing = false;
                     state.respawn_at = tick + RESPAWN_DELAY_TICKS;
-                    deaths.push((state.id, *killer));
+                    state.healing = None;
+                    state.open_container = None;
+                    let items = drain_inventory(&mut state.inventory);
+                    deaths.push((state.id, *killer, items, state.position, state.yaw));
                 }
             }
         }
     }
 
-    for (victim, killer) in deaths {
+    for (victim, killer, items, position, yaw) in deaths {
         events.push(GameEvent::Death {
             victim,
             victim_name: String::new(),
             killer,
             killer_name: String::new(),
         });
+        spawn_corpse(world, victim, position, yaw, items, tick);
     }
 
     if let Some(queue) = world.get_resource_mut::<CombatEvents>() {
         queue.0.extend(events);
+    }
+}
+
+/// Обыск, инвентарь и жизненный цикл открытых контейнеров: действия из
+/// `ActionQueue` (сервер уже отфильтровал дубли) и авто-закрытие панелей.
+fn player_actions(world: &mut World) {
+    let tick = tick_now(world);
+    let actions = world
+        .get_resource_mut::<ActionQueue>()
+        .map(ActionQueue::take_all)
+        .unwrap_or_default();
+
+    for (player_id, action) in actions {
+        match action {
+            PlayerAction::Interact => interact(world, player_id),
+            PlayerAction::Inventory(action) => inventory_action(world, player_id, action, tick),
+        }
+    }
+
+    maintain_open_containers(world);
+}
+
+/// Нажатие E: контейнер в прицеле открывается/закрывается, предмет на земле
+/// подбирается; без цели открытая панель закрывается.
+fn interact(world: &mut World, player_id: u64) {
+    let Some((eye, aim, open)) = player_aim(world, player_id) else {
+        // Мёртвый или неизвестный игрок — панель обыска не держим.
+        set_open_container(world, player_id, None);
+        return;
+    };
+
+    match pick_interact_target(world, eye, aim) {
+        Some(InteractTarget::Container(container)) => {
+            if open == Some(container) {
+                set_open_container(world, player_id, None);
+            } else {
+                set_open_container(world, player_id, Some(container));
+            }
+        }
+        Some(InteractTarget::Ground(spawn_seq)) => pickup_items(world, player_id, spawn_seq),
+        None => set_open_container(world, player_id, None),
+    }
+}
+
+/// Открывает/закрывает панель обыска и сообщает сети её содержимое.
+/// Повтор того же состояния не рассылается.
+fn set_open_container(world: &mut World, player_id: u64, container: Option<u64>) {
+    let changed = with_player(world, player_id, |state| {
+        if state.open_container == container {
+            return false;
+        }
+        state.open_container = container;
+        true
+    })
+    .unwrap_or(false);
+    if !changed {
+        return;
+    }
+
+    let update = container
+        .and_then(|id| {
+            container_items_net(world, id).map(|items| ContainerUpdateData {
+                container: id,
+                items,
+            })
+        })
+        .unwrap_or_else(ContainerUpdateData::closed);
+    if let Some(updates) = world.get_resource_mut::<NetUpdates>() {
+        updates.push_container(player_id, update);
+    }
+}
+
+/// Авто-закрытие панелей обыска: игрок ушёл дальше
+/// `CONTAINER_CLOSE_DISTANCE_M`, контейнер исчез (труп истёк) или игрок мёртв.
+fn maintain_open_containers(world: &mut World) {
+    let players: Vec<(u64, bool, Vec3, Option<u64>)> = world
+        .query::<&PlayerState>()
+        .iter()
+        .map(|state| {
+            (
+                state.id,
+                state.health > 0,
+                state.position,
+                state.open_container,
+            )
+        })
+        .collect();
+
+    let mut close = Vec::new();
+    for (id, alive, position, container) in players {
+        let Some(container) = container else {
+            continue;
+        };
+        let target = container_position(world, container);
+        let far = target.is_some_and(|target| {
+            horizontal_distance(position, target) > CONTAINER_CLOSE_DISTANCE_M
+        });
+        if !alive || target.is_none() || far {
+            close.push(id);
+        }
+    }
+    for id in close {
+        set_open_container(world, id, None);
+    }
+}
+
+/// Действие с инвентарём: взять/всё/выбросить/использовать.
+fn inventory_action(world: &mut World, player_id: u64, action: InventoryAction, tick: u64) {
+    match action {
+        InventoryAction::TakeFrom { container, index } => {
+            take_from_container(world, player_id, container, index);
+        }
+        InventoryAction::TakeAll { container } => {
+            take_all_from_container(world, player_id, container);
+        }
+        InventoryAction::Drop { slot } => drop_slot(world, player_id, slot),
+        InventoryAction::Use { slot } => use_slot(world, player_id, slot, tick),
+    }
+}
+
+/// Действие допустимо: игрок жив, контейнер открыт им и в радиусе обыска.
+fn container_accessible(world: &mut World, player_id: u64, container: u64) -> bool {
+    let open = with_player(world, player_id, |state| {
+        state.health > 0 && state.open_container == Some(container)
+    })
+    .unwrap_or(false);
+    if !open {
+        return false;
+    }
+    let Some(position) = container_position(world, container) else {
+        return false;
+    };
+    let player_position = with_player(world, player_id, |state| state.position).unwrap_or_default();
+    horizontal_distance(player_position, position) <= INTERACT_RANGE_M
+}
+
+/// Взять стопку из открытого контейнера: сколько влезет, остаток — назад.
+fn take_from_container(world: &mut World, player_id: u64, container: u64, index: u16) {
+    if !container_accessible(world, player_id, container) {
+        return;
+    }
+    let Some(stack) = take_container_stack(world, container, usize::from(index)) else {
+        return;
+    };
+    let catalog = catalog_of(world);
+    let moved = with_player(world, player_id, |state| {
+        add_stack(&catalog, &mut state.inventory, stack)
+    })
+    .unwrap_or(0);
+
+    let leftover = stack.count - moved;
+    if leftover > 0 {
+        push_container_stack(world, container, Stack::new(stack.item, leftover));
+    }
+    if moved > 0 {
+        push_inventory_update_of(world, player_id);
+    }
+    if moved > 0 || leftover > 0 {
+        push_container_update(world, player_id, container);
+    }
+}
+
+/// Взять из открытого контейнера всё, что влезает по весу и ячейкам.
+fn take_all_from_container(world: &mut World, player_id: u64, container: u64) {
+    if !container_accessible(world, player_id, container) {
+        return;
+    }
+    let Some(items) = container_items_copy(world, container) else {
+        return;
+    };
+    let catalog = catalog_of(world);
+    let mut remaining = Vec::new();
+    let mut moved_any = false;
+    for stack in items {
+        let moved = with_player(world, player_id, |state| {
+            add_stack(&catalog, &mut state.inventory, stack)
+        })
+        .unwrap_or(0);
+        if moved > 0 {
+            moved_any = true;
+        }
+        if moved < stack.count {
+            remaining.push(Stack::new(stack.item, stack.count - moved));
+        }
+    }
+    if !moved_any {
+        return;
+    }
+    set_container_items(world, container, remaining);
+    push_inventory_update_of(world, player_id);
+    push_container_update(world, player_id, container);
+}
+
+/// Выбросить ячейку инвентаря на землю перед собой.
+fn drop_slot(world: &mut World, player_id: u64, slot: u8) {
+    let index = usize::from(slot);
+    if index >= INVENTORY_SLOTS {
+        return;
+    }
+    let dropped = with_player(world, player_id, |state| {
+        if state.health == 0 {
+            return None;
+        }
+        state.inventory.get_mut(index).and_then(|cell| cell.take())
+    })
+    .flatten();
+    let Some(stack) = dropped else {
+        return;
+    };
+
+    let position = drop_position(world, player_id);
+    spawn_ground_item(world, stack, position);
+    push_inventory_update_of(world, player_id);
+}
+
+/// Использовать предмет из ячейки: запускает лечение (применится в
+/// `player_healing`). Мёртвые, здоровые и уже лечащиеся — не начинают.
+fn use_slot(world: &mut World, player_id: u64, slot: u8, tick: u64) {
+    let index = usize::from(slot);
+    if index >= INVENTORY_SLOTS {
+        return;
+    }
+    let catalog = catalog_of(world);
+    let started = with_player(world, player_id, |state| {
+        if state.health == 0 || state.health >= MAX_HEALTH || state.healing.is_some() {
+            return None;
+        }
+        let stack = state.inventory.get(index).copied().flatten()?;
+        let effect = catalog.get(stack.item)?.use_effect.as_ref()?;
+        if effect.heal == 0 {
+            return None;
+        }
+        let ticks = (effect.duration_secs * SIMULATION_HZ as f32)
+            .round()
+            .max(1.0) as u64;
+        state.healing = Some(Healing {
+            slot,
+            until_tick: tick + ticks,
+        });
+        Some(u16::try_from(ticks).unwrap_or(u16::MAX))
+    })
+    .flatten();
+
+    if let Some(ticks) = started {
+        if let Some(events) = world.get_resource_mut::<CombatEvents>() {
+            events.0.push(GameEvent::UseStarted {
+                player: player_id,
+                ticks,
+            });
+        }
+    }
+}
+
+/// Завершение лечения: по истечении `until_tick` добавляет HP и тратит одну
+/// единицу предмета. Смерть или потеря предмета отменяют эффект.
+fn player_healing(world: &mut World) {
+    let tick = tick_now(world);
+    let catalog = catalog_of(world);
+    let mut completed: Vec<u64> = Vec::new();
+
+    {
+        let mut query = world.query::<&mut PlayerState>();
+        for state in query.iter() {
+            let Some(healing) = state.healing else {
+                continue;
+            };
+            if state.health == 0 {
+                state.healing = None;
+                continue;
+            }
+            if tick < healing.until_tick {
+                continue;
+            }
+            state.healing = None;
+
+            let slot = usize::from(healing.slot);
+            let Some(stack) = state.inventory.get(slot).copied().flatten() else {
+                continue;
+            };
+            let Some(effect) = catalog
+                .get(stack.item)
+                .and_then(|item| item.use_effect.as_ref())
+            else {
+                continue;
+            };
+            state.health = state.health.saturating_add(effect.heal).min(MAX_HEALTH);
+            if let Some(cell) = state.inventory.get_mut(slot) {
+                let emptied = match cell {
+                    Some(existing) => {
+                        existing.count = existing.count.saturating_sub(1);
+                        existing.count == 0
+                    }
+                    None => false,
+                };
+                if emptied {
+                    *cell = None;
+                }
+            }
+            completed.push(state.id);
+        }
+    }
+
+    for id in completed {
+        push_inventory_update_of(world, id);
+    }
+}
+
+/// Старение мира: трупы старше `CORPSE_LIFETIME_TICKS` исчезают (панели
+/// обыска у смотрящих закроются в `maintain_open_containers`).
+fn corpse_decay(world: &mut World) {
+    let tick = tick_now(world);
+    if let Some(corpses) = world.get_resource_mut::<Corpses>() {
+        corpses.entries.retain(|corpse| corpse.despawn_tick > tick);
     }
 }
 
@@ -759,8 +1404,504 @@ fn player_respawn(world: &mut World) {
             state.health = MAX_HEALTH;
             state.respawn_at = 0;
             state.next_fire_tick = 0;
+            state.healing = None;
+            state.open_container = None;
         }
     }
+}
+
+/// Цель наведения (E): контейнер (ящик/труп) или предмет на земле.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InteractTarget {
+    Container(u64),
+    /// Порядковый номер появления предмета на земле.
+    Ground(u64),
+}
+
+/// Выбирает цель в пределах `INTERACT_RANGE_M` (по горизонтали) с максимальной
+/// близостью к прицелу (косинус ≥ `INTERACT_MIN_DOT`). Линия видимости не
+/// проверяется: цели маленькие и выбираются в упор.
+fn pick_interact_target(world: &World, eye: Vec3, aim: Vec3) -> Option<InteractTarget> {
+    let mut best: Option<(f32, f32, InteractTarget)> = None;
+    let mut consider = |target: InteractTarget, position: Vec3| {
+        let delta = position - eye;
+        let horizontal = Vec3::new(delta.x, 0.0, delta.z);
+        let distance = horizontal.length();
+        if distance > INTERACT_RANGE_M {
+            return;
+        }
+        let dot = if delta.length_squared() < 1e-8 {
+            1.0
+        } else {
+            delta.normalize().dot(aim)
+        };
+        if dot < INTERACT_MIN_DOT {
+            return;
+        }
+        let better = match best {
+            None => true,
+            Some((best_dot, best_dist, _)) => {
+                dot > best_dot + 1e-6 || ((dot - best_dot).abs() <= 1e-6 && distance < best_dist)
+            }
+        };
+        if better {
+            best = Some((dot, distance, target));
+        }
+    };
+
+    if let Some(containers) = world.get_resource::<Containers>() {
+        for container in &containers.0 {
+            consider(
+                InteractTarget::Container(crate_container_id(container.scene_index)),
+                container.position,
+            );
+        }
+    }
+    if let Some(corpses) = world.get_resource::<Corpses>() {
+        for corpse in &corpses.entries {
+            consider(InteractTarget::Container(corpse.id), corpse.position);
+        }
+    }
+    if let Some(items) = world.get_resource::<GroundItems>() {
+        for item in &items.entries {
+            consider(InteractTarget::Ground(item.spawn_seq), item.position);
+        }
+    }
+
+    best.map(|(_, _, target)| target)
+}
+
+/// Подбор предмета с земли: сколько влезет в инвентарь; остаток остаётся.
+fn pickup_items(world: &mut World, player_id: u64, spawn_seq: u64) {
+    let taken = {
+        let Some(items) = world.get_resource_mut::<GroundItems>() else {
+            return;
+        };
+        let Some(index) = items
+            .entries
+            .iter()
+            .position(|item| item.spawn_seq == spawn_seq)
+        else {
+            return;
+        };
+        items.entries.remove(index)
+    };
+
+    let catalog = catalog_of(world);
+    let moved = with_player(world, player_id, |state| {
+        if state.health == 0 {
+            return 0;
+        }
+        add_stack(&catalog, &mut state.inventory, taken.stack)
+    })
+    .unwrap_or(0);
+    if moved > 0 {
+        push_inventory_update_of(world, player_id);
+    }
+    if moved < taken.stack.count {
+        spawn_ground_item(
+            world,
+            Stack::new(taken.stack.item, taken.stack.count - moved),
+            taken.position,
+        );
+    }
+}
+
+/// Позиция глаз, прицел и открытый контейнер живого игрока.
+fn player_aim(world: &mut World, player_id: u64) -> Option<(Vec3, Vec3, Option<u64>)> {
+    let mut query = world.query::<&PlayerState>();
+    for state in query.iter() {
+        if state.id == player_id && state.health > 0 {
+            return Some((
+                state.position + Vec3::new(0.0, EYE_HEIGHT, 0.0),
+                aim_forward(state.yaw, state.pitch),
+                state.open_container,
+            ));
+        }
+    }
+    None
+}
+
+/// Точка выброса: шаг вперёд от игрока на высоте ступней.
+fn drop_position(world: &mut World, player_id: u64) -> Vec3 {
+    let mut query = world.query::<&PlayerState>();
+    for state in query.iter() {
+        if state.id == player_id {
+            let (sin_yaw, cos_yaw) = state.yaw.sin_cos();
+            return state.position + Vec3::new(cos_yaw, 0.0, sin_yaw) * 0.6;
+        }
+    }
+    Vec3::ZERO
+}
+
+/// Мутирует состояние игрока по id, если он существует.
+fn with_player<T>(world: &mut World, id: u64, f: impl FnOnce(&mut PlayerState) -> T) -> Option<T> {
+    let mut query = world.query::<&mut PlayerState>();
+    for state in query.iter() {
+        if state.id == id {
+            return Some(f(state));
+        }
+    }
+    None
+}
+
+fn player_state_copy(world: &mut World, id: u64) -> Option<PlayerState> {
+    let mut query = world.query::<&PlayerState>();
+    query.iter().find(|state| state.id == id).cloned()
+}
+
+/// Копия каталога предметов уровня.
+fn catalog_of(world: &World) -> ItemCatalog {
+    world
+        .get_resource::<LootCatalog>()
+        .map(|catalog| catalog.0.clone())
+        .unwrap_or_default()
+}
+
+/// Вес одной единицы предмета в граммах — точные сравнения с лимитом.
+fn item_weight_grams(item: &Item) -> u32 {
+    (item.weight_kg * 1000.0).round().max(1.0) as u32
+}
+
+/// Вес инвентаря в граммах по каталогу.
+pub fn inventory_weight_grams(
+    catalog: &ItemCatalog,
+    inventory: &[Option<Stack>; INVENTORY_SLOTS],
+) -> u32 {
+    let mut grams = 0u32;
+    for stack in inventory.iter().flatten() {
+        if let Some(item) = catalog.get(stack.item) {
+            grams = grams.saturating_add(item_weight_grams(item).saturating_mul(stack.count));
+        }
+    }
+    grams
+}
+
+/// Кладёт стопку в инвентарь насколько влезает по весу и ячейкам: сначала
+/// доливает частичные стопки того же предмета, затем занимает пустые ячейки.
+/// Возвращает число перенесённых единиц (может быть меньше `stack.count`).
+fn add_stack(
+    catalog: &ItemCatalog,
+    inventory: &mut [Option<Stack>; INVENTORY_SLOTS],
+    stack: Stack,
+) -> u32 {
+    let Some(item) = catalog.get(stack.item) else {
+        return 0;
+    };
+    let stack_max = item.stack_max.max(1);
+    let unit_grams = item_weight_grams(item);
+    let room_units =
+        MAX_CARRY_GRAMS.saturating_sub(inventory_weight_grams(catalog, inventory)) / unit_grams;
+    if room_units == 0 {
+        return 0;
+    }
+
+    let mut left = stack.count;
+    let mut moved = 0u32;
+
+    // Доливка в частичные стопки того же предмета.
+    for slot in inventory.iter_mut() {
+        if left == 0 || moved >= room_units {
+            break;
+        }
+        if let Some(existing) = slot.as_mut() {
+            if existing.item == stack.item && existing.count < stack_max {
+                let take = left.min(stack_max - existing.count).min(room_units - moved);
+                existing.count += take;
+                left -= take;
+                moved += take;
+            }
+        }
+    }
+
+    // Новые ячейки.
+    for slot in inventory.iter_mut() {
+        if left == 0 || moved >= room_units {
+            break;
+        }
+        if slot.is_none() {
+            let take = left.min(stack_max).min(room_units - moved);
+            *slot = Some(Stack::new(stack.item, take));
+            left -= take;
+            moved += take;
+        }
+    }
+
+    moved
+}
+
+/// Выгребает содержимое инвентаря (лут для трупа), оставляя ячейки пустыми.
+fn drain_inventory(inventory: &mut [Option<Stack>; INVENTORY_SLOTS]) -> Vec<Stack> {
+    let mut items = Vec::new();
+    for slot in inventory.iter_mut() {
+        if let Some(stack) = slot.take() {
+            items.push(stack);
+        }
+    }
+    items
+}
+
+/// Полное состояние ячеек инвентаря в сетевом виде.
+fn inventory_net(inventory: &[Option<Stack>; INVENTORY_SLOTS]) -> Vec<Option<ItemStackNet>> {
+    inventory
+        .iter()
+        .map(|slot| {
+            slot.map(|stack| ItemStackNet {
+                item: stack.item,
+                count: u16::try_from(stack.count).unwrap_or(u16::MAX),
+            })
+        })
+        .collect()
+}
+
+/// Стопки в сетевом виде.
+fn stacks_net(items: &[Stack]) -> Vec<ItemStackNet> {
+    items
+        .iter()
+        .map(|stack| ItemStackNet {
+            item: stack.item,
+            count: u16::try_from(stack.count).unwrap_or(u16::MAX),
+        })
+        .collect()
+}
+
+/// Помечает инвентарь игрока «изменился»: сессия дошлёт полное состояние.
+fn push_inventory_update(world: &mut World, state: &PlayerState) {
+    if let Some(updates) = world.get_resource_mut::<NetUpdates>() {
+        updates.push_inventory(state.id, inventory_net(&state.inventory));
+    }
+}
+
+/// То же по id игрока.
+fn push_inventory_update_of(world: &mut World, player_id: u64) {
+    if let Some(state) = player_state_copy(world, player_id) {
+        push_inventory_update(world, &state);
+    }
+}
+
+/// Обновление содержимого контейнера для игрока с открытой панелью.
+fn push_container_update(world: &mut World, player_id: u64, container: u64) {
+    let items = container_items_net(world, container).unwrap_or_default();
+    if let Some(updates) = world.get_resource_mut::<NetUpdates>() {
+        updates.push_container(player_id, ContainerUpdateData { container, items });
+    }
+}
+
+/// Кладёт труп игрока (тело остаётся для рендера даже без лута) и сообщает
+/// сети, что инвентарь жертвы и открытый контейнер опустели.
+fn spawn_corpse(
+    world: &mut World,
+    owner_id: u64,
+    position: Vec3,
+    yaw: f32,
+    items: Vec<Stack>,
+    tick: u64,
+) {
+    if let Some(corpses) = world.get_resource_mut::<Corpses>() {
+        corpses.spawn(Corpse {
+            id: 0,
+            owner_id,
+            position,
+            yaw,
+            items,
+            despawn_tick: tick + CORPSE_LIFETIME_TICKS,
+        });
+    }
+    push_inventory_update_of(world, owner_id);
+    set_open_container(world, owner_id, None);
+}
+
+/// Кладёт предмет на землю; сверх `GROUND_ITEMS_MAX` гаснут самые старые.
+fn spawn_ground_item(world: &mut World, stack: Stack, position: Vec3) {
+    if stack.count == 0 {
+        return;
+    }
+    let Some(items) = world.get_resource_mut::<GroundItems>() else {
+        return;
+    };
+    let seq = items.next_seq;
+    items.next_seq += 1;
+    items.entries.push(GroundItem {
+        stack,
+        position,
+        spawn_seq: seq,
+    });
+    while items.entries.len() > GROUND_ITEMS_MAX {
+        let Some(oldest) = items
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, item)| item.spawn_seq)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        items.entries.remove(oldest);
+    }
+}
+
+/// id контейнера-ящика по индексу объекта сцены.
+pub fn crate_container_id(scene_index: u32) -> u64 {
+    u64::from(scene_index) + 1
+}
+
+/// Индекс объекта сцены по id ящика; `None` для трупов и 0.
+pub fn crate_scene_index(container: u64) -> Option<u32> {
+    if container == 0 || is_corpse_container(container) {
+        return None;
+    }
+    u32::try_from(container - 1).ok()
+}
+
+/// id относится к трупу, а не к ящику сцены.
+pub fn is_corpse_container(container: u64) -> bool {
+    container >= CORPSE_CONTAINER_BASE
+}
+
+/// Центр контейнера (ящика или места смерти трупа).
+fn container_position(world: &World, container: u64) -> Option<Vec3> {
+    if container == 0 {
+        return None;
+    }
+    if is_corpse_container(container) {
+        let corpses = world.get_resource::<Corpses>()?;
+        return corpses
+            .entries
+            .iter()
+            .find(|corpse| corpse.id == container)
+            .map(|corpse| corpse.position);
+    }
+    let scene_index = crate_scene_index(container)?;
+    let containers = world.get_resource::<Containers>()?;
+    containers
+        .0
+        .iter()
+        .find(|crate_state| crate_state.scene_index == scene_index)
+        .map(|crate_state| crate_state.position)
+}
+
+/// Содержимое контейнера (копия).
+fn container_items_copy(world: &World, container: u64) -> Option<Vec<Stack>> {
+    container_items_ref(world, container).cloned()
+}
+
+/// Содержимое контейнера в сетевом виде.
+fn container_items_net(world: &World, container: u64) -> Option<Vec<ItemStackNet>> {
+    container_items_copy(world, container).map(|items| stacks_net(&items))
+}
+
+fn container_items_ref(world: &World, container: u64) -> Option<&Vec<Stack>> {
+    if container == 0 {
+        return None;
+    }
+    if is_corpse_container(container) {
+        let corpses = world.get_resource::<Corpses>()?;
+        return corpses
+            .entries
+            .iter()
+            .find(|corpse| corpse.id == container)
+            .map(|corpse| &corpse.items);
+    }
+    let scene_index = crate_scene_index(container)?;
+    let containers = world.get_resource::<Containers>()?;
+    containers
+        .0
+        .iter()
+        .find(|crate_state| crate_state.scene_index == scene_index)
+        .map(|crate_state| &crate_state.items)
+}
+
+/// Мутабельная ссылка на содержимое контейнера (ящика или трупа).
+fn container_items_mut(world: &mut World, container: u64) -> Option<&mut Vec<Stack>> {
+    if container == 0 {
+        return None;
+    }
+    if is_corpse_container(container) {
+        let corpses = world.get_resource_mut::<Corpses>()?;
+        return corpses
+            .entries
+            .iter_mut()
+            .find(|corpse| corpse.id == container)
+            .map(|corpse| &mut corpse.items);
+    }
+    let scene_index = crate_scene_index(container)?;
+    let containers = world.get_resource_mut::<Containers>()?;
+    containers
+        .0
+        .iter_mut()
+        .find(|crate_state| crate_state.scene_index == scene_index)
+        .map(|crate_state| &mut crate_state.items)
+}
+
+/// Забирает стопку из контейнера по индексу.
+fn take_container_stack(world: &mut World, container: u64, index: usize) -> Option<Stack> {
+    let items = container_items_mut(world, container)?;
+    if index < items.len() {
+        Some(items.remove(index))
+    } else {
+        None
+    }
+}
+
+/// Кладёт стопку в конец содержимого контейнера.
+fn push_container_stack(world: &mut World, container: u64, stack: Stack) {
+    if let Some(items) = container_items_mut(world, container) {
+        items.push(stack);
+    }
+}
+
+/// Заменяет содержимое контейнера.
+fn set_container_items(world: &mut World, container: u64, items: Vec<Stack>) {
+    if let Some(target) = container_items_mut(world, container) {
+        *target = items;
+    }
+}
+
+/// Горизонтальная дистанция между точками (высота не учитывается).
+fn horizontal_distance(left: Vec3, right: Vec3) -> f32 {
+    ((left.x - right.x).powi(2) + (left.z - right.z).powi(2)).sqrt()
+}
+
+/// Собирает ящики уровня: объекты сцены с `loot`, наполненные по каталогу.
+/// Неизвестные ключи пропускаются с предупреждением, количество дробится по
+/// `stack_max` предмета.
+fn build_containers(scene: &Scene, catalog: &ItemCatalog) -> Vec<ContainerState> {
+    let mut containers = Vec::new();
+    for (index, object) in scene.objects.iter().enumerate() {
+        let Some(loot) = &object.loot else {
+            continue;
+        };
+        let Ok(scene_index) = u32::try_from(index) else {
+            continue;
+        };
+        let mut items = Vec::new();
+        for entry in loot {
+            let Some(item_index) = catalog.index_of(&entry.item) else {
+                log::warn!(
+                    "ящик #{}: предмет '{}' отсутствует в каталоге — пропущен",
+                    index,
+                    entry.item
+                );
+                continue;
+            };
+            let stack_max = catalog
+                .get(item_index)
+                .map(|item| item.stack_max.max(1))
+                .unwrap_or(1);
+            let mut left = entry.count;
+            while left > 0 {
+                let count = left.min(stack_max);
+                items.push(Stack::new(item_index, count));
+                left -= count;
+            }
+        }
+        containers.push(ContainerState {
+            scene_index,
+            position: object.position,
+            items,
+        });
+    }
+    containers
 }
 
 #[cfg(test)]

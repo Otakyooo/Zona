@@ -136,6 +136,12 @@ impl ItemCatalog {
                     item.key
                 )));
             }
+            if item.stack_max > u32::from(u16::MAX) {
+                return Err(ContentError::Validation(format!(
+                    "у предмета '{}' stack_max {} не помещается в сетевое поле u16",
+                    item.key, item.stack_max
+                )));
+            }
             for channel in item.color {
                 if !(0.0..=1.0).contains(&channel) {
                     return Err(ContentError::Validation(format!(
@@ -359,6 +365,7 @@ mod tests {
             r#"(items: [(key: "x", display_name: "X", weight_kg: 0.0, stack_max: 1)])"#,
             r#"(items: [(key: "x", display_name: "X", weight_kg: -1.0, stack_max: 1)])"#,
             r#"(items: [(key: "x", display_name: "X", weight_kg: 1.0, stack_max: 0)])"#,
+            r#"(items: [(key: "x", display_name: "X", weight_kg: 1.0, stack_max: 100000)])"#,
             r#"(items: [(key: "x", display_name: "X", weight_kg: 1.0, stack_max: 1, color: (1.5, 0.0, 0.0))])"#,
             r#"(items: [(key: "x", display_name: "X", weight_kg: 1.0, stack_max: 1, use_effect: Some((heal: 0, duration_secs: 1.0)))])"#,
             r#"(items: [(key: "x", display_name: "X", weight_kg: 1.0, stack_max: 1, use_effect: Some((heal: 10, duration_secs: 0.0)))])"#,

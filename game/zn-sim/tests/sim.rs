@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use glam::Vec3;
-use zn_net::{ClientInput, GameEvent};
+use zn_net::{ClientInput, GameEvent, InventoryAction, ItemStackNet};
 use zn_scene::{Scene, SceneObject};
 use zn_sim::{
-    aim_forward, zone_damage, Simulation, EYE_HEIGHT, FLAG_FIRE, FLAG_SPRINTING, MAX_HEALTH,
-    ZONE_HEAD_MIN, ZONE_TORSO_MIN,
+    aim_forward, crate_container_id, inventory_weight_grams, is_corpse_container, zone_damage,
+    PlayerAction, Simulation, Stack, CORPSE_LIFETIME_TICKS, EYE_HEIGHT, FLAG_FIRE, FLAG_SPRINTING,
+    MAX_CARRY_GRAMS, MAX_HEALTH, ZONE_HEAD_MIN, ZONE_TORSO_MIN,
 };
 
 const SIM_STEPS: u64 = 60;
@@ -503,4 +504,430 @@ fn aim_forward_matches_camera_convention() {
     assert!(aim_forward(0.0, 0.5).y > 0.4, "pitch вверх");
     let right = aim_forward(std::f32::consts::FRAC_PI_2, 0.0);
     assert!((right - Vec3::Z).length() < 1e-5, "{right:?}");
+}
+
+// ── Лут (M4b) ───────────────────────────────────────────────────────────
+
+fn test_catalog() -> zn_content::ItemCatalog {
+    zn_content::ItemCatalog::load_ron("../content/items/items.ron").expect("каталог предметов")
+}
+
+/// Сцена теста лута: пол (верх на y = 0) и ящик-куб 0.8 в `position`
+/// (как `demo_zone`); спавн в начале координат, прицел yaw = 0 → +X.
+fn loot_scene(position: Vec3, loot: &[(&str, u32)]) -> Scene {
+    let mut scene = Scene::new("loot");
+    scene.spawn = Vec3::ZERO;
+    scene.add(SceneObject::new(
+        Vec3::new(0.0, -0.5, 0.0),
+        Vec3::new(30.0, 1.0, 30.0),
+        glam::Vec4::ONE,
+    ));
+    let entries = loot
+        .iter()
+        .map(|(item, count)| zn_scene::LootEntry {
+            item: (*item).to_string(),
+            count: *count,
+        })
+        .collect();
+    scene.add(SceneObject::new(position, Vec3::splat(0.8), glam::Vec4::ONE).with_loot(entries));
+    scene
+}
+
+/// Ящик тестовой сцены — второй объект (индекс 1) → id контейнера 2.
+fn test_crate_container() -> u64 {
+    crate_container_id(1)
+}
+
+#[test]
+fn interact_opens_crate_and_take_all_moves_loot() {
+    let catalog = test_catalog();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("ammo_545", 60), ("bolt", 10)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    let container = test_crate_container();
+
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    assert_eq!(
+        sim.player_state(id).unwrap().open_container,
+        Some(container)
+    );
+
+    // Открытие прислало содержимое ящика.
+    let updates = sim.take_net_updates();
+    let open = updates
+        .containers
+        .iter()
+        .find(|(who, _)| *who == id)
+        .expect("апдейт открытия");
+    assert_eq!(open.1.container, container);
+    assert_eq!(open.1.items.len(), 2);
+
+    sim.queue_action(
+        id,
+        PlayerAction::Inventory(InventoryAction::TakeAll { container }),
+    );
+    sim.step_once();
+
+    let ammo = catalog.index_of("ammo_545").unwrap();
+    let bolt = catalog.index_of("bolt").unwrap();
+    let state = sim.player_state(id).unwrap();
+    assert_eq!(state.inventory[0], Some(Stack::new(ammo, 60)));
+    assert_eq!(state.inventory[1], Some(Stack::new(bolt, 10)));
+    assert_eq!(
+        state.inventory.iter().flatten().count(),
+        2,
+        "остальные ячейки пусты"
+    );
+
+    // Контейнер опустел, инвентарь разослан.
+    let updates = sim.take_net_updates();
+    assert!(updates.containers.iter().any(|(who, update)| *who == id
+        && update.container == container
+        && update.items.is_empty()));
+    assert!(updates.inventory.iter().any(|(who, slots)| *who == id
+        && slots[0]
+            == Some(ItemStackNet {
+                item: ammo,
+                count: 60
+            })));
+}
+
+#[test]
+fn carry_weight_limit_caps_take_all_and_leaves_leftover() {
+    let catalog = test_catalog();
+    let canned = catalog.index_of("canned_food").unwrap();
+    // 120 консервов = 60 кг: по весу влезает ровно 100 (50 кг).
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("canned_food", 120)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    let container = test_crate_container();
+
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    // 120 шт. дробятся по stack_max = 5 → 24 стопки.
+    let updates = sim.take_net_updates();
+    let open = updates
+        .containers
+        .iter()
+        .find(|(who, _)| *who == id)
+        .expect("апдейт открытия");
+    assert_eq!(open.1.items.len(), 24);
+
+    sim.queue_action(
+        id,
+        PlayerAction::Inventory(InventoryAction::TakeAll { container }),
+    );
+    sim.step_once();
+
+    let state = sim.player_state(id).unwrap();
+    let total: u32 = state
+        .inventory
+        .iter()
+        .flatten()
+        .map(|stack| stack.count)
+        .sum();
+    assert_eq!(total, 100, "по весу влезает ровно 100 консервов");
+    assert!(state
+        .inventory
+        .iter()
+        .flatten()
+        .all(|stack| stack.item == canned));
+    assert_eq!(
+        inventory_weight_grams(&catalog, &state.inventory),
+        MAX_CARRY_GRAMS,
+        "инвентарь заполнен ровно до лимита"
+    );
+
+    // В ящике осталось 20 консервов.
+    let updates = sim.take_net_updates();
+    let last = updates
+        .containers
+        .iter()
+        .rev()
+        .find(|(who, update)| *who == id && update.container == container)
+        .map(|(_, update)| update)
+        .expect("контейнер обновлён");
+    let leftover: u32 = last.items.iter().map(|stack| u32::from(stack.count)).sum();
+    assert_eq!(leftover, 20);
+}
+
+#[test]
+fn drop_and_pickup_ground_item() {
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+
+    assert_eq!(sim.debug_give(id, medkit, 1), 1);
+    sim.queue_action(
+        id,
+        PlayerAction::Inventory(InventoryAction::Drop { slot: 0 }),
+    );
+    sim.step_once();
+
+    assert!(
+        sim.player_state(id).unwrap().inventory[0].is_none(),
+        "ячейка опустела"
+    );
+    let loot = sim.snapshot_loot();
+    assert_eq!(loot.len(), 1);
+    assert_eq!(loot[0].item, medkit);
+    assert_eq!(loot[0].count, 1);
+
+    // Смотрим вниз и подбираем: предмет появляется в первой свободной ячейке.
+    let mut look_down = input(1, 0.0, 0.0, false);
+    look_down.pitch_delta = -1.0;
+    sim.queue_input(id, look_down);
+    sim.step_once();
+
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+
+    assert!(sim.snapshot_loot().is_empty(), "предмет подобран");
+    assert_eq!(
+        sim.player_state(id).unwrap().inventory[0],
+        Some(Stack::new(medkit, 1))
+    );
+}
+
+#[test]
+fn interact_requires_aim_and_range() {
+    let catalog = test_catalog();
+
+    // Ящик дальше радиуса 2 м.
+    let far = loot_scene(Vec3::new(3.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&far, catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    assert_eq!(
+        sim.player_state(id).unwrap().open_container,
+        None,
+        "далёкий ящик не открывается"
+    );
+
+    // Ящик за спиной (прицел yaw = 0 → +X).
+    let behind = loot_scene(Vec3::new(-1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&behind, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    assert_eq!(
+        sim.player_state(id).unwrap().open_container,
+        None,
+        "ящик позади не открывается"
+    );
+}
+
+#[test]
+fn interact_toggles_open_container() {
+    let catalog = test_catalog();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    assert!(sim.player_state(id).unwrap().open_container.is_some());
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    assert!(sim.player_state(id).unwrap().open_container.is_none());
+}
+
+#[test]
+fn open_container_closes_when_walking_away() {
+    let catalog = test_catalog();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    assert!(sim.player_state(id).unwrap().open_container.is_some());
+
+    // Уходим назад (−X): дальше 3 м панель закрывается сама.
+    for tick in 1..60u64 {
+        sim.queue_input(id, input(tick, -1.0, 0.0, false));
+        sim.step_once();
+    }
+    let state = sim.player_state(id).unwrap();
+    assert!(
+        state.position.x < -3.0,
+        "игрок не отошёл: {:?}",
+        state.position
+    );
+    assert_eq!(state.open_container, None, "панель закрылась по дистанции");
+}
+
+#[test]
+fn unknown_loot_keys_are_skipped() {
+    let catalog = test_catalog();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("nope", 5), ("bolt", 3)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    let updates = sim.take_net_updates();
+    let open = updates
+        .containers
+        .iter()
+        .find(|(who, _)| *who == id)
+        .expect("апдейт открытия");
+    assert_eq!(open.1.items.len(), 1, "неизвестный предмет пропущен");
+    assert_eq!(open.1.items[0].item, catalog.index_of("bolt").unwrap());
+}
+
+#[test]
+fn medkit_heals_and_is_consumed() {
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+
+    assert_eq!(sim.debug_give(id, medkit, 1), 1);
+    let mut hurt = sim.player_state(id).unwrap().net_state();
+    hurt.health = 40;
+    assert!(sim.restore_player(id, &hurt));
+
+    sim.queue_action(
+        id,
+        PlayerAction::Inventory(InventoryAction::Use { slot: 0 }),
+    );
+    sim.step_once();
+    let healing = sim
+        .player_state(id)
+        .unwrap()
+        .healing
+        .expect("лечение началось");
+    assert!(
+        sim.take_events()
+            .iter()
+            .any(|event| matches!(event, GameEvent::UseStarted { player, ticks } if *player == id && *ticks == 120)),
+        "событие начала лечения потерялось"
+    );
+
+    let until = healing.until_tick;
+    while sim.tick() <= until {
+        sim.step_once();
+    }
+    let state = sim.player_state(id).unwrap();
+    assert_eq!(state.health, 90, "40 + 50 аптечки");
+    assert_eq!(state.healing, None);
+    assert_eq!(state.inventory[0], None, "аптечка израсходована");
+}
+
+#[test]
+fn healing_capped_at_max_health() {
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+
+    assert_eq!(sim.debug_give(id, medkit, 1), 1);
+    let mut hurt = sim.player_state(id).unwrap().net_state();
+    hurt.health = 80;
+    assert!(sim.restore_player(id, &hurt));
+
+    sim.queue_action(
+        id,
+        PlayerAction::Inventory(InventoryAction::Use { slot: 0 }),
+    );
+    sim.step_once();
+    let until = sim.player_state(id).unwrap().healing.unwrap().until_tick;
+    while sim.tick() <= until {
+        sim.step_once();
+    }
+    assert_eq!(sim.player_state(id).unwrap().health, MAX_HEALTH);
+}
+
+#[test]
+fn death_moves_inventory_into_corpse_that_decays() {
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let scene = loot_scene(Vec3::new(100.0, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let shooter = sim.spawn_player(Vec3::new(-5.0, 0.0, 0.0));
+    let target = sim.spawn_player(Vec3::new(5.0, 0.0, 0.0));
+    assert_eq!(sim.debug_give(target, medkit, 2), 2);
+
+    // Четыре торс-попадания подряд убивают цель.
+    let mut command = fire_input(0);
+    command.pitch_delta = (1.15 - EYE_HEIGHT).atan2(10.0);
+    sim.queue_input(shooter, command);
+    sim.step_once();
+    for tick in 1..30u64 {
+        sim.queue_input(shooter, fire_input(tick));
+        sim.step_once();
+    }
+    assert_eq!(sim.player_state(target).unwrap().health, 0);
+
+    // Прекращаем огонь: иначе последний инпут (FLAG_FIRE) повторяется вечно и
+    // возродившаяся цель гибнет снова, плодя трупы.
+    sim.queue_input(shooter, input(sim.tick(), 0.0, 0.0, false));
+    sim.step_once();
+
+    // Труп: тело в снапшоте, лут — в контейнере.
+    let corpses = sim.snapshot_corpses();
+    assert_eq!(corpses.len(), 1);
+    assert_eq!(corpses[0].owner, target);
+    let container = corpses[0].container;
+    assert!(is_corpse_container(container));
+    assert_eq!(
+        sim.container_items(container),
+        Some(vec![Stack::new(medkit, 2)]),
+        "инвентарь жертвы переехал в труп"
+    );
+    assert!(
+        sim.player_state(target)
+            .unwrap()
+            .inventory
+            .iter()
+            .all(|slot| slot.is_none()),
+        "инвентарь жертвы пуст после смерти"
+    );
+
+    // Через 5 минут труп исчезает вместе с контейнером.
+    let death_tick = sim.tick();
+    while sim.tick() <= death_tick + CORPSE_LIFETIME_TICKS {
+        sim.step_once();
+    }
+    assert!(sim.snapshot_corpses().is_empty(), "труп должен исчезнуть");
+    assert!(sim.container_items(container).is_none());
+}
+
+#[test]
+fn dead_player_cannot_loot() {
+    let catalog = test_catalog();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+
+    let mut dead = sim.player_state(id).unwrap().net_state();
+    dead.health = 0;
+    assert!(sim.restore_player(id, &dead));
+
+    sim.queue_action(id, PlayerAction::Interact);
+    sim.step_once();
+    assert_eq!(sim.player_state(id).unwrap().open_container, None);
+}
+
+#[test]
+fn demo_zone_crates_fill_from_catalog() {
+    let catalog = test_catalog();
+    let scene = Scene::demo_zone();
+    let sim = Simulation::with_scene_and_catalog(&scene, catalog);
+
+    let index = scene
+        .objects
+        .iter()
+        .position(|object| object.loot.is_some())
+        .expect("в demo_zone есть ящики");
+    let container = crate_container_id(u32::try_from(index).unwrap());
+    let items = sim.container_items(container).expect("ящик существует");
+    assert!(!items.is_empty(), "ящик наполнен по каталогу");
 }

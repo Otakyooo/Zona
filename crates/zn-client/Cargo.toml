@@ -20,6 +20,7 @@ log = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 zn-assets = { path = "../zn-assets" }
+zn-content = { path = "../../game/zn-content" }
 zn-core = { path = "../zn-core" }
 zn-input = { path = "../zn-input" }
 zn-net = { path = "../zn-net" }

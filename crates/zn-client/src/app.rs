@@ -25,7 +25,9 @@ use zn_sim::{
 
 use crate::assets::{AssetEvent, AssetLoader};
 use crate::interp::{player_color, InterpolatedPlayer, INTERP_DELAY_TICKS};
-use crate::level::{build_draw_list, load_level, DEFAULT_CONTENT_ROOT, DEFAULT_LEVEL};
+use crate::level::{
+    build_draw_list, load_catalog, load_level, DEFAULT_CONTENT_ROOT, DEFAULT_LEVEL,
+};
 use crate::net::{NetClient, NetEvent, NetStatus};
 use crate::prediction::{reconcile, ErrorSmoother, InputHistory};
 
@@ -189,7 +191,9 @@ impl ClientApp {
         let (scene, _) = load_level(&content_root, level);
         log::info!("уровень '{}': {} объектов", scene.name, scene.len());
 
-        let mut simulation = Simulation::with_scene(&scene);
+        let catalog = load_catalog(&content_root);
+        let items_hash = catalog.content_hash();
+        let mut simulation = Simulation::with_scene_and_catalog(&scene, catalog);
         let player_id = simulation.spawn_player(scene.spawn);
         let camera = Camera::new(
             scene.spawn + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0),
@@ -198,7 +202,7 @@ impl ClientApp {
         );
 
         let net = server.and_then(|addr| {
-            match NetClient::connect(&addr, scene.content_hash(), CLIENT_NAME) {
+            match NetClient::connect(&addr, scene.content_hash(), items_hash, CLIENT_NAME) {
                 Ok(net) => {
                     log::info!("подключаемся к серверу {addr}");
                     Some(net)
@@ -666,6 +670,8 @@ impl ClientApp {
                         self.my_killer = Some(killer_text);
                     }
                 }
+                // Прогресс лечения рисует HUD (коммит C цепочки M4b).
+                GameEvent::UseStarted { .. } => {}
             }
         }
     }
@@ -1416,8 +1422,9 @@ mod tests {
 
         // UDP connect ничего не шлёт — состояние «подключение».
         let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        app.net =
-            Some(NetClient::connect(&server.local_addr().unwrap().to_string(), 0, "Тест").unwrap());
+        app.net = Some(
+            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap(),
+        );
         app.update_window_title();
         assert_eq!(app.window_title, "ZONA — подключение…");
     }

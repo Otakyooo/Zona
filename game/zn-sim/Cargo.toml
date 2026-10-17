@@ -10,6 +10,7 @@ description = "ZONA shared simulation: authoritative game state used by both cli
 [dependencies]
 glam = { workspace = true }
 log = { workspace = true }
+zn-content = { path = "../zn-content" }
 zn-core = { path = "../../crates/zn-core" }
 zn-net = { path = "../../crates/zn-net" }
 zn-physics = { path = "../../crates/zn-physics" }

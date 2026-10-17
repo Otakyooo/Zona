@@ -3,12 +3,14 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
+use zn_content::ItemCatalog;
 use zn_net::{
-    check_client_hello, decode_message, encode_message, ClientInput, GameEvent, Message,
-    RejectReason, INPUT_REDUNDANCY, MAX_NAME_LEN, SERVER_TIMEOUT, SIMULATION_HZ, SNAPSHOT_HZ,
+    check_client_hello, decode_message, encode_message, ClientInput, CorpseNet, GameEvent,
+    InventoryAction, Message, RejectReason, INPUT_REDUNDANCY, MAX_NAME_LEN, SERVER_TIMEOUT,
+    SIMULATION_HZ, SNAPSHOT_HZ,
 };
 use zn_scene::Scene;
-use zn_sim::Simulation;
+use zn_sim::{NetUpdates, PlayerAction, Simulation};
 
 /// Порт по умолчанию для выделенного сервера.
 pub const DEFAULT_PORT: u16 = 7700;
@@ -65,6 +67,10 @@ struct ClientState {
     name: String,
     addr: SocketAddr,
     last_seen: Duration,
+    /// Последний обработанный `Interact` (дедупликация повторов клиента).
+    last_interact_tick: u64,
+    /// Последний обработанный `InventoryAction`.
+    last_action_tick: u64,
 }
 
 /// Один процесс сервера = один матч. Сессия владеет сокетом и симуляцией,
@@ -74,6 +80,9 @@ pub struct Session {
     socket: UdpSocket,
     simulation: Simulation,
     content_hash: u64,
+    items_hash: u64,
+    /// История имён по id: килл-фид и подписи трупов переживают отключение.
+    names: HashMap<u64, String>,
     config: SessionConfig,
     clients: HashMap<SocketAddr, ClientState>,
     now: Duration,
@@ -85,27 +94,42 @@ pub struct Session {
 
 impl Session {
     /// Биндит UDP-сокет по адресу (`127.0.0.1:0` в тестах) и создаёт сессию.
-    pub fn bind(bind_addr: &str, scene: &Scene, config: SessionConfig) -> io::Result<Self> {
+    pub fn bind(
+        bind_addr: &str,
+        scene: &Scene,
+        catalog: ItemCatalog,
+        config: SessionConfig,
+    ) -> io::Result<Self> {
         let socket = UdpSocket::bind(bind_addr)?;
-        Self::new(socket, scene, config)
+        Self::new(socket, scene, catalog, config)
     }
 
-    /// Сессия на готовом сокете (переводится в non-blocking).
-    pub fn new(socket: UdpSocket, scene: &Scene, config: SessionConfig) -> io::Result<Self> {
+    /// Сессия на готовом сокете (переводится в non-blocking). Каталог предметов
+    /// наполняет ящики сцены; его хэш сверяется в handshake.
+    pub fn new(
+        socket: UdpSocket,
+        scene: &Scene,
+        catalog: ItemCatalog,
+        config: SessionConfig,
+    ) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
-        let simulation = Simulation::with_scene(scene);
+        let items_hash = catalog.content_hash();
+        let simulation = Simulation::with_scene_and_catalog(scene, catalog);
         let spawn = simulation.spawn_point();
         log::info!(
-            "сессия: уровень '{}', {} статических коллайдеров, спавн {spawn:?}, hash={:#018x}",
+            "сессия: уровень '{}', {} статических коллайдеров, спавн {spawn:?}, hash={:#018x}, items={:#018x}",
             scene.name,
             simulation.static_collider_count(),
-            scene.content_hash()
+            scene.content_hash(),
+            items_hash
         );
         let rng = config.rng_seed | 1;
         Ok(Self {
             socket,
             simulation,
             content_hash: scene.content_hash(),
+            items_hash,
+            names: HashMap::new(),
             config,
             clients: HashMap::new(),
             now: Duration::ZERO,
@@ -122,6 +146,11 @@ impl Session {
 
     pub fn content_hash(&self) -> u64 {
         self.content_hash
+    }
+
+    /// Хэш каталога предметов (клиенты сверяют его в Hello).
+    pub fn items_hash(&self) -> u64 {
+        self.items_hash
     }
 
     pub fn max_players(&self) -> usize {
@@ -191,6 +220,22 @@ impl Session {
         id
     }
 
+    /// Отладка: выдать предмет игроку по ключу каталога (консоль `loot`).
+    pub fn debug_give(
+        &mut self,
+        player_id: u64,
+        item_key: &str,
+        count: u32,
+    ) -> Result<u32, String> {
+        let Some(item) = self.simulation.catalog_index_of(item_key) else {
+            return Err(format!("предмет '{item_key}' не найден в каталоге"));
+        };
+        if self.simulation.player_state(player_id).is_none() {
+            return Err(format!("игрок {player_id} не найден"));
+        }
+        Ok(self.simulation.debug_give(player_id, item, count))
+    }
+
     /// Один шаг цикла: приём → фиксированные шаги симуляции → снапшоты
     /// (30 Гц) → таймауты → отправка отложенных пакетов.
     pub fn poll(&mut self, dt: Duration) {
@@ -232,9 +277,14 @@ impl Session {
             Message::ClientHello {
                 protocol_version,
                 content_hash,
+                items_hash,
                 name,
-            } => self.handle_hello(addr, protocol_version, content_hash, name),
+            } => self.handle_hello(addr, protocol_version, content_hash, items_hash, name),
             Message::InputPacket { inputs } => self.handle_inputs(addr, inputs),
+            Message::Interact { tick } => self.handle_interact(addr, tick),
+            Message::InventoryAction { tick, action } => {
+                self.handle_inventory_action(addr, tick, action);
+            }
             Message::Ping { nonce } => {
                 if let Some(client) = self.clients.get_mut(&addr) {
                     client.last_seen = self.now;
@@ -254,6 +304,7 @@ impl Session {
         addr: SocketAddr,
         protocol_version: u32,
         content_hash: u64,
+        items_hash: u64,
         name: String,
     ) {
         // Повтор Hello (Welcome мог потеряться) — повторяем Welcome.
@@ -275,7 +326,13 @@ impl Session {
             return;
         }
 
-        if let Err(reason) = check_client_hello(protocol_version, content_hash, self.content_hash) {
+        if let Err(reason) = check_client_hello(
+            protocol_version,
+            content_hash,
+            items_hash,
+            self.content_hash,
+            self.items_hash,
+        ) {
             log::info!("отказ {addr}: {reason:?}");
             self.send(addr, Message::ServerReject { reason });
             return;
@@ -288,6 +345,7 @@ impl Session {
             "игрок '{name}' (id {player_id}) подключился с {addr} [{} игроков]",
             self.clients.len() + 1
         );
+        self.names.insert(player_id, name.clone());
         self.clients.insert(
             addr,
             ClientState {
@@ -295,6 +353,8 @@ impl Session {
                 name,
                 addr,
                 last_seen: self.now,
+                last_interact_tick: 0,
+                last_action_tick: 0,
             },
         );
         self.send_welcome(addr, player_id);
@@ -330,11 +390,47 @@ impl Session {
         }
     }
 
+    /// Обыск/подбор (E): повторные пакеты с тем же tick отбрасываются —
+    /// клиент шлёт действие с redundancy, но обработать его нужно один раз.
+    fn handle_interact(&mut self, addr: SocketAddr, tick: u64) {
+        let Some(client) = self.clients.get_mut(&addr) else {
+            return;
+        };
+        client.last_seen = self.now;
+        if tick <= client.last_interact_tick {
+            return;
+        }
+        client.last_interact_tick = tick;
+        let player_id = client.player_id;
+        self.simulation
+            .queue_action(player_id, PlayerAction::Interact);
+    }
+
+    /// Действие с инвентарём: та же дедупликация по tick, что у `Interact`.
+    fn handle_inventory_action(&mut self, addr: SocketAddr, tick: u64, action: InventoryAction) {
+        let Some(client) = self.clients.get_mut(&addr) else {
+            return;
+        };
+        client.last_seen = self.now;
+        if tick <= client.last_action_tick {
+            return;
+        }
+        client.last_action_tick = tick;
+        let player_id = client.player_id;
+        self.simulation
+            .queue_action(player_id, PlayerAction::Inventory(action));
+    }
+
     fn send_snapshots(&mut self) {
         let players = self.simulation.snapshot();
         let server_tick = self.simulation.tick();
+        let loot = self.simulation.snapshot_loot();
+        let mut corpses = self.simulation.snapshot_corpses();
+        self.fill_corpse_names(&mut corpses);
         let events = self.simulation.take_events();
         let events = self.enrich_events(events);
+        let updates = self.simulation.take_net_updates();
+
         let addrs: Vec<SocketAddr> = self.clients.keys().copied().collect();
         for addr in addrs {
             let Some(client) = self.clients.get(&addr) else {
@@ -351,28 +447,66 @@ impl Session {
                     server_tick,
                     acked_input_tick,
                     players: players.clone(),
+                    loot: loot.clone(),
+                    corpses: corpses.clone(),
                     events: events.clone(),
                 },
             );
         }
+
+        self.send_net_updates(updates);
+    }
+
+    /// Подставляет имена жертв в трупы (история имён переживает отключение).
+    fn fill_corpse_names(&self, corpses: &mut [CorpseNet]) {
+        for corpse in corpses {
+            if corpse.name.is_empty() {
+                if let Some(name) = self.names.get(&corpse.owner) {
+                    corpse.name = name.clone();
+                }
+            }
+        }
+    }
+
+    /// Персональные апдейты: состояние инвентаря владельцу, содержимое
+    /// открытого контейнера — открывшему его игроку.
+    fn send_net_updates(&mut self, updates: NetUpdates) {
+        for (player_id, slots) in updates.inventory {
+            if let Some(addr) = self.addr_of(player_id) {
+                self.send(addr, Message::InventoryUpdate { slots });
+            }
+        }
+        for (player_id, update) in updates.containers {
+            if let Some(addr) = self.addr_of(player_id) {
+                self.send(
+                    addr,
+                    Message::ContainerUpdate {
+                        container: update.container,
+                        items: update.items,
+                    },
+                );
+            }
+        }
+    }
+
+    fn addr_of(&self, player_id: u64) -> Option<SocketAddr> {
+        self.clients
+            .iter()
+            .find(|(_, client)| client.player_id == player_id)
+            .map(|(addr, _)| *addr)
     }
 
     /// Подставляет имена в события смертей: симуляция знает только id, а
     /// клиентам нужен килл-фид.
     fn enrich_events(&self, events: Vec<GameEvent>) -> Vec<GameEvent> {
-        let names: HashMap<u64, &str> = self
-            .clients
-            .values()
-            .map(|client| (client.player_id, client.name.as_str()))
-            .collect();
         events
             .into_iter()
             .map(|event| match event {
                 GameEvent::Death { victim, killer, .. } => GameEvent::Death {
                     victim,
-                    victim_name: names.get(&victim).unwrap_or(&"").to_string(),
+                    victim_name: self.names.get(&victim).cloned().unwrap_or_default(),
                     killer,
-                    killer_name: names.get(&killer).unwrap_or(&"").to_string(),
+                    killer_name: self.names.get(&killer).cloned().unwrap_or_default(),
                 },
                 other => other,
             })
@@ -498,6 +632,11 @@ fn clamp_name(name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Каталог предметов из контента репозитория (cwd теста — crate root).
+    fn test_catalog() -> ItemCatalog {
+        ItemCatalog::load_ron("../../game/content/items/items.ron").expect("каталог предметов")
+    }
+
     #[test]
     fn sanitize_clamps_and_defuses_input() {
         let mut input = ClientInput {
@@ -543,11 +682,12 @@ mod tests {
             rng_seed: 12345,
             ..SessionConfig::default()
         };
-        let mut session = Session::new(socket, &scene, config).unwrap();
+        let mut session = Session::new(socket, &scene, test_catalog(), config).unwrap();
         let rolls_a: Vec<bool> = (0..16).map(|_| session.should_drop_outgoing()).collect();
         let mut session = Session::new(
             UdpSocket::bind("127.0.0.1:0").unwrap(),
             &scene,
+            test_catalog(),
             SessionConfig {
                 out_loss_pct: 50.0,
                 rng_seed: 12345,

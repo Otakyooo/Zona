@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use zn_content::ItemCatalog;
 use zn_render::{DrawList, InstanceRaw, MaterialId, MeshId};
 use zn_scene::{Scene, SceneObject};
 
@@ -35,6 +36,29 @@ pub fn level_path(content_root: &Path, level: &str) -> PathBuf {
     content_root
         .join("levels")
         .join(format!("{level}.scene.ron"))
+}
+
+/// Ищет каталог предметов `<content>/items/items.ron`; при ошибке — пустой
+/// каталог с предупреждением (предметы отключены, сервер отвергнет handshake).
+pub fn load_catalog(content_root: &Path) -> ItemCatalog {
+    let path = content_root.join("items").join("items.ron");
+    match ItemCatalog::load_ron(&path) {
+        Ok(catalog) => {
+            log::info!(
+                "каталог предметов загружен из {} ({} позиций)",
+                path.display(),
+                catalog.len()
+            );
+            catalog
+        }
+        Err(error) => {
+            log::warn!(
+                "каталог предметов не прочитан ({}): {error} — предметы отключены",
+                path.display()
+            );
+            ItemCatalog::default()
+        }
+    }
 }
 
 /// Разрешает объект сцены в пары (меш, материал) для draw list: объект

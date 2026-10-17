@@ -5112,6 +5112,7 @@ dependencies = [
  "wgpu",
  "winit",
  "zn-assets",
+ "zn-content",
  "zn-core",
  "zn-input",
  "zn-net",
@@ -5200,6 +5201,7 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
+ "zn-content",
  "zn-net",
  "zn-scene",
  "zn-sim",
@@ -5211,6 +5213,7 @@ version = "0.1.0"
 dependencies = [
  "glam 0.34.1",
  "log",
+ "zn-content",
  "zn-core",
  "zn-net",
  "zn-physics",

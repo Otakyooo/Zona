@@ -37,15 +37,42 @@ fn net_state_roundtrips_through_bincode() {
 }
 
 #[test]
+fn inventory_actions_roundtrip_through_bincode() {
+    let actions = [
+        InventoryAction::TakeFrom {
+            container: 3,
+            index: 1,
+        },
+        InventoryAction::TakeAll { container: 3 },
+        InventoryAction::Drop { slot: 39 },
+        InventoryAction::Use { slot: 12 },
+    ];
+    for action in actions {
+        let bytes = encode_message(&action).unwrap();
+        let decoded: InventoryAction = decode_message(&bytes).unwrap();
+        assert_eq!(decoded, action);
+    }
+}
+
+#[test]
 fn all_message_variants_roundtrip_through_bincode() {
     let messages = vec![
         Message::ClientHello {
             protocol_version: PROTOCOL_VERSION,
             content_hash: 0xDEAD_BEEF_CAFE_F00D,
+            items_hash: 0x0BAD_F00D_1234_5678,
             name: "Сталкер".to_string(),
         },
         Message::InputPacket {
             inputs: vec![ClientInput::new(1), ClientInput::new(2)],
+        },
+        Message::Interact { tick: 41 },
+        Message::InventoryAction {
+            tick: 42,
+            action: InventoryAction::TakeFrom {
+                container: 7,
+                index: 0,
+            },
         },
         Message::Ping { nonce: 9 },
         Message::ClientBye,
@@ -67,11 +94,27 @@ fn all_message_variants_roundtrip_through_bincode() {
             server_tick: 50,
             acked_input_tick: 44,
             players: vec![state(1), state(2)],
+            loot: vec![GroundItemNet {
+                item: 4,
+                count: 30,
+                pos: [10, -2, 140],
+            }],
+            corpses: vec![CorpseNet {
+                container: 1 << 62,
+                owner: 2,
+                name: "Жертва".to_string(),
+                pos: [-1, -2, 140],
+                yaw: 200,
+            }],
             events: vec![
                 GameEvent::Shot {
                     shooter: 1,
                     origin: [0.0, 1.62, 0.0],
                     dir: [1.0, 0.0, 0.0],
+                },
+                GameEvent::UseStarted {
+                    player: 2,
+                    ticks: 120,
                 },
                 GameEvent::Death {
                     victim: 2,
@@ -84,6 +127,17 @@ fn all_message_variants_roundtrip_through_bincode() {
         Message::Pong {
             nonce: 9,
             server_tick: 51,
+        },
+        Message::InventoryUpdate {
+            slots: vec![
+                Some(ItemStackNet { item: 4, count: 3 }),
+                None,
+                Some(ItemStackNet { item: 0, count: 60 }),
+            ],
+        },
+        Message::ContainerUpdate {
+            container: 2,
+            items: vec![ItemStackNet { item: 0, count: 60 }],
         },
     ];
 
@@ -113,16 +167,24 @@ fn truncated_and_garbage_messages_are_rejected() {
 #[test]
 fn hello_validation_rejects_version_and_content_mismatch() {
     let hash = 0x1234_5678_9ABC_DEF0;
-    assert_eq!(check_client_hello(PROTOCOL_VERSION, hash, hash), Ok(()));
+    let items = 0x0FED_CBA9_8765_4321;
+    assert_eq!(
+        check_client_hello(PROTOCOL_VERSION, hash, items, hash, items),
+        Ok(())
+    );
 
     assert_eq!(
-        check_client_hello(PROTOCOL_VERSION + 1, hash, hash),
+        check_client_hello(PROTOCOL_VERSION + 1, hash, items, hash, items),
         Err(RejectReason::VersionMismatch {
             server: PROTOCOL_VERSION
         })
     );
     assert_eq!(
-        check_client_hello(PROTOCOL_VERSION, hash + 1, hash),
+        check_client_hello(PROTOCOL_VERSION, hash + 1, items, hash, items),
+        Err(RejectReason::ContentMismatch)
+    );
+    assert_eq!(
+        check_client_hello(PROTOCOL_VERSION, hash, items + 1, hash, items),
         Err(RejectReason::ContentMismatch)
     );
 }
@@ -134,12 +196,33 @@ fn full_snapshot_fits_udp_mtu() {
         server_tick: 1000,
         acked_input_tick: 999,
         players,
-        // Худший реалистичный случай: снапшот с событиями, имена — кириллица.
+        // Худший реалистичный случай: лимит предметов на земле, трупы и
+        // события; имена — кириллица.
+        loot: (0..32)
+            .map(|i| GroundItemNet {
+                item: i as u16,
+                count: 60,
+                pos: [i as i16 * 10, -2, 140],
+            })
+            .collect(),
+        corpses: (1..=4)
+            .map(|i| CorpseNet {
+                container: (1 << 62) + i,
+                owner: i,
+                name: "Охотник".to_string(),
+                pos: [i as i16, -2, 140],
+                yaw: 200,
+            })
+            .collect(),
         events: vec![
             GameEvent::Shot {
                 shooter: 3,
                 origin: [0.0, 1.62, 14.0],
                 dir: [1.0, 0.0, 0.0],
+            },
+            GameEvent::UseStarted {
+                player: 5,
+                ticks: 120,
             },
             GameEvent::Death {
                 victim: 5,
@@ -159,8 +242,30 @@ fn full_snapshot_fits_udp_mtu() {
 }
 
 #[test]
+fn position_and_yaw_quantization_roundtrip() {
+    for value in [0.0, 1.5, -0.2, 14.0, 123.4, -100.0] {
+        let quantized = quantize_pos([value, 0.0, 0.0]);
+        let restored = dequantize_pos(quantized)[0];
+        assert!(
+            (restored - value).abs() <= POS_QUANTUM / 2.0 + 1e-3,
+            "{value} → {restored}"
+        );
+    }
+    assert_eq!(quantize_pos([14.0, -0.2, 0.0]), [140, -2, 0]);
+
+    assert_eq!(quantize_yaw(0.0), 0);
+    assert_eq!(quantize_yaw(std::f32::consts::PI), 128);
+    let restored = dequantize_yaw(quantize_yaw(-0.1));
+    let expected = (-0.1f32).rem_euclid(std::f32::consts::TAU);
+    assert!(
+        (restored - expected).abs() <= YAW_QUANTUM / 2.0 + 1e-3,
+        "{expected} → {restored}"
+    );
+}
+
+#[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(PROTOCOL_VERSION, 4);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);

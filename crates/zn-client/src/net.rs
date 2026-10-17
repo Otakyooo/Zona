@@ -44,6 +44,7 @@ pub struct NetClient {
     socket: UdpSocket,
     server: SocketAddr,
     content_hash: u64,
+    items_hash: u64,
     name: String,
     status: NetStatus,
     last_hello: Option<Instant>,
@@ -59,7 +60,12 @@ pub struct NetClient {
 
 impl NetClient {
     /// Подключается к серверу (UDP `connect` на первый разрешённый адрес).
-    pub fn connect(server: &str, content_hash: u64, name: &str) -> io::Result<Self> {
+    pub fn connect(
+        server: &str,
+        content_hash: u64,
+        items_hash: u64,
+        name: &str,
+    ) -> io::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_nonblocking(true)?;
         let addr = server
@@ -71,6 +77,7 @@ impl NetClient {
             socket,
             server: addr,
             content_hash,
+            items_hash,
             name: name.to_string(),
             status: NetStatus::Connecting,
             last_hello: None,
@@ -145,6 +152,7 @@ impl NetClient {
                     let hello = Message::ClientHello {
                         protocol_version: PROTOCOL_VERSION,
                         content_hash: self.content_hash,
+                        items_hash: self.items_hash,
                         name: self.name.clone(),
                     };
                     self.send(&hello);
@@ -246,6 +254,7 @@ impl NetClient {
                 acked_input_tick,
                 players,
                 events,
+                ..
             } => {
                 if self.status != NetStatus::Connected {
                     return None;
@@ -330,8 +339,13 @@ mod tests {
 
     /// Клиент в состоянии `Connected`: Hello → Welcome.
     fn connected_client(server: &UdpSocket) -> (NetClient, SocketAddr) {
-        let mut client =
-            NetClient::connect(&server.local_addr().unwrap().to_string(), 0xAB, "Тест").unwrap();
+        let mut client = NetClient::connect(
+            &server.local_addr().unwrap().to_string(),
+            0xAB,
+            0xCD,
+            "Тест",
+        )
+        .unwrap();
         client.poll(Instant::now());
         let (message, addr) = expect_message(server);
         assert!(matches!(message, Message::ClientHello { .. }));
@@ -359,8 +373,13 @@ mod tests {
     #[test]
     fn hello_resends_until_welcome() {
         let server = loopback_server();
-        let mut client =
-            NetClient::connect(&server.local_addr().unwrap().to_string(), 0x42, "Сталкер").unwrap();
+        let mut client = NetClient::connect(
+            &server.local_addr().unwrap().to_string(),
+            0x42,
+            0x77,
+            "Сталкер",
+        )
+        .unwrap();
         let t0 = Instant::now();
 
         client.poll(t0);
@@ -369,10 +388,12 @@ mod tests {
             Message::ClientHello {
                 protocol_version,
                 content_hash,
+                items_hash,
                 name,
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(content_hash, 0x42);
+                assert_eq!(items_hash, 0x77);
                 assert_eq!(name, "Сталкер");
             }
             other => panic!("ожидался ClientHello, получили {}", other.kind()),
@@ -496,6 +517,8 @@ mod tests {
                 server_tick: 30,
                 acked_input_tick: 12,
                 players: vec![],
+                loot: vec![],
+                corpses: vec![],
                 events: vec![],
             },
         );
@@ -516,7 +539,7 @@ mod tests {
     fn reject_stops_outgoing_traffic() {
         let server = loopback_server();
         let mut client =
-            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, "Тест").unwrap();
+            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap();
         let t0 = Instant::now();
         client.poll(t0);
         let (_, addr) = expect_message(&server);

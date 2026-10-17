@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 
 /// Версия протокола. v2 — сетевое движение (M3): handshake, input-пакеты с
 /// redundancy, персональные снапшоты, ping; v3 — бой (M4a): здоровье в
-/// состояниях, события выстрелов/смертей. Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// состояниях, события выстрелов/смертей; v4 — лут (M4b): хэш каталога
+/// предметов в Hello, обыск и действия инвентаря, предметы/трупы в снапшотах.
+/// Несовпадение версий отвергается.
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -69,6 +71,80 @@ pub const FLAG_SPRINTING: u32 = 1 << 1;
 /// используется.
 pub const FLAG_FIRE: u32 = 1 << 2;
 
+// ── Лут (M4b) ───────────────────────────────────────────────────────────
+
+/// Стопка предметов в сети: `item` — индекс в отсортированном по ключу
+/// каталоге `zn-content` (`ItemCatalog::index_of`), `count` ≤ `stack_max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemStackNet {
+    pub item: u16,
+    pub count: u16,
+}
+
+/// Действие с инвентарём (C→S). Клиент повторяет действие в нескольких
+/// пакетах; сервер обрабатывает только действия с возрастающим `tick`
+/// (дедупликация повторов).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum InventoryAction {
+    /// Взять стопку из открытого контейнера (сколько влезет по весу).
+    TakeFrom { container: u64, index: u16 },
+    /// Взять из открытого контейнера всё, что влезает.
+    TakeAll { container: u64 },
+    /// Выбросить ячейку инвентаря на землю.
+    Drop { slot: u8 },
+    /// Использовать предмет из ячейки (лечение).
+    Use { slot: u8 },
+}
+
+/// Предмет на земле в снапшоте; позиция квантована до `POS_QUANTUM`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroundItemNet {
+    pub item: u16,
+    pub count: u16,
+    pub pos: [i16; 3],
+}
+
+/// Труп игрока в снапшоте: тело для рендера и id контейнера для обыска.
+/// Имя жертвы заполняет серверная сессия из своей истории имён.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CorpseNet {
+    /// id контейнера трупа (для `Interact`/`InventoryAction`).
+    pub container: u64,
+    pub owner: u64,
+    /// Имя жертвы; пустое — сервер не нашёл имени в истории.
+    pub name: String,
+    pub pos: [i16; 3],
+    /// Поворот тела: квант `YAW_QUANTUM`.
+    pub yaw: u8,
+}
+
+/// Квант позиции предметов и трупов: 0.1 м в `i16` (диапазон ±3276 м).
+pub const POS_QUANTUM: f32 = 0.1;
+/// Квант поворота трупов: 2π/256 (полный диапазон одного байта).
+pub const YAW_QUANTUM: f32 = std::f32::consts::TAU / 256.0;
+
+/// Квантует позицию для сети (предметы и трупы).
+pub fn quantize_pos(position: [f32; 3]) -> [i16; 3] {
+    position.map(|value| {
+        (value / POS_QUANTUM)
+            .round()
+            .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+    })
+}
+
+pub fn dequantize_pos(quantized: [i16; 3]) -> [f32; 3] {
+    quantized.map(|value| f32::from(value) * POS_QUANTUM)
+}
+
+/// Квантует поворот (радианы, любое значение) в один байт.
+pub fn quantize_yaw(yaw: f32) -> u8 {
+    ((yaw.rem_euclid(std::f32::consts::TAU)) / YAW_QUANTUM).round() as u8
+}
+
+pub fn dequantize_yaw(quantized: u8) -> f32 {
+    f32::from(quantized) * YAW_QUANTUM
+}
+
 /// События матча, накопленные между снапшотами: визуальная обратная связь и
 /// килл-фид. Игровая логика уже применена в симуляции — события нужны только
 /// для представления.
@@ -87,6 +163,9 @@ pub enum GameEvent {
         killer: u64,
         killer_name: String,
     },
+    /// Начато использование предмета: клиенты рисуют прогресс на `ticks`
+    /// тиков (лечение завершит сервер, даже если клиент отстал).
+    UseStarted { player: u64, ticks: u16 },
 }
 
 /// Причина отказа в подключении (`ServerReject`).
@@ -94,7 +173,8 @@ pub enum GameEvent {
 pub enum RejectReason {
     /// Несовпадение версии протокола; `server` — версия сервера.
     VersionMismatch { server: u32 },
-    /// `Scene::content_hash()` клиента не совпал с серверным.
+    /// `Scene::content_hash()` или `ItemCatalog::content_hash()` клиента не
+    /// совпал с серверными.
     ContentMismatch,
     /// В сессии нет свободных слотов.
     SessionFull,
@@ -109,11 +189,23 @@ pub enum Message {
     ClientHello {
         protocol_version: u32,
         content_hash: u64,
+        /// Хэш каталога предметов (`ItemCatalog::content_hash`).
+        items_hash: u64,
         name: String,
     },
     /// Последние инпуты (не более `INPUT_REDUNDANCY`, по возрастанию tick).
     InputPacket {
         inputs: Vec<ClientInput>,
+    },
+    /// Обыск (E): открыть/закрыть контейнер или подобрать предмет. `tick` —
+    /// инпут-тик нажатия; повтор с тем же tick сервер отбрасывает.
+    Interact {
+        tick: u64,
+    },
+    /// Действие с инвентарём; `tick` — для дедупликации повторов.
+    InventoryAction {
+        tick: u64,
+        action: InventoryAction,
     },
     Ping {
         nonce: u32,
@@ -136,12 +228,26 @@ pub enum Message {
         /// Максимальный tick инпута, учтённого в этом снапшоте (reconciliation).
         acked_input_tick: u64,
         players: Vec<PlayerNetState>,
-        /// События с прошлого снапшота (выстрелы, смерти) — всем клиентам.
+        /// Предметы на земле (позиции квантованы, `POS_QUANTUM`).
+        loot: Vec<GroundItemNet>,
+        /// Трупы: место и поворот тела; лут — персональным `ContainerUpdate`.
+        corpses: Vec<CorpseNet>,
+        /// События с прошлого снапшота (выстрелы, смерти, лечение) — всем клиентам.
         events: Vec<GameEvent>,
     },
     Pong {
         nonce: u32,
         server_tick: u64,
+    },
+    /// Персональное состояние ячеек инвентаря владельцу (при каждом изменении).
+    InventoryUpdate {
+        slots: Vec<Option<ItemStackNet>>,
+    },
+    /// Персональное состояние контейнера открывшему его игроку;
+    /// `container = 0` — контейнер закрыт.
+    ContainerUpdate {
+        container: u64,
+        items: Vec<ItemStackNet>,
     },
 }
 
@@ -151,30 +257,36 @@ impl Message {
         match self {
             Self::ClientHello { .. } => "ClientHello",
             Self::InputPacket { .. } => "InputPacket",
+            Self::Interact { .. } => "Interact",
+            Self::InventoryAction { .. } => "InventoryAction",
             Self::Ping { .. } => "Ping",
             Self::ClientBye => "ClientBye",
             Self::ServerWelcome { .. } => "ServerWelcome",
             Self::ServerReject { .. } => "ServerReject",
             Self::Snapshot { .. } => "Snapshot",
             Self::Pong { .. } => "Pong",
+            Self::InventoryUpdate { .. } => "InventoryUpdate",
+            Self::ContainerUpdate { .. } => "ContainerUpdate",
         }
     }
 }
 
 /// Проверка `ClientHello` на стороне сервера. `Ok(())` — можно принимать:
-/// версия совпадает и хэш загруженного уровня тот же (иначе коллайдеры
-/// клиента и сервера разойдутся).
+/// версия совпадает и хэши загруженных уровня и каталога предметов те же
+/// (иначе коллайдеры и предметы клиента и сервера разойдутся).
 pub fn check_client_hello(
     protocol_version: u32,
     content_hash: u64,
+    items_hash: u64,
     expected_content_hash: u64,
+    expected_items_hash: u64,
 ) -> Result<(), RejectReason> {
     if protocol_version != PROTOCOL_VERSION {
         return Err(RejectReason::VersionMismatch {
             server: PROTOCOL_VERSION,
         });
     }
-    if content_hash != expected_content_hash {
+    if content_hash != expected_content_hash || items_hash != expected_items_hash {
         return Err(RejectReason::ContentMismatch);
     }
     Ok(())
