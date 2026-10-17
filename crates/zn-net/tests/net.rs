@@ -55,6 +55,19 @@ fn inventory_actions_roundtrip_through_bincode() {
 }
 
 #[test]
+fn stash_actions_roundtrip_through_bincode() {
+    let actions = [
+        StashAction::Take { index: 0 },
+        StashAction::Put { slot: 39 },
+    ];
+    for action in actions {
+        let bytes = encode_message(&action).unwrap();
+        let decoded: StashAction = decode_message(&bytes).unwrap();
+        assert_eq!(decoded, action);
+    }
+}
+
+#[test]
 fn all_message_variants_roundtrip_through_bincode() {
     let messages = vec![
         Message::ClientHello {
@@ -75,12 +88,17 @@ fn all_message_variants_roundtrip_through_bincode() {
             },
         },
         Message::ThrowBolt { tick: 43 },
+        Message::StashAction {
+            tick: 44,
+            action: StashAction::Take { index: 2 },
+        },
         Message::Ping { nonce: 9 },
         Message::ClientBye,
         Message::ServerWelcome {
             player_id: 3,
             server_tick: 120,
             spawn: [0.0, 0.0, 14.0],
+            location: 0,
         },
         Message::ServerReject {
             reason: RejectReason::VersionMismatch { server: 99 },
@@ -148,6 +166,14 @@ fn all_message_variants_roundtrip_through_bincode() {
         Message::ContainerUpdate {
             container: 2,
             items: vec![ItemStackNet { item: 0, count: 60 }],
+        },
+        Message::LocationChanged {
+            location: 3,
+            position: [1.0, 0.0, -15.0],
+            yaw: 1.5,
+        },
+        Message::StashUpdate {
+            items: vec![ItemStackNet { item: 6, count: 5 }],
         },
     ];
 
@@ -288,7 +314,7 @@ fn position_and_yaw_quantization_roundtrip() {
 
 #[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);

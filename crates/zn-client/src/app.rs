@@ -1347,10 +1347,11 @@ impl ClientApp {
                     player_id,
                     server_tick,
                     spawn,
+                    location,
                 } => {
                     log::info!(
                         "сервер принял игрока: net id {player_id}, tick {server_tick}, \
-                         спавн {spawn:?}"
+                         локация {location}, спавн {spawn:?}"
                     );
                     self.net_player_id = Some(player_id);
                 }
@@ -1377,6 +1378,18 @@ impl ClientApp {
                 NetEvent::InventoryUpdate { slots } => self.inventory = slots,
                 NetEvent::ContainerUpdate { container, items } => {
                     self.apply_container_update(container, items);
+                }
+                NetEvent::LocationChanged {
+                    location,
+                    position,
+                    yaw,
+                } => {
+                    // M4d-1D: перезагрузка сцены и перенос своего игрока.
+                    log::info!("смена локации на {location}: позиция {position:?}, yaw {yaw:.2}");
+                }
+                NetEvent::StashUpdate { items } => {
+                    // M4d-1D: панель склада базы.
+                    log::debug!("склад базы: {} стопок", items.len());
                 }
             }
         }

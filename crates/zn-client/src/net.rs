@@ -20,6 +20,8 @@ pub enum NetEvent {
         player_id: u64,
         server_tick: u64,
         spawn: [f32; 3],
+        /// Локация игрока (id из `LocationRegistry`, M4d).
+        location: u8,
     },
     Reject(RejectReason),
     Snapshot {
@@ -42,6 +44,16 @@ pub enum NetEvent {
     /// Состояние открытого контейнера; `container = 0` — панель закрыта.
     ContainerUpdate {
         container: u64,
+        items: Vec<ItemStackNet>,
+    },
+    /// Смена локации игрока (M4d): перезагрузка сцены и перенос себя.
+    LocationChanged {
+        location: u8,
+        position: [f32; 3],
+        yaw: f32,
+    },
+    /// Состояние склада базы владельцу (M4d).
+    StashUpdate {
         items: Vec<ItemStackNet>,
     },
 }
@@ -276,10 +288,12 @@ impl NetClient {
                 player_id,
                 server_tick,
                 spawn,
+                location,
             } => {
                 if self.status == NetStatus::Connecting {
                     log::info!(
-                        "сервер {} принял: player_id={player_id}, tick={server_tick}",
+                        "сервер {} принял: player_id={player_id}, tick={server_tick}, \
+                         локация={location}",
                         self.server
                     );
                     self.status = NetStatus::Connected;
@@ -290,6 +304,7 @@ impl NetClient {
                     player_id,
                     server_tick,
                     spawn,
+                    location,
                 })
             }
             Message::ServerReject { reason } => {
@@ -331,6 +346,26 @@ impl NetClient {
                     return None;
                 }
                 Some(NetEvent::ContainerUpdate { container, items })
+            }
+            Message::LocationChanged {
+                location,
+                position,
+                yaw,
+            } => {
+                if self.status != NetStatus::Connected {
+                    return None;
+                }
+                Some(NetEvent::LocationChanged {
+                    location,
+                    position,
+                    yaw,
+                })
+            }
+            Message::StashUpdate { items } => {
+                if self.status != NetStatus::Connected {
+                    return None;
+                }
+                Some(NetEvent::StashUpdate { items })
             }
             Message::Pong { nonce, .. } => {
                 if let Some((pending_nonce, sent_at)) = self.pending_ping {
@@ -421,6 +456,7 @@ mod tests {
                 player_id: 1,
                 server_tick: 10,
                 spawn: [0.0, 0.0, 14.0],
+                location: 0,
             },
         );
         let events = client.poll(Instant::now());
@@ -483,6 +519,7 @@ mod tests {
                 player_id: 5,
                 server_tick: 7,
                 spawn: [1.0, 2.0, 3.0],
+                location: 1,
             },
         );
         let events = client.poll(t0 + HELLO_RESEND_INTERVAL + Duration::from_millis(2));
@@ -492,6 +529,7 @@ mod tests {
                 player_id: 5,
                 server_tick: 7,
                 spawn: [1.0, 2.0, 3.0],
+                location: 1,
             }]
         );
         assert_eq!(client.status(), NetStatus::Connected);
@@ -500,6 +538,46 @@ mod tests {
         assert!(
             drain(&server).is_none(),
             "после Welcome Hello не повторяется"
+        );
+    }
+
+    #[test]
+    fn location_changed_and_stash_update_reach_app() {
+        let server = loopback_server();
+        let (mut client, addr) = connected_client(&server);
+
+        send_to(
+            &server,
+            addr,
+            &Message::LocationChanged {
+                location: 3,
+                position: [1.0, 0.0, -15.0],
+                yaw: 0.5,
+            },
+        );
+        let events = client.poll(Instant::now());
+        assert_eq!(
+            events,
+            vec![NetEvent::LocationChanged {
+                location: 3,
+                position: [1.0, 0.0, -15.0],
+                yaw: 0.5,
+            }]
+        );
+
+        send_to(
+            &server,
+            addr,
+            &Message::StashUpdate {
+                items: vec![ItemStackNet { item: 2, count: 7 }],
+            },
+        );
+        let events = client.poll(Instant::now());
+        assert_eq!(
+            events,
+            vec![NetEvent::StashUpdate {
+                items: vec![ItemStackNet { item: 2, count: 7 }],
+            }]
         );
     }
 

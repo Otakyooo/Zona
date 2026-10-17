@@ -364,12 +364,16 @@ impl Session {
     fn send_welcome(&mut self, addr: SocketAddr, player_id: u64) {
         let server_tick = self.simulation.tick();
         let spawn = self.simulation.spawn_point().to_array();
+        // M4d-1B: сессия — одна сцена; M4d-1C подключит мир локаций и
+        // настоящий id базы. Пока всегда локация 0.
+        let location = zn_scene::LOCATION_BASE;
         self.send(
             addr,
             Message::ServerWelcome {
                 player_id,
                 server_tick,
                 spawn,
+                location,
             },
         );
     }

@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 /// состояниях, события выстрелов/смертей; v4 — лут (M4b): хэш каталога
 /// предметов в Hello, обыск и действия инвентаря, предметы/трупы в снапшотах;
 /// v5 — аномалии (M4c): броски болтов, снаряды в снапшотах, событие
-/// обнаружения аномалии. Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// обнаружения аномалии; v6 — локации и база (M4d): локация в Welcome, смена
+/// локации (переходы/пузыри), склад базы. Несовпадение версий отвергается.
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -95,6 +96,16 @@ pub enum InventoryAction {
     Drop { slot: u8 },
     /// Использовать предмет из ячейки (лечение).
     Use { slot: u8 },
+}
+
+/// Действие со складом базы (M4d, C→S): повтор пачки с тем же tick
+/// отбрасывается сервером — как у прочих действий.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StashAction {
+    /// Взять стопку из склада (позиция в списке) в инвентарь.
+    Take { index: u16 },
+    /// Положить ячейку инвентаря в склад.
+    Put { slot: u8 },
 }
 
 /// Предмет на земле в снапшоте; позиция квантована до `POS_QUANTUM`.
@@ -221,6 +232,11 @@ pub enum Message {
         tick: u64,
         action: InventoryAction,
     },
+    /// Действие со складом базы (M4d); `tick` — для дедупликации повторов.
+    StashAction {
+        tick: u64,
+        action: StashAction,
+    },
     /// Бросок болта (G); `tick` — для дедупликации повторов.
     ThrowBolt {
         tick: u64,
@@ -236,6 +252,8 @@ pub enum Message {
         server_tick: u64,
         /// Точка спавна уровня (ступни).
         spawn: [f32; 3],
+        /// Локация игрока (id из `LocationRegistry`).
+        location: u8,
     },
     ServerReject {
         reason: RejectReason,
@@ -269,6 +287,17 @@ pub enum Message {
         container: u64,
         items: Vec<ItemStackNet>,
     },
+    /// Смена локации игрока (переход пешком, пузырь, респавн): клиент
+    /// перезагружает сцену и переносит себя в `position` с поворотом `yaw`.
+    LocationChanged {
+        location: u8,
+        position: [f32; 3],
+        yaw: f32,
+    },
+    /// Персональное состояние склада базы владельцу (M4d).
+    StashUpdate {
+        items: Vec<ItemStackNet>,
+    },
 }
 
 impl Message {
@@ -279,6 +308,7 @@ impl Message {
             Self::InputPacket { .. } => "InputPacket",
             Self::Interact { .. } => "Interact",
             Self::InventoryAction { .. } => "InventoryAction",
+            Self::StashAction { .. } => "StashAction",
             Self::ThrowBolt { .. } => "ThrowBolt",
             Self::Ping { .. } => "Ping",
             Self::ClientBye => "ClientBye",
@@ -288,6 +318,8 @@ impl Message {
             Self::Pong { .. } => "Pong",
             Self::InventoryUpdate { .. } => "InventoryUpdate",
             Self::ContainerUpdate { .. } => "ContainerUpdate",
+            Self::LocationChanged { .. } => "LocationChanged",
+            Self::StashUpdate { .. } => "StashUpdate",
         }
     }
 }
