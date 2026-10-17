@@ -8,8 +8,9 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Instant;
 
 use zn_net::{
-    decode_message, encode_message, ClientInput, GameEvent, Message, PlayerNetState, RejectReason,
-    CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL, PROTOCOL_VERSION,
+    decode_message, encode_message, ClientInput, CorpseNet, GameEvent, GroundItemNet,
+    InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason, CLIENT_TIMEOUT,
+    HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL, PROTOCOL_VERSION,
 };
 
 /// События для приложения, извлечённые из входящих пакетов.
@@ -25,8 +26,21 @@ pub enum NetEvent {
         server_tick: u64,
         acked_input_tick: u64,
         players: Vec<PlayerNetState>,
+        /// Предметы на земле (M4b).
+        loot: Vec<GroundItemNet>,
+        /// Трупы игроков (M4b).
+        corpses: Vec<CorpseNet>,
         /// События боя с прошлого снапшота (трейсеры, килл-фид).
         events: Vec<GameEvent>,
+    },
+    /// Полное состояние ячеек инвентаря владельцу (M4b).
+    InventoryUpdate {
+        slots: Vec<Option<ItemStackNet>>,
+    },
+    /// Состояние открытого контейнера; `container = 0` — панель закрыта.
+    ContainerUpdate {
+        container: u64,
+        items: Vec<ItemStackNet>,
     },
 }
 
@@ -141,6 +155,28 @@ impl NetClient {
         self.last_sent_tick = Some(last.tick);
     }
 
+    /// Отправляет обыск (E) с `INPUT_REDUNDANCY`-кратным повтором: потеря
+    /// датаграммы не должна терять действие (сервер дедуплицирует по tick).
+    pub fn send_interact(&mut self, tick: u64) {
+        if self.status != NetStatus::Connected {
+            return;
+        }
+        for _ in 0..INPUT_REDUNDANCY {
+            self.send(&Message::Interact { tick });
+        }
+    }
+
+    /// Отправляет действие с инвентарём (взять/всё/выбросить/использовать)
+    /// с тем же повтором.
+    pub fn send_inventory_action(&mut self, tick: u64, action: InventoryAction) {
+        if self.status != NetStatus::Connected {
+            return;
+        }
+        for _ in 0..INPUT_REDUNDANCY {
+            self.send(&Message::InventoryAction { tick, action });
+        }
+    }
+
     fn poll_timers(&mut self, now: Instant) {
         match self.status {
             NetStatus::Connecting => {
@@ -253,8 +289,9 @@ impl NetClient {
                 server_tick,
                 acked_input_tick,
                 players,
+                loot,
+                corpses,
                 events,
-                ..
             } => {
                 if self.status != NetStatus::Connected {
                     return None;
@@ -264,8 +301,22 @@ impl NetClient {
                     server_tick,
                     acked_input_tick,
                     players,
+                    loot,
+                    corpses,
                     events,
                 })
+            }
+            Message::InventoryUpdate { slots } => {
+                if self.status != NetStatus::Connected {
+                    return None;
+                }
+                Some(NetEvent::InventoryUpdate { slots })
+            }
+            Message::ContainerUpdate { container, items } => {
+                if self.status != NetStatus::Connected {
+                    return None;
+                }
+                Some(NetEvent::ContainerUpdate { container, items })
             }
             Message::Pong { nonce, .. } => {
                 if let Some((pending_nonce, sent_at)) = self.pending_ping {
@@ -529,6 +580,8 @@ mod tests {
                 server_tick: 30,
                 acked_input_tick: 12,
                 players: vec![],
+                loot: vec![],
+                corpses: vec![],
                 events: vec![],
             }]
         );
@@ -577,5 +630,62 @@ mod tests {
         let events = client.poll(Instant::now());
         assert!(events.is_empty(), "{events:?}");
         assert_eq!(client.status(), NetStatus::Connected);
+    }
+
+    #[test]
+    fn interact_and_inventory_actions_repeat_and_pass_through() {
+        let server = loopback_server();
+        let (mut client, addr) = connected_client(&server);
+
+        // Interact уходит INPUT_REDUNDANCY раз — дедупликация на сервере.
+        client.send_interact(7);
+        for _ in 0..INPUT_REDUNDANCY {
+            match expect_message(&server).0 {
+                Message::Interact { tick } => assert_eq!(tick, 7),
+                other => panic!("ожидался Interact, получили {}", other.kind()),
+            }
+        }
+
+        client.send_inventory_action(8, InventoryAction::Drop { slot: 3 });
+        for _ in 0..INPUT_REDUNDANCY {
+            match expect_message(&server).0 {
+                Message::InventoryAction { tick, action } => {
+                    assert_eq!(tick, 8);
+                    assert_eq!(action, InventoryAction::Drop { slot: 3 });
+                }
+                other => panic!("ожидался InventoryAction, получили {}", other.kind()),
+            }
+        }
+
+        // Персональные апдейты доходят до приложения событиями.
+        send_to(
+            &server,
+            addr,
+            &Message::InventoryUpdate {
+                slots: vec![Some(ItemStackNet { item: 4, count: 2 })],
+            },
+        );
+        assert_eq!(
+            client.poll(Instant::now()),
+            vec![NetEvent::InventoryUpdate {
+                slots: vec![Some(ItemStackNet { item: 4, count: 2 })],
+            }]
+        );
+
+        send_to(
+            &server,
+            addr,
+            &Message::ContainerUpdate {
+                container: 42,
+                items: vec![ItemStackNet { item: 0, count: 60 }],
+            },
+        );
+        assert_eq!(
+            client.poll(Instant::now()),
+            vec![NetEvent::ContainerUpdate {
+                container: 42,
+                items: vec![ItemStackNet { item: 0, count: 60 }],
+            }]
+        );
     }
 }

@@ -10,17 +10,22 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowId};
 
+use zn_content::ItemCatalog;
 use zn_core::{FixedStep, SIMULATION_HZ};
 use zn_input::InputState;
-use zn_net::{GameEvent, PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY};
+use zn_net::{
+    dequantize_pos, dequantize_yaw, CorpseNet, GameEvent, GroundItemNet, InventoryAction,
+    ItemStackNet, PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY,
+};
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
     cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer,
 };
 use zn_scene::{Scene, SceneObject};
 use zn_sim::{
-    ClientInput, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING, MAX_HEALTH,
-    RESPAWN_DELAY_TICKS, RIFLE_RANGE,
+    ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING,
+    INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS, INVENTORY_SLOTS,
+    MAX_HEALTH, RESPAWN_DELAY_TICKS, RIFLE_RANGE,
 };
 
 use crate::assets::{AssetEvent, AssetLoader};
@@ -64,6 +69,13 @@ const PLAYER_CAPSULE_SCALE: Vec3 = Vec3::new(
 /// Подъём центра капсулы от ступней (полкапсулы).
 const PLAYER_CAPSULE_LIFT: Vec3 = Vec3::new(0.0, PLAYER_HALF_HEIGHT + PLAYER_RADIUS, 0.0);
 
+/// Предмет на земле — куб у ступней (сервер кладёт лут на уровень ступней).
+const GROUND_ITEM_SIZE: f32 = 0.22;
+/// Труп — лежачий бокс жертвы: длина × высота × ширина.
+const CORPSE_SIZE: Vec3 = Vec3::new(1.9, 0.35, 0.7);
+/// Цвет предмета, которого нет в каталоге (контент разошёлся с сервером).
+const DEFAULT_ITEM_COLOR: Vec4 = Vec4::new(0.75, 0.75, 0.75, 1.0);
+
 /// Интервал диагностического лога reconciliation, с.
 const RECONCILE_LOG_INTERVAL_SECS: f32 = 5.0;
 
@@ -98,6 +110,34 @@ struct MuzzleFlash {
 #[derive(Debug)]
 struct KillFeedEntry {
     text: String,
+    until: Instant,
+}
+
+/// Вид цели наведения — подсказка взаимодействия.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HintKind {
+    /// Ящик или труп — «[E] Обыскать».
+    Container,
+    /// Предмет на земле — «[E] Подобрать».
+    Item,
+}
+
+/// Открытый контейнер обыска: id и содержимое из персонального апдейта.
+struct OpenContainer {
+    container: u64,
+    items: Vec<ItemStackNet>,
+}
+
+/// Фокус панелей, когда открыты обе: ↑/↓ и Enter работают с ним.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelFocus {
+    Container,
+    Inventory,
+}
+
+/// Локальный прогресс лечения (UseStarted): полоска живёт до `until`
+/// (длительность полоски для HUD добавит коммит панелей).
+struct HealingView {
     until: Instant,
 }
 
@@ -167,6 +207,30 @@ pub struct ClientApp {
     fixed: FixedStep,
     last_frame: Option<Instant>,
     client_tick: u64,
+    /// Каталог предметов (цвета/эффекты) — тот же, что у сервера.
+    catalog: ItemCatalog,
+    /// Предметы на земле: снапшоты сервера (offline — локальная симуляция).
+    world_loot: Vec<GroundItemNet>,
+    /// Трупы: снапшоты сервера (offline — локальная симуляция).
+    world_corpses: Vec<CorpseNet>,
+    /// Инвентарь локального игрока из персональных апдейтов.
+    inventory: Vec<Option<ItemStackNet>>,
+    /// Открытый контейнер обыска; `None` — панель закрыта.
+    open_container: Option<OpenContainer>,
+    /// Панель инвентаря открыта (клавиша I).
+    inventory_open: bool,
+    /// Фокус панелей при открытых обеих (←/→).
+    panel_focus: PanelFocus,
+    /// Выбранная ячейка инвентаря (сетка 8×5).
+    inventory_select: usize,
+    /// Выбранная строка открытого контейнера.
+    container_select: usize,
+    /// Полоска лечения локального игрока (старт — событие UseStarted).
+    healing: Option<HealingView>,
+    /// Цель в прицеле для подсказки взаимодействия (косметика).
+    interact_hint: Option<HintKind>,
+    /// Монотонный счётчик действий — дедупликация повторов на сервере.
+    action_seq: u64,
 }
 
 impl ClientApp {
@@ -193,7 +257,7 @@ impl ClientApp {
 
         let catalog = load_catalog(&content_root);
         let items_hash = catalog.content_hash();
-        let mut simulation = Simulation::with_scene_and_catalog(&scene, catalog);
+        let mut simulation = Simulation::with_scene_and_catalog(&scene, catalog.clone());
         let player_id = simulation.spawn_player(scene.spawn);
         let camera = Camera::new(
             scene.spawn + Vec3::new(0.0, PLAYER_EYE_HEIGHT, 0.0),
@@ -266,6 +330,18 @@ impl ClientApp {
             fixed: FixedStep::from_hz(60),
             last_frame: None,
             client_tick: 0,
+            catalog,
+            world_loot: Vec::new(),
+            world_corpses: Vec::new(),
+            inventory: Vec::new(),
+            open_container: None,
+            inventory_open: false,
+            panel_focus: PanelFocus::Container,
+            inventory_select: 0,
+            container_select: 0,
+            healing: None,
+            interact_hint: None,
+            action_seq: 0,
         }
     }
 
@@ -489,6 +565,51 @@ impl ClientApp {
             );
         }
 
+        // Лут и трупы мира: снапшот сервера (offline — локальная симуляция).
+        for item in &self.world_loot {
+            let [x, y, z] = dequantize_pos(item.pos);
+            let color = self
+                .catalog
+                .get(item.item)
+                .map_or(DEFAULT_ITEM_COLOR, |definition| {
+                    Vec4::new(
+                        definition.color[0],
+                        definition.color[1],
+                        definition.color[2],
+                        1.0,
+                    )
+                });
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::splat(GROUND_ITEM_SIZE),
+                Quat::IDENTITY,
+                Vec3::new(x, y + GROUND_ITEM_SIZE * 0.5, z),
+            );
+            list.push(
+                cube,
+                material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: color.to_array(),
+                },
+            );
+        }
+        for corpse in &self.world_corpses {
+            let [x, y, z] = dequantize_pos(corpse.pos);
+            let model = Mat4::from_scale_rotation_translation(
+                CORPSE_SIZE,
+                Quat::from_rotation_y(dequantize_yaw(corpse.yaw)),
+                Vec3::new(x, y + CORPSE_SIZE.y * 0.5, z),
+            );
+            list.push(
+                cube,
+                material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: player_color(corpse.owner).into(),
+                },
+            );
+        }
+
         // Эффекты выстрелов: трейсеры (растянутый по направлению куб) и
         // вспышки у дула. Живут доли секунды — просроченные отбрасываются.
         let now = Instant::now();
@@ -586,11 +707,13 @@ impl ClientApp {
         }
 
         // Локальное предсказание не репликует события боя: урон и события —
-        // авторитет сервера; очередь очищаем, чтобы она не росла.
-        let _ = self.simulation.take_events();
+        // авторитет сервера; очередь очищаем, чтобы она не росла. Исключение —
+        // offline: старт лечения приходит из локальной симуляции.
+        let local_events = self.simulation.take_events();
 
         if steps > 0 {
             self.sync_camera_from_simulation();
+            self.handle_action_keys();
             self.input.end_frame();
             if let Some(net) = self.net.as_mut() {
                 // Последние INPUT_REDUNDANCY инпутов: потеря датаграммы не
@@ -598,6 +721,25 @@ impl ClientApp {
                 net.send_inputs(&self.history.last_n(INPUT_REDUNDANCY));
             }
         }
+
+        if self.net.is_none() {
+            // Offline: истина — локальная симуляция (лут, трупы, апдейты).
+            for event in &local_events {
+                if let GameEvent::UseStarted { player, ticks } = event {
+                    if *player == self.player_id {
+                        self.start_healing_view(*ticks, now);
+                    }
+                }
+            }
+            self.world_loot = self.simulation.snapshot_loot();
+            self.world_corpses = self.simulation.snapshot_corpses();
+            self.apply_net_updates();
+        } else {
+            // Online: локальные апдейты предсказания не нужны — истина в сети.
+            let _ = self.simulation.take_net_updates();
+        }
+
+        self.update_interact_hint();
     }
 
     /// Локальный отклик своего выстрела: трейсер до первой стены и вспышка.
@@ -670,10 +812,246 @@ impl ClientApp {
                         self.my_killer = Some(killer_text);
                     }
                 }
-                // Прогресс лечения рисует HUD (коммит C цепочки M4b).
-                GameEvent::UseStarted { .. } => {}
+                GameEvent::UseStarted { player, ticks } => {
+                    if Some(*player) == self.net_player_id {
+                        self.start_healing_view(*ticks, now);
+                    }
+                }
             }
         }
+    }
+
+    /// Действия вне инпутов: E (обыск/подбор/закрыть), I (инвентарь),
+    /// T (взять всё), Q (выбросить), Enter (взять/использовать), стрелки
+    /// (навигация). Панели passive — курсор остаётся в игре.
+    fn handle_action_keys(&mut self) {
+        if self.input.just_pressed(KeyCode::KeyE) {
+            self.send_action(PlayerAction::Interact);
+        }
+        if self.input.just_pressed(KeyCode::KeyI) {
+            self.inventory_open = !self.inventory_open;
+        }
+        if self.input.just_pressed(KeyCode::KeyT) {
+            if let Some(container) = self.open_container.as_ref().map(|open| open.container) {
+                self.send_action(PlayerAction::Inventory(InventoryAction::TakeAll {
+                    container,
+                }));
+            }
+        }
+        if self.input.just_pressed(KeyCode::KeyQ) {
+            if let Some(slot) = self.selected_inventory_slot() {
+                self.send_action(PlayerAction::Inventory(InventoryAction::Drop { slot }));
+            }
+        }
+        if self.input.just_pressed(KeyCode::Enter) {
+            self.press_enter();
+        }
+        self.handle_panel_navigation();
+    }
+
+    /// Отправляет действие: серверу (с повтором `INPUT_REDUNDANCY` раз) либо в
+    /// очередь локальной симуляции (offline). `tick` растёт монотонно — сервер
+    /// дедуплицирует повторы.
+    fn send_action(&mut self, action: PlayerAction) {
+        self.action_seq += 1;
+        let tick = self.action_seq;
+        match self.net.as_mut() {
+            Some(net) => match action {
+                PlayerAction::Interact => net.send_interact(tick),
+                PlayerAction::Inventory(inventory) => net.send_inventory_action(tick, inventory),
+            },
+            None => self.simulation.queue_action(self.player_id, action),
+        }
+    }
+
+    /// Enter: взять выбранную строку контейнера (фокус на контейнере) или
+    /// использовать предмет инвентаря (фокус на инвентаре).
+    fn press_enter(&mut self) {
+        match self.effective_focus() {
+            Some(PanelFocus::Container) => {
+                let Some(open) = self.open_container.as_ref() else {
+                    return;
+                };
+                if self.container_select >= open.items.len() {
+                    return;
+                }
+                let container = open.container;
+                let index = self.container_select as u16;
+                self.send_action(PlayerAction::Inventory(InventoryAction::TakeFrom {
+                    container,
+                    index,
+                }));
+            }
+            Some(PanelFocus::Inventory) => {
+                let slot = self.inventory_select.min(INVENTORY_SLOTS - 1);
+                let usable = self
+                    .inventory
+                    .get(slot)
+                    .and_then(|stack| *stack)
+                    .is_some_and(|stack| {
+                        self.catalog
+                            .get(stack.item)
+                            .is_some_and(|item| item.use_effect.is_some())
+                    });
+                if usable {
+                    self.send_action(PlayerAction::Inventory(InventoryAction::Use {
+                        slot: slot as u8,
+                    }));
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Слот инвентаря под выделением с предметом (для Q).
+    fn selected_inventory_slot(&self) -> Option<u8> {
+        if !self.inventory_open {
+            return None;
+        }
+        let slot = self.inventory_select.min(INVENTORY_SLOTS - 1);
+        let occupied = self
+            .inventory
+            .get(slot)
+            .is_some_and(|stack| stack.is_some());
+        occupied.then_some(slot as u8)
+    }
+
+    /// Эффективный фокус панелей: обе открыты — выбранный ←/→; одна — она.
+    fn effective_focus(&self) -> Option<PanelFocus> {
+        match (self.open_container.is_some(), self.inventory_open) {
+            (true, true) => Some(self.panel_focus),
+            (true, false) => Some(PanelFocus::Container),
+            (false, true) => Some(PanelFocus::Inventory),
+            (false, false) => None,
+        }
+    }
+
+    /// Стрелки: ↑/↓ — выделение внутри панели фокуса; ←/→ при двух открытых
+    /// панелях — переключение фокуса, иначе ←/→ двигают по сетке инвентаря.
+    fn handle_panel_navigation(&mut self) {
+        let up = self.input.just_pressed(KeyCode::ArrowUp);
+        let down = self.input.just_pressed(KeyCode::ArrowDown);
+        let left = self.input.just_pressed(KeyCode::ArrowLeft);
+        let right = self.input.just_pressed(KeyCode::ArrowRight);
+        if !(up || down || left || right) {
+            return;
+        }
+
+        let both = self.open_container.is_some() && self.inventory_open;
+        if both {
+            if left {
+                self.panel_focus = PanelFocus::Container;
+                return;
+            }
+            if right {
+                self.panel_focus = PanelFocus::Inventory;
+                return;
+            }
+        }
+
+        match self.effective_focus() {
+            Some(PanelFocus::Container) => {
+                let rows = self
+                    .open_container
+                    .as_ref()
+                    .map_or(0, |open| open.items.len());
+                if up {
+                    self.container_select = self.container_select.saturating_sub(1);
+                }
+                if down && rows > 0 && self.container_select + 1 < rows {
+                    self.container_select += 1;
+                }
+            }
+            Some(PanelFocus::Inventory) => {
+                let mut col = self.inventory_select % INVENTORY_COLS;
+                let mut row = self.inventory_select / INVENTORY_COLS;
+                if up {
+                    row = row.saturating_sub(1);
+                } else if down {
+                    row = (row + 1).min(INVENTORY_ROWS - 1);
+                } else if left && !both {
+                    col = col.saturating_sub(1);
+                } else if right && !both {
+                    col = (col + 1).min(INVENTORY_COLS - 1);
+                }
+                self.inventory_select = row * INVENTORY_COLS + col;
+            }
+            None => {}
+        }
+    }
+
+    /// Панель обыска: `container = 0` — сервер закрыл контейнер.
+    fn apply_container_update(&mut self, container: u64, items: Vec<ItemStackNet>) {
+        if container == 0 {
+            self.open_container = None;
+            return;
+        }
+        let switched = self
+            .open_container
+            .as_ref()
+            .is_none_or(|open| open.container != container);
+        if switched {
+            self.container_select = 0;
+            self.panel_focus = PanelFocus::Container;
+        } else {
+            // После изъятия строк выделение может выйти за список.
+            self.container_select = self.container_select.min(items.len().saturating_sub(1));
+        }
+        self.open_container = Some(OpenContainer { container, items });
+    }
+
+    /// Персональные апдейты локальной симуляции (offline): инвентарь и
+    /// контейнер — как если бы пришли от сервера.
+    fn apply_net_updates(&mut self) {
+        let updates = self.simulation.take_net_updates();
+        for (id, slots) in updates.inventory {
+            if id == self.player_id {
+                self.inventory = slots;
+            }
+        }
+        for (id, update) in updates.containers {
+            if id == self.player_id {
+                self.apply_container_update(update.container, update.items);
+            }
+        }
+    }
+
+    /// Старт полоски лечения: длительность приходит в тиках.
+    fn start_healing_view(&mut self, ticks: u16, now: Instant) {
+        let total_secs = f32::from(ticks) / SIMULATION_HZ as f32;
+        self.healing = Some(HealingView {
+            until: now + Duration::from_secs_f32(total_secs),
+        });
+    }
+
+    /// Подсказка взаимодействия по камере: ящики сцены, трупы и предметы на
+    /// земле. Косметика — истина серверная.
+    fn update_interact_hint(&mut self) {
+        let mut containers: Vec<Vec3> = self
+            .scene
+            .objects
+            .iter()
+            .filter(|object| object.loot.is_some())
+            .map(|object| object.position)
+            .collect();
+        containers.extend(self.world_corpses.iter().map(|corpse| {
+            let [x, y, z] = dequantize_pos(corpse.pos);
+            Vec3::new(x, y, z)
+        }));
+        let items: Vec<Vec3> = self
+            .world_loot
+            .iter()
+            .map(|item| {
+                let [x, y, z] = dequantize_pos(item.pos);
+                Vec3::new(x, y, z)
+            })
+            .collect();
+        self.interact_hint = pick_interact_hint(
+            self.camera.position,
+            self.camera.forward(),
+            &containers,
+            &items,
+        );
     }
 
     /// Камера из состояния игрока: ступни + высота глаз + незагасшая
@@ -717,8 +1095,19 @@ impl ClientApp {
                     server_tick,
                     acked_input_tick,
                     players,
+                    loot,
+                    corpses,
                     events,
-                } => self.apply_snapshot(server_tick, acked_input_tick, &players, &events, now),
+                } => {
+                    // Мировые списки лута/трупов — прямое замещение снапшотом.
+                    self.world_loot = loot;
+                    self.world_corpses = corpses;
+                    self.apply_snapshot(server_tick, acked_input_tick, &players, &events, now);
+                }
+                NetEvent::InventoryUpdate { slots } => self.inventory = slots,
+                NetEvent::ContainerUpdate { container, items } => {
+                    self.apply_container_update(container, items);
+                }
             }
         }
 
@@ -753,6 +1142,11 @@ impl ClientApp {
         self.net = None;
         self.net_player_id = None;
         self.remote.clear();
+        // Сетевая истина лута теряется — offline продолжится с локальной.
+        self.world_loot.clear();
+        self.world_corpses.clear();
+        self.inventory.clear();
+        self.open_container = None;
     }
 
     /// Снапшот сервера: события боя, буферы удалённых игроков, время рендера
@@ -777,6 +1171,8 @@ impl ClientApp {
             Some(0) => {
                 self.my_respawn_tick
                     .get_or_insert(server_tick + RESPAWN_DELAY_TICKS);
+                // Смерть отменяет лечение (расход не начисляется).
+                self.healing = None;
             }
             Some(_) => self.my_respawn_tick = None,
             None => {}
@@ -850,6 +1246,9 @@ impl ClientApp {
             .map(|tick| tick.saturating_sub(self.last_server_tick) as f32 / SIMULATION_HZ as f32);
 
         let now = Instant::now();
+        if self.healing.as_ref().is_some_and(|heal| heal.until <= now) {
+            self.healing = None;
+        }
         self.kill_feed.retain(|entry| entry.until > now);
         let feed = self
             .kill_feed
@@ -1244,6 +1643,50 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
     }
 }
 
+/// Локальный выбор цели наведения для подсказки: те же правила, что в
+/// симуляции (XZ ≤ `INTERACT_RANGE_M`, косинус к прицелу ≥ `INTERACT_MIN_DOT`),
+/// выигрывает цель «прицельнее», при равенстве — ближайшая. Подсказка
+/// косметическая: истину (что откроет E) решает сервер.
+fn pick_interact_hint(
+    eye: Vec3,
+    aim: Vec3,
+    containers: &[Vec3],
+    items: &[Vec3],
+) -> Option<HintKind> {
+    let mut best: Option<(f32, f32, HintKind)> = None;
+    let mut consider = |position: Vec3, kind: HintKind| {
+        let delta = position - eye;
+        let distance = Vec3::new(delta.x, 0.0, delta.z).length();
+        if distance > INTERACT_RANGE_M {
+            return;
+        }
+        let dot = if delta.length_squared() < 1e-8 {
+            1.0
+        } else {
+            delta.normalize().dot(aim)
+        };
+        if dot < INTERACT_MIN_DOT {
+            return;
+        }
+        let better = match best {
+            None => true,
+            Some((best_dot, best_dist, _)) => {
+                dot > best_dot + 1e-6 || ((dot - best_dot).abs() <= 1e-6 && distance < best_dist)
+            }
+        };
+        if better {
+            best = Some((dot, distance, kind));
+        }
+    };
+    for position in containers {
+        consider(*position, HintKind::Container);
+    }
+    for position in items {
+        consider(*position, HintKind::Item);
+    }
+    best.map(|(_, _, kind)| kind)
+}
+
 /// Имя игрока для килл-фида: «Вы» для себя, иначе имя с сервера или `#id`.
 fn side_name(id: u64, name: &str, me: Option<u64>) -> String {
     if Some(id) == me {
@@ -1561,5 +2004,140 @@ mod tests {
         assert_eq!(hud.killer.as_deref(), Some("Охотник"));
         let respawn = hud.respawn_secs.expect("отсчёт респавна");
         assert!(respawn > 0.0 && respawn <= 3.0, "respawn = {respawn}");
+    }
+
+    #[test]
+    fn interact_hint_prefers_aimed_target_within_range() {
+        let eye = Vec3::new(0.0, 1.4, 0.0);
+        let aim = -Vec3::X;
+
+        // Ящик в конусе на ~1.6 м — цель найдена.
+        let crate_pos = Vec3::new(-1.3, 0.4, 1.0);
+        assert_eq!(
+            pick_interact_hint(eye, aim, &[crate_pos], &[]),
+            Some(HintKind::Container)
+        );
+
+        // XZ-дистанция больше 2 м — цели нет.
+        assert_eq!(
+            pick_interact_hint(eye, aim, &[Vec3::new(-2.5, 0.4, 0.0)], &[]),
+            None
+        );
+        // Цель за спиной — нет.
+        assert_eq!(
+            pick_interact_hint(eye, aim, &[Vec3::new(1.3, 0.4, 0.0)], &[]),
+            None
+        );
+
+        // Предмет «прицельнее» ящика — подсказка «подобрать».
+        assert_eq!(
+            pick_interact_hint(eye, aim, &[crate_pos], &[Vec3::new(-1.5, 0.0, 0.0)]),
+            Some(HintKind::Item)
+        );
+    }
+
+    #[test]
+    fn use_started_starts_local_healing_progress() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.net_player_id = Some(7);
+        let now = Instant::now();
+
+        app.handle_combat_events(
+            &[GameEvent::UseStarted {
+                player: 7,
+                ticks: 120,
+            }],
+            now,
+        );
+        let healing = app.healing.as_ref().expect("полоска лечения запущена");
+        let left = healing.until.saturating_duration_since(now).as_secs_f32();
+        assert!((left - 2.0).abs() < 1e-3, "left = {left}");
+
+        // Чужое лечение мою полоску не трогает.
+        app.healing = None;
+        app.handle_combat_events(
+            &[GameEvent::UseStarted {
+                player: 8,
+                ticks: 120,
+            }],
+            now,
+        );
+        assert!(app.healing.is_none());
+
+        // Просроченная полоска убирается при сборке HUD.
+        app.healing = Some(HealingView {
+            until: now - Duration::from_secs(1),
+        });
+        let _ = app.collect_hud_data();
+        assert!(app.healing.is_none(), "просроченная полоска убрана");
+    }
+
+    #[test]
+    fn panel_keys_toggle_inventory_and_move_selection() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+
+        // I открывает панель инвентаря.
+        app.input.press_key(KeyCode::KeyI);
+        app.simulate(std::time::Duration::from_millis(17));
+        assert!(app.inventory_open);
+        app.input.release_key(KeyCode::KeyI);
+
+        // ↓ и → двигают выделение по сетке 8×5.
+        app.input.press_key(KeyCode::ArrowDown);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::ArrowDown);
+        app.input.press_key(KeyCode::ArrowRight);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::ArrowRight);
+        assert_eq!(app.inventory_select, INVENTORY_COLS + 1);
+
+        // ↑ возвращает в строку 0, ← — в колонку 0.
+        app.input.press_key(KeyCode::ArrowUp);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::ArrowUp);
+        assert_eq!(app.inventory_select, 1);
+        app.input.press_key(KeyCode::ArrowLeft);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::ArrowLeft);
+        assert_eq!(app.inventory_select, 0);
+
+        // Повторный I закрывает панель.
+        app.input.press_key(KeyCode::KeyI);
+        app.simulate(std::time::Duration::from_millis(17));
+        assert!(!app.inventory_open);
+    }
+
+    #[test]
+    fn offline_interact_opens_crate_and_take_all_fills_inventory() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        let ammo = app.catalog.index_of("ammo_545").expect("каталог загружен");
+
+        // E из спавна: взгляд спавна смотрит на ящик перед игроком.
+        app.input.press_key(KeyCode::KeyE);
+        for _ in 0..8 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+        let open = app.open_container.as_ref().expect("ящик открыт");
+        assert!(!open.items.is_empty(), "в ящике есть лут");
+        assert_eq!(app.interact_hint, Some(HintKind::Container));
+
+        // T — взять всё: патроны переезжают в инвентарь, ящик пустеет.
+        app.input.press_key(KeyCode::KeyT);
+        for _ in 0..8 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+        let open = app
+            .open_container
+            .as_ref()
+            .expect("контейнер остаётся открытым");
+        assert!(open.items.is_empty(), "ящик опустел: {:?}", open.items);
+        let stacks: Vec<_> = app.inventory.iter().flatten().collect();
+        assert!(
+            stacks
+                .iter()
+                .any(|stack| stack.item == ammo && stack.count == 60),
+            "патроны в инвентаре: {stacks:?}"
+        );
     }
 }
