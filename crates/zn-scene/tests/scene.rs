@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use glam::Vec3;
-    use zn_scene::{ColliderShape, Scene, SceneObject, BUILTIN_CUBE};
+    use zn_scene::{ColliderShape, LootEntry, Scene, SceneObject, BUILTIN_CUBE};
 
     #[test]
     fn ron_roundtrip_preserves_scene() {
@@ -66,6 +66,8 @@ mod tests {
         assert!(object.solid);
         assert_eq!(object.asset_key(), BUILTIN_CUBE);
         assert_eq!(object.effective_collider(), Some(ColliderShape::Box));
+        assert_eq!(object.loot, None);
+        assert!(!object.is_container());
     }
 
     #[test]
@@ -139,6 +141,63 @@ mod tests {
         let text = scene.to_ron().unwrap();
         let loaded = Scene::from_ron(&text).unwrap();
         assert_eq!(loaded.content_hash(), scene.content_hash());
+    }
+
+    #[test]
+    fn container_loot_roundtrips_through_ron() {
+        let mut scene = Scene::new("loot");
+        scene.add(
+            SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE).with_loot(vec![
+                LootEntry {
+                    item: "medkit".into(),
+                    count: 1,
+                },
+                LootEntry {
+                    item: "ammo_545".into(),
+                    count: 60,
+                },
+            ]),
+        );
+
+        let text = scene.to_ron().unwrap();
+        let loaded = Scene::from_ron(&text).unwrap();
+        assert_eq!(loaded, scene);
+        let object = &loaded.objects[0];
+        assert!(object.is_container());
+        let loot = object.loot.as_ref().unwrap();
+        assert_eq!(loot.len(), 2);
+        assert_eq!(loot[1].item, "ammo_545");
+        assert_eq!(loot[1].count, 60);
+    }
+
+    #[test]
+    fn demo_zone_has_eight_crates_with_loot() {
+        let scene = Scene::demo_zone();
+        let containers: Vec<_> = scene
+            .objects
+            .iter()
+            .filter(|object| object.is_container())
+            .collect();
+        assert_eq!(containers.len(), 8);
+        for container in containers {
+            assert!(container.solid, "ящик должен быть solid (обыск лучом)");
+            assert!(!container.loot.as_ref().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn content_hash_distinguishes_loot() {
+        let mut plain = Scene::new("hash");
+        let base = SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE);
+        plain.add(base.clone());
+
+        let mut with_loot = Scene::new("hash");
+        with_loot.add(base.with_loot(vec![LootEntry {
+            item: "bolt".into(),
+            count: 1,
+        }]));
+
+        assert_ne!(with_loot.content_hash(), plain.content_hash());
     }
 
     #[test]

@@ -37,6 +37,13 @@ impl std::fmt::Display for ColliderShape {
     }
 }
 
+/// Запись лута контейнера: ключ предмета из каталога `zn-content` и количество.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LootEntry {
+    pub item: String,
+    pub count: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneObject {
     pub position: Vec3,
@@ -53,6 +60,9 @@ pub struct SceneObject {
     pub collider: Option<ColliderShape>,
     #[serde(default = "default_true")]
     pub solid: bool,
+    /// Фиксированный лут: наличие превращает объект в обыскиваемый контейнер.
+    #[serde(default)]
+    pub loot: Option<Vec<LootEntry>>,
 }
 
 fn default_color() -> Vec4 {
@@ -61,6 +71,24 @@ fn default_color() -> Vec4 {
 
 fn default_true() -> bool {
     true
+}
+
+/// Ящик лут-контейнера: куб 0.8 м у пола с фиксированным содержимым.
+fn crate_object(x: f32, z: f32, loot: &[(&str, u32)]) -> SceneObject {
+    let entries = loot
+        .iter()
+        .map(|(item, count)| LootEntry {
+            item: (*item).to_string(),
+            count: *count,
+        })
+        .collect();
+    SceneObject::new(
+        Vec3::new(x, 0.4, z),
+        Vec3::splat(0.8),
+        Vec4::new(0.45, 0.33, 0.18, 1.0),
+    )
+    .with_asset(BUILTIN_CUBE)
+    .with_loot(entries)
 }
 
 impl SceneObject {
@@ -74,6 +102,7 @@ impl SceneObject {
             material: None,
             collider: None,
             solid: true,
+            loot: None,
         }
     }
 
@@ -115,6 +144,16 @@ impl SceneObject {
     pub fn with_solid(mut self, solid: bool) -> Self {
         self.solid = solid;
         self
+    }
+
+    pub fn with_loot(mut self, loot: Vec<LootEntry>) -> Self {
+        self.loot = Some(loot);
+        self
+    }
+
+    /// Обыскиваемый контейнер: у объекта задан фиксированный лут.
+    pub fn is_container(&self) -> bool {
+        self.loot.is_some()
     }
 
     pub fn invulnerable(mut self) -> Self {
@@ -310,6 +349,27 @@ impl Scene {
                     .with_asset(BUILTIN_CUBE)
                     .invulnerable(),
             );
+        }
+
+        // Ящики M4b — обыскиваемые контейнеры с фиксированным лутом:
+        // два у спавна, шесть по маршруту. Итог: аптечек 5, бинтов 5,
+        // патронов 180, болтов 30, консервов 3, водки 4.
+        let crates = [
+            crate_object(2.5, 12.0, &[("medkit", 1), ("bandage", 2)]),
+            crate_object(-3.0, 12.5, &[("ammo_545", 60), ("bolt", 10)]),
+            crate_object(8.0, 16.0, &[("canned_food", 2), ("vodka", 1)]),
+            crate_object(-9.0, 6.0, &[("medkit", 2), ("bandage", 2)]),
+            crate_object(12.0, 2.0, &[("bolt", 20), ("ammo_545", 30)]),
+            crate_object(-13.0, -11.0, &[("vodka", 2), ("canned_food", 1)]),
+            crate_object(
+                9.5,
+                -16.0,
+                &[("medkit", 1), ("bandage", 1), ("ammo_545", 60)],
+            ),
+            crate_object(0.0, -10.0, &[("medkit", 1), ("vodka", 1), ("ammo_545", 30)]),
+        ];
+        for object in crates {
+            scene.add(object);
         }
 
         scene
