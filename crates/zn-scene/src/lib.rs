@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 
 use glam::{Vec3, Vec4};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,248 @@ impl SceneAnomaly {
     }
 }
 
+// ── Локации и переходы (M4d) ────────────────────────────────────────────
+
+/// Идентификатор локации мира (`LocationRegistry`).
+pub type LocationId = u8;
+
+/// Локация встроенного мира: База.
+pub const LOCATION_BASE: LocationId = 0;
+/// Локация встроенного мира: Кордон.
+pub const LOCATION_KORDON: LocationId = 1;
+/// Локация встроенного мира: Свалка.
+pub const LOCATION_SVALKA: LocationId = 2;
+/// Локация встроенного мира: Подземка.
+pub const LOCATION_PODZEMKA: LocationId = 3;
+
+/// Точка пузыря (M4d): сфера-телепорт. `position` — якорь на полу (центр —
+/// `position + (0, radius, 0)`), вход игрока уносит его в ближайшую к базе
+/// локацию. Кандидаты появления задаются в сцене; какие активны и когда
+/// перерождаются — решает сервер.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneBubble {
+    pub position: Vec3,
+    pub radius: f32,
+}
+
+impl SceneBubble {
+    pub fn new(position: Vec3, radius: f32) -> Self {
+        Self { position, radius }
+    }
+
+    /// Центр сферы в мире (как у аномалий: сфера касается пола).
+    pub fn center(&self) -> Vec3 {
+        self.position + Vec3::Y * self.radius
+    }
+
+    /// Точка внутри сферы пузыря? Проверяется «сердце» игрока (ступни + 0.9).
+    pub fn contains(&self, point: Vec3) -> bool {
+        point.distance_squared(self.center()) <= self.radius * self.radius
+    }
+}
+
+/// Переход между локациями (M4d): круг радиуса `radius` на полу вокруг
+/// `position`. Вход игрока переключает его в локацию `target`, в точку
+/// `target_position` с поворотом `target_yaw` (пешком, без таймера).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneTransition {
+    pub position: Vec3,
+    pub radius: f32,
+    /// id целевой локации из `LocationRegistry`.
+    pub target: LocationId,
+    /// Точка появления в целевой локации (ступни).
+    pub target_position: Vec3,
+    #[serde(default)]
+    pub target_yaw: f32,
+    /// Подпись для рендера/UI (например, «База»).
+    #[serde(default)]
+    pub label: String,
+}
+
+impl SceneTransition {
+    pub fn new(position: Vec3, radius: f32, target: LocationId, target_position: Vec3) -> Self {
+        Self {
+            position,
+            radius,
+            target,
+            target_position,
+            target_yaw: 0.0,
+            label: String::new(),
+        }
+    }
+
+    pub fn with_yaw(mut self, yaw: f32) -> Self {
+        self.target_yaw = yaw;
+        self
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Точка в зоне перехода? Расстояние по горизонтали: зона — цилиндр.
+    pub fn contains(&self, point: Vec3) -> bool {
+        let delta = Vec3::new(point.x - self.position.x, 0.0, point.z - self.position.z);
+        delta.length_squared() <= self.radius * self.radius
+    }
+}
+
+/// Запись реестра локаций: название для UI и файл сцены без расширения
+/// (`levels/<scene>.scene.ron`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LocationInfo {
+    pub id: LocationId,
+    pub name: String,
+    pub scene: String,
+    /// База — безопасная локация: спавн, склад, без аномалий.
+    #[serde(default)]
+    pub base: bool,
+}
+
+/// Реестр локаций мира (M4d): `locations.ron`. Клиент и сервер читают его при
+/// старте; сцены локаций и сам реестр покрывает `world_content_hash`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LocationRegistry {
+    pub locations: Vec<LocationInfo>,
+}
+
+impl LocationRegistry {
+    /// Встроенный мир цикла M4d: База — Кордон — Свалка/Подземка.
+    pub fn builtin() -> Self {
+        Self {
+            locations: vec![
+                LocationInfo {
+                    id: LOCATION_BASE,
+                    name: "База".to_string(),
+                    scene: "base".to_string(),
+                    base: true,
+                },
+                LocationInfo {
+                    id: LOCATION_KORDON,
+                    name: "Кордон".to_string(),
+                    scene: "kordon".to_string(),
+                    base: false,
+                },
+                LocationInfo {
+                    id: LOCATION_SVALKA,
+                    name: "Свалка".to_string(),
+                    scene: "svalka".to_string(),
+                    base: false,
+                },
+                LocationInfo {
+                    id: LOCATION_PODZEMKA,
+                    name: "Подземка".to_string(),
+                    scene: "podzemka".to_string(),
+                    base: false,
+                },
+            ],
+        }
+    }
+
+    pub fn to_ron(&self) -> Result<String, ron::Error> {
+        ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())
+    }
+
+    pub fn from_ron(text: &str) -> Result<Self, SceneError> {
+        ron::from_str(text).map_err(SceneError::Deserialize)
+    }
+
+    pub fn load_ron(path: impl AsRef<Path>) -> Result<Self, SceneError> {
+        let text = std::fs::read_to_string(path).map_err(SceneError::Io)?;
+        Self::from_ron(&text)
+    }
+
+    pub fn save_ron(&self, path: impl AsRef<Path>) -> Result<(), SceneError> {
+        let text = self.to_ron().map_err(SceneError::Serialize)?;
+        std::fs::write(path, text).map_err(SceneError::Io)
+    }
+
+    pub fn get(&self, id: LocationId) -> Option<&LocationInfo> {
+        self.locations.iter().find(|info| info.id == id)
+    }
+
+    /// Путь к сцене локации: `<content_root>/levels/<scene>.scene.ron`.
+    pub fn scene_path(&self, content_root: &Path, id: LocationId) -> Option<PathBuf> {
+        let info = self.get(id)?;
+        Some(
+            content_root
+                .join("levels")
+                .join(format!("{}.scene.ron", info.scene)),
+        )
+    }
+
+    /// Первая безопасная база (обычно единственная).
+    pub fn base_id(&self) -> Option<LocationId> {
+        self.locations
+            .iter()
+            .find(|info| info.base)
+            .map(|info| info.id)
+    }
+
+    /// Детерминированный хэш реестра (FNV-1a по каноническому RON).
+    pub fn content_hash(&self) -> u64 {
+        let text = self.to_ron().unwrap_or_default();
+        let mut hash = FNV_OFFSET_BASIS;
+        for byte in text.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+}
+
+/// Хэш мира (реестр + сцены локаций, отсортированные по id). Клиент и сервер
+/// сверяют его в handshake: расхождение — разные переходы/коллайдеры.
+pub fn world_content_hash(registry: &LocationRegistry, scenes: &[(LocationId, &Scene)]) -> u64 {
+    let mut entries: Vec<(LocationId, u64)> = scenes
+        .iter()
+        .map(|(id, scene)| (*id, scene.content_hash()))
+        .collect();
+    entries.sort_unstable_by_key(|(id, _)| *id);
+    let mut hash = registry.content_hash();
+    for (id, scene_hash) in entries {
+        hash ^= scene_hash;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        hash ^= u64::from(id);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Кратчайшие расстояния (в переходах) от каждой локации до базы; рёбра —
+/// переходы сцен. Пузырь уносит игрока в локацию с минимальным расстоянием
+/// (ближайшую к базе). Недостижимые локации в карту не попадают.
+pub fn distances_to_base(
+    registry: &LocationRegistry,
+    scenes: &[(LocationId, &Scene)],
+) -> HashMap<LocationId, u32> {
+    let mut distances = HashMap::new();
+    let Some(base) = registry.base_id() else {
+        return distances;
+    };
+    let mut adjacency: HashMap<LocationId, Vec<LocationId>> = HashMap::new();
+    for (id, scene) in scenes {
+        let entry = adjacency.entry(*id).or_default();
+        for transition in &scene.transitions {
+            entry.push(transition.target);
+        }
+    }
+    let mut queue = VecDeque::from([(base, 0u32)]);
+    distances.insert(base, 0);
+    while let Some((id, distance)) = queue.pop_front() {
+        let neighbours = adjacency.get(&id).cloned().unwrap_or_default();
+        for neighbour in neighbours {
+            if distances.contains_key(&neighbour) || registry.get(neighbour).is_none() {
+                continue;
+            }
+            distances.insert(neighbour, distance + 1);
+            queue.push_back((neighbour, distance + 1));
+        }
+    }
+    distances
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SceneObject {
     pub position: Vec3,
@@ -138,6 +381,11 @@ fn crate_object(x: f32, z: f32, loot: &[(&str, u32)]) -> SceneObject {
     )
     .with_asset(BUILTIN_CUBE)
     .with_loot(entries)
+}
+
+/// Плоская плита-маркер (переход/зона): лежит на полу, не мешает движению.
+fn pad(x: f32, z: f32, size: f32, color: Vec4) -> SceneObject {
+    SceneObject::new(Vec3::new(x, 0.06, z), Vec3::new(size, 0.12, size), color).invulnerable()
 }
 
 impl SceneObject {
@@ -257,6 +505,15 @@ pub struct Scene {
     /// Аномалии уровня (M4c): не коллайдеры, влияют на игроков и болты.
     #[serde(default)]
     pub anomalies: Vec<SceneAnomaly>,
+    /// Переходы в другие локации (M4d), пешком.
+    #[serde(default)]
+    pub transitions: Vec<SceneTransition>,
+    /// Кандидаты появления пузырей (M4d).
+    #[serde(default)]
+    pub bubbles: Vec<SceneBubble>,
+    /// Точки прибытия пузырей (M4d): сюда сервер высаживает игрока после ТП.
+    #[serde(default)]
+    pub bubble_arrivals: Vec<Vec3>,
 }
 
 impl Scene {
@@ -267,6 +524,9 @@ impl Scene {
             spawn_yaw: 0.0,
             objects: Vec::new(),
             anomalies: Vec::new(),
+            transitions: Vec::new(),
+            bubbles: Vec::new(),
+            bubble_arrivals: Vec::new(),
         }
     }
 
@@ -277,6 +537,21 @@ impl Scene {
 
     pub fn add_anomaly(&mut self, anomaly: SceneAnomaly) -> &mut Self {
         self.anomalies.push(anomaly);
+        self
+    }
+
+    pub fn add_transition(&mut self, transition: SceneTransition) -> &mut Self {
+        self.transitions.push(transition);
+        self
+    }
+
+    pub fn add_bubble(&mut self, bubble: SceneBubble) -> &mut Self {
+        self.bubbles.push(bubble);
+        self
+    }
+
+    pub fn add_bubble_arrival(&mut self, position: Vec3) -> &mut Self {
+        self.bubble_arrivals.push(position);
         self
     }
 
@@ -448,6 +723,298 @@ impl Scene {
         );
 
         scene
+    }
+
+    /// База (M4d): безопасная локация — спавн, склад, ворота на Кордон.
+    /// Аномалий, пузырей и лута нет.
+    pub fn base() -> Self {
+        let mut scene = Scene::new("base");
+        scene.spawn = Vec3::new(0.0, 0.0, 14.0);
+        scene.spawn_yaw = std::f32::consts::PI;
+
+        let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
+            scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
+        };
+
+        let ground = Vec4::new(0.20, 0.21, 0.18, 1.0);
+        let wall = Vec4::new(0.12, 0.13, 0.12, 1.0);
+        let building = Vec4::new(0.26, 0.26, 0.24, 1.0);
+
+        // Площадка 48×48 и периметр.
+        push(
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(48.0, 0.5, 48.0),
+            ground,
+        );
+        push(Vec3::new(0.0, 2.5, -24.0), Vec3::new(49.0, 3.0, 1.0), wall);
+        push(Vec3::new(0.0, 2.5, 24.0), Vec3::new(49.0, 3.0, 1.0), wall);
+        push(Vec3::new(-24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
+        push(Vec3::new(24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
+
+        // Постройки: казарма и ангар.
+        push(
+            Vec3::new(-12.0, 2.5, -8.0),
+            Vec3::new(12.0, 5.0, 10.0),
+            building,
+        );
+        push(
+            Vec3::new(10.0, 2.0, 6.0),
+            Vec3::new(8.0, 4.0, 8.0),
+            building,
+        );
+
+        // Склад (декор): контейнер у спавна; склад-панель — по действию игрока.
+        push(
+            Vec3::new(4.0, 0.6, 10.0),
+            Vec3::new(1.6, 1.2, 1.6),
+            Vec4::new(0.45, 0.33, 0.18, 1.0),
+        );
+
+        // Ворота на Кордон (у северной стены).
+        scene.add(pad(0.0, -20.0, 5.0, Vec4::new(0.20, 0.55, 0.25, 1.0)));
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(0.0, 0.0, -20.0),
+                2.5,
+                LOCATION_KORDON,
+                Vec3::new(0.0, 0.0, 22.0),
+            )
+            .with_yaw(std::f32::consts::PI)
+            .with_label("Кордон"),
+        );
+
+        scene
+    }
+
+    /// Кордон (M4d): нынешний demo_zone с переходами (База/Свалка/Подземка),
+    /// кандидатами пузырей и точками прибытия у ворот базы.
+    pub fn kordon() -> Self {
+        let mut scene = Self::demo_zone();
+        scene.name = "kordon".to_string();
+
+        scene.add(pad(0.0, 26.0, 5.0, Vec4::new(0.20, 0.55, 0.25, 1.0)));
+        scene.add(pad(-26.0, 0.0, 5.0, Vec4::new(0.25, 0.35, 0.60, 1.0)));
+        scene.add(pad(26.0, 0.0, 5.0, Vec4::new(0.60, 0.40, 0.18, 1.0)));
+
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(0.0, 0.0, 26.0),
+                2.5,
+                LOCATION_BASE,
+                Vec3::new(0.0, 0.0, -16.0),
+            )
+            .with_label("База"),
+        );
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(-26.0, 0.0, 0.0),
+                2.5,
+                LOCATION_SVALKA,
+                Vec3::new(38.0, 0.0, 0.0),
+            )
+            .with_yaw(-std::f32::consts::FRAC_PI_2)
+            .with_label("Свалка"),
+        );
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(26.0, 0.0, 0.0),
+                2.5,
+                LOCATION_PODZEMKA,
+                Vec3::new(-15.0, 0.0, 0.0),
+            )
+            .with_yaw(std::f32::consts::FRAC_PI_2)
+            .with_label("Подземка"),
+        );
+
+        // Кандидаты пузырей: свободные точки карты.
+        scene.add_bubble(SceneBubble::new(Vec3::new(12.0, 0.0, -16.0), 1.2));
+        scene.add_bubble(SceneBubble::new(Vec3::new(-16.0, 0.0, 10.0), 1.2));
+        scene.add_bubble(SceneBubble::new(Vec3::new(18.0, 0.0, 20.0), 1.2));
+
+        // Точки прибытия: пузыри из Свалки/Подземки высаживают здесь —
+        // почти под базой, до ворот идти пешком.
+        scene.add_bubble_arrival(Vec3::new(6.0, 0.0, 19.0));
+        scene.add_bubble_arrival(Vec3::new(-8.0, 0.0, 20.0));
+
+        scene
+    }
+
+    /// Свалка (M4d): открытая локация 96×96 — завалы, три аномалии, лут.
+    /// Переход на восток — к Кордону.
+    pub fn svalka() -> Self {
+        let mut scene = Scene::new("svalka");
+        scene.spawn = Vec3::new(38.0, 0.0, 0.0);
+        scene.spawn_yaw = -std::f32::consts::FRAC_PI_2;
+
+        let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
+            scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
+        };
+
+        let ground = Vec4::new(0.20, 0.19, 0.16, 1.0);
+        let wall = Vec4::new(0.11, 0.11, 0.10, 1.0);
+        let pile = Vec4::new(0.28, 0.27, 0.23, 1.0);
+
+        push(
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(96.0, 0.5, 96.0),
+            ground,
+        );
+        push(Vec3::new(0.0, 2.5, -48.0), Vec3::new(97.0, 3.0, 1.0), wall);
+        push(Vec3::new(0.0, 2.5, 48.0), Vec3::new(97.0, 3.0, 1.0), wall);
+        push(Vec3::new(-48.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 97.0), wall);
+        push(Vec3::new(48.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 97.0), wall);
+
+        // Завалы: башни и разбросанные блоки.
+        let piles = [
+            (Vec3::new(-10.0, 4.0, -12.0), Vec3::new(6.0, 8.0, 6.0)),
+            (Vec3::new(12.0, 3.0, 14.0), Vec3::new(5.0, 6.0, 5.0)),
+            (Vec3::new(-24.0, 2.5, 20.0), Vec3::new(4.0, 5.0, 4.0)),
+            (Vec3::new(26.0, 2.0, -26.0), Vec3::new(6.0, 4.0, 6.0)),
+            (Vec3::new(-34.0, 1.5, -30.0), Vec3::new(5.0, 3.0, 7.0)),
+        ];
+        for (position, scale) in piles {
+            push(position, scale, pile);
+        }
+        let debris = [
+            (Vec3::new(4.0, 0.75, -20.0), Vec3::new(3.0, 1.5, 2.0)),
+            (Vec3::new(-18.0, 1.0, 2.0), Vec3::new(2.0, 2.0, 3.0)),
+            (Vec3::new(20.0, 0.6, 30.0), Vec3::new(4.0, 1.2, 2.0)),
+            (Vec3::new(-6.0, 0.9, 26.0), Vec3::new(2.5, 1.8, 2.5)),
+            (Vec3::new(30.0, 1.2, 8.0), Vec3::new(3.0, 2.4, 3.0)),
+            (Vec3::new(-28.0, 0.7, -8.0), Vec3::new(2.0, 1.4, 4.0)),
+        ];
+        for (position, scale) in debris {
+            push(position, scale, pile);
+        }
+
+        // Заборы-стенки, делящие карту.
+        push(Vec3::new(-2.0, 1.5, -30.0), Vec3::new(20.0, 3.0, 1.0), wall);
+        push(Vec3::new(-20.0, 1.5, 8.0), Vec3::new(1.0, 3.0, 18.0), wall);
+
+        // Ящики: лут по всей карте.
+        let crates = [
+            crate_object(30.0, 20.0, &[("medkit", 1), ("ammo_545", 30)]),
+            crate_object(-20.0, -20.0, &[("bolt", 20), ("bandage", 2)]),
+            crate_object(0.0, 34.0, &[("canned_food", 2), ("vodka", 1)]),
+            crate_object(26.0, -10.0, &[("medkit", 2), ("ammo_545", 60)]),
+            crate_object(-30.0, 34.0, &[("bolt", 30), ("bandage", 2)]),
+            crate_object(14.0, -36.0, &[("vodka", 2), ("canned_food", 1)]),
+        ];
+        for object in crates {
+            scene.add(object);
+        }
+
+        // Аномалии: две с артефактами, одна пустая.
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(20.0, 0.0, 25.0), 3.0, AnomalyKind::Heat)
+                .with_artifact("artifact_heat"),
+        );
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(-18.0, 0.0, -22.0), 3.5, AnomalyKind::Gravity)
+                .with_artifact("artifact_gravity"),
+        );
+        scene.add_anomaly(SceneAnomaly::new(
+            Vec3::new(-34.0, 0.0, 24.0),
+            3.0,
+            AnomalyKind::Heat,
+        ));
+
+        // Переход к Кордону (у восточной стены).
+        scene.add(pad(43.0, 0.0, 5.0, Vec4::new(0.25, 0.35, 0.60, 1.0)));
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(43.0, 0.0, 0.0),
+                2.5,
+                LOCATION_KORDON,
+                Vec3::new(-21.0, 0.0, 0.0),
+            )
+            .with_yaw(std::f32::consts::FRAC_PI_2)
+            .with_label("Кордон"),
+        );
+
+        // Кандидаты пузырей.
+        scene.add_bubble(SceneBubble::new(Vec3::new(30.0, 0.0, 30.0), 1.2));
+        scene.add_bubble(SceneBubble::new(Vec3::new(-30.0, 0.0, -30.0), 1.2));
+        scene.add_bubble(SceneBubble::new(Vec3::new(-34.0, 0.0, -4.0), 1.2));
+        scene.add_bubble(SceneBubble::new(Vec3::new(26.0, 0.0, -34.0), 1.2));
+
+        scene
+    }
+
+    /// Подземка (M4d): тесные коридоры 48×48, одна аномалия, лут.
+    /// Переход на запад — к Кордону.
+    pub fn podzemka() -> Self {
+        let mut scene = Scene::new("podzemka");
+        scene.spawn = Vec3::new(-15.0, 0.0, 0.0);
+        scene.spawn_yaw = std::f32::consts::FRAC_PI_2;
+
+        let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
+            scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
+        };
+
+        let ground = Vec4::new(0.16, 0.16, 0.15, 1.0);
+        let wall = Vec4::new(0.10, 0.10, 0.09, 1.0);
+        let inner = Vec4::new(0.22, 0.22, 0.21, 1.0);
+
+        push(
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(48.0, 0.5, 48.0),
+            ground,
+        );
+        push(Vec3::new(0.0, 2.5, -24.0), Vec3::new(49.0, 3.0, 1.0), wall);
+        push(Vec3::new(0.0, 2.5, 24.0), Vec3::new(49.0, 3.0, 1.0), wall);
+        push(Vec3::new(-24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
+        push(Vec3::new(24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
+
+        // Коридоры: длинные стены с проходами.
+        push(Vec3::new(-8.0, 2.0, -9.0), Vec3::new(1.0, 4.0, 18.0), inner);
+        push(Vec3::new(8.0, 2.0, 9.0), Vec3::new(1.0, 4.0, 18.0), inner);
+        push(Vec3::new(0.0, 2.0, -16.0), Vec3::new(14.0, 4.0, 1.0), inner);
+        push(Vec3::new(0.0, 2.0, 16.0), Vec3::new(14.0, 4.0, 1.0), inner);
+
+        let crates = [
+            crate_object(-16.0, 20.0, &[("medkit", 1), ("bandage", 2)]),
+            crate_object(14.0, -14.0, &[("bolt", 15), ("ammo_545", 30)]),
+            crate_object(4.0, 4.0, &[("canned_food", 1), ("vodka", 1)]),
+        ];
+        for object in crates {
+            scene.add(object);
+        }
+
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(16.0, 0.0, 16.0), 2.5, AnomalyKind::Heat)
+                .with_artifact("artifact_heat"),
+        );
+
+        // Переход к Кордону (у западной стены).
+        scene.add(pad(-20.0, 0.0, 5.0, Vec4::new(0.60, 0.40, 0.18, 1.0)));
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(-20.0, 0.0, 0.0),
+                2.5,
+                LOCATION_KORDON,
+                Vec3::new(21.0, 0.0, 0.0),
+            )
+            .with_yaw(-std::f32::consts::FRAC_PI_2)
+            .with_label("Кордон"),
+        );
+
+        // Кандидаты пузырей.
+        scene.add_bubble(SceneBubble::new(Vec3::new(12.0, 0.0, -12.0), 1.2));
+        scene.add_bubble(SceneBubble::new(Vec3::new(-12.0, 0.0, 12.0), 1.2));
+        scene.add_bubble(SceneBubble::new(Vec3::new(0.0, 0.0, 20.0), 1.2));
+
+        scene
+    }
+
+    /// Встроенный мир цикла M4d: сцены локаций `LocationRegistry::builtin()`.
+    pub fn builtin_world() -> Vec<(LocationId, Scene)> {
+        vec![
+            (LOCATION_BASE, Scene::base()),
+            (LOCATION_KORDON, Scene::kordon()),
+            (LOCATION_SVALKA, Scene::svalka()),
+            (LOCATION_PODZEMKA, Scene::podzemka()),
+        ]
     }
 }
 

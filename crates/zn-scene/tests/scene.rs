@@ -2,7 +2,9 @@
 mod tests {
     use glam::Vec3;
     use zn_scene::{
-        AnomalyKind, ColliderShape, LootEntry, Scene, SceneAnomaly, SceneObject, BUILTIN_CUBE,
+        distances_to_base, world_content_hash, AnomalyKind, ColliderShape, LocationRegistry,
+        LootEntry, Scene, SceneAnomaly, SceneBubble, SceneObject, SceneTransition, BUILTIN_CUBE,
+        LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA, LOCATION_SVALKA,
     };
 
     #[test]
@@ -282,5 +284,118 @@ mod tests {
         with_anomaly.add_anomaly(SceneAnomaly::new(Vec3::ZERO, 3.0, AnomalyKind::Heat));
 
         assert_ne!(with_anomaly.content_hash(), plain.content_hash());
+    }
+
+    #[test]
+    fn builtin_registry_roundtrip_and_base() {
+        let registry = LocationRegistry::builtin();
+        assert_eq!(registry.base_id(), Some(LOCATION_BASE));
+        assert_eq!(registry.get(LOCATION_KORDON).unwrap().name, "Кордон");
+        assert_eq!(registry.get(LOCATION_SVALKA).unwrap().scene, "svalka");
+
+        let text = registry.to_ron().unwrap();
+        let loaded = LocationRegistry::from_ron(&text).unwrap();
+        assert_eq!(loaded, registry);
+    }
+
+    #[test]
+    fn builtin_world_matches_registry() {
+        let registry = LocationRegistry::builtin();
+        let world = Scene::builtin_world();
+        assert_eq!(world.len(), registry.locations.len());
+        for (id, scene) in &world {
+            let info = registry.get(*id).expect("локация есть в реестре");
+            assert_eq!(scene.name, info.scene, "имя сцены совпадает с файлом");
+        }
+
+        // База безопасна: без аномалий и пузырей, один переход — на Кордон.
+        let base = &world[0].1;
+        assert!(base.anomalies.is_empty());
+        assert!(base.bubbles.is_empty());
+        assert!(base.bubble_arrivals.is_empty());
+        assert_eq!(base.transitions.len(), 1);
+        assert_eq!(base.transitions[0].target, LOCATION_KORDON);
+    }
+
+    #[test]
+    fn world_hash_depends_on_registry_and_scenes() {
+        let registry = LocationRegistry::builtin();
+        let world = Scene::builtin_world();
+        let refs: Vec<(u8, &Scene)> = world.iter().map(|(id, scene)| (*id, scene)).collect();
+        let first = world_content_hash(&registry, &refs);
+
+        let mut bumped = world.clone();
+        bumped[2].1.spawn.x += 1.0;
+        let bumped_refs: Vec<(u8, &Scene)> =
+            bumped.iter().map(|(id, scene)| (*id, scene)).collect();
+        assert_ne!(first, world_content_hash(&registry, &bumped_refs));
+        assert_eq!(first, world_content_hash(&registry, &refs));
+    }
+
+    #[test]
+    fn world_spawn_points_are_outside_transition_zones() {
+        let world = Scene::builtin_world();
+        for (id, scene) in &world {
+            let mut spawn_points: Vec<Vec3> = scene
+                .transitions
+                .iter()
+                .map(|transition| transition.target_position)
+                .collect();
+            spawn_points.extend(scene.bubble_arrivals.iter().copied());
+            for point in spawn_points {
+                for zone in &scene.transitions {
+                    assert!(
+                        !zone.contains(point),
+                        "локация {id}: точка появления {point:?} внутри зоны {zone:?} — телепорт-петля"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kordon_extends_demo_zone_with_transitions_and_bubbles() {
+        let demo = Scene::demo_zone();
+        let kordon = Scene::kordon();
+        assert_eq!(
+            kordon.objects.len(),
+            demo.objects.len() + 3,
+            "плюс три плиты переходов"
+        );
+        assert_eq!(kordon.anomalies.len(), demo.anomalies.len());
+        assert_eq!(kordon.transitions.len(), 3);
+        assert_eq!(kordon.bubbles.len(), 3);
+        assert!(!kordon.bubble_arrivals.is_empty());
+
+        let targets: Vec<u8> = kordon.transitions.iter().map(|t| t.target).collect();
+        assert_eq!(
+            targets,
+            vec![LOCATION_BASE, LOCATION_SVALKA, LOCATION_PODZEMKA]
+        );
+    }
+
+    #[test]
+    fn distances_to_base_prefers_kordon() {
+        let registry = LocationRegistry::builtin();
+        let world = Scene::builtin_world();
+        let refs: Vec<(u8, &Scene)> = world.iter().map(|(id, scene)| (*id, scene)).collect();
+        let distances = distances_to_base(&registry, &refs);
+        assert_eq!(distances.get(&LOCATION_BASE), Some(&0));
+        assert_eq!(distances.get(&LOCATION_KORDON), Some(&1));
+        assert_eq!(distances.get(&LOCATION_SVALKA), Some(&2));
+        assert_eq!(distances.get(&LOCATION_PODZEMKA), Some(&2));
+    }
+
+    #[test]
+    fn transition_and_bubble_containment() {
+        let transition =
+            SceneTransition::new(Vec3::new(0.0, 0.0, 10.0), 2.5, LOCATION_BASE, Vec3::ZERO);
+        assert!(transition.contains(Vec3::new(1.0, 5.0, 10.5)));
+        assert!(!transition.contains(Vec3::new(3.0, 0.0, 10.0)));
+
+        let bubble = SceneBubble::new(Vec3::ZERO, 1.2);
+        assert_eq!(bubble.center(), Vec3::new(0.0, 1.2, 0.0));
+        assert!(bubble.contains(Vec3::new(0.0, 1.2, 0.5)));
+        assert!(!bubble.contains(Vec3::new(2.0, 1.2, 0.0)));
     }
 }

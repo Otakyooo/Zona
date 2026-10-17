@@ -1,0 +1,28 @@
+(
+    locations: [
+        (
+            id: 0,
+            name: "База",
+            scene: "base",
+            base: true,
+        ),
+        (
+            id: 1,
+            name: "Кордон",
+            scene: "kordon",
+            base: false,
+        ),
+        (
+            id: 2,
+            name: "Свалка",
+            scene: "svalka",
+            base: false,
+        ),
+        (
+            id: 3,
+            name: "Подземка",
+            scene: "podzemka",
+            base: false,
+        ),
+    ],
+)
