@@ -34,6 +34,8 @@ pub enum NetEvent {
         corpses: Vec<CorpseNet>,
         /// Летящие болты (M4c).
         bolts: Vec<BoltNet>,
+        /// Активные пузыри локации игрока (M4d, квантованные якоря).
+        bubbles: Vec<[i16; 3]>,
         /// События боя с прошлого снапшота (трейсеры, килл-фид).
         events: Vec<GameEvent>,
     },
@@ -319,6 +321,7 @@ impl NetClient {
                 loot,
                 corpses,
                 bolts,
+                bubbles,
                 events,
             } => {
                 if self.status != NetStatus::Connected {
@@ -332,6 +335,7 @@ impl NetClient {
                     loot,
                     corpses,
                     bolts,
+                    bubbles,
                     events,
                 })
             }
@@ -667,6 +671,7 @@ mod tests {
                     owner: 1,
                     pos: [150, 30, 150],
                 }],
+                bubbles: vec![[160, 0, 190]],
                 events: vec![],
             },
         );
@@ -684,6 +689,7 @@ mod tests {
                     owner: 1,
                     pos: [150, 30, 150],
                 }],
+                bubbles: vec![[160, 0, 190]],
                 events: vec![],
             }]
         );

@@ -130,6 +130,7 @@ fn all_message_variants_roundtrip_through_bincode() {
                 owner: 1,
                 pos: [150, 30, 150],
             }],
+            bubbles: vec![[300, 0, -300], [120, 0, 180]],
             events: vec![
                 GameEvent::Shot {
                     shooter: 1,
@@ -258,6 +259,8 @@ fn full_snapshot_fits_udp_mtu() {
                 pos: [i as i16 * 10, 30, 150],
             })
             .collect(),
+        // Максимум активных пузырей на локацию (`BUBBLE_COUNT_MAX`) — 3.
+        bubbles: vec![[120, 0, 300], [-300, 0, -40], [260, 0, -340]],
         events: vec![
             GameEvent::Shot {
                 shooter: 3,

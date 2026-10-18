@@ -657,6 +657,8 @@ struct LocationSnapshot {
     loot: Vec<GroundItemNet>,
     corpses: Vec<CorpseNet>,
     bolts: Vec<BoltNet>,
+    /// Активные пузыри этой локации (квантованные якоря).
+    bubbles: Vec<[i16; 3]>,
     events: Vec<GameEvent>,
 }
 
@@ -1339,6 +1341,13 @@ impl Session {
         let mut per_location: Vec<(LocationId, LocationSnapshot)> = Vec::with_capacity(ids.len());
         let mut net_updates: Vec<NetUpdates> = Vec::with_capacity(ids.len());
         for id in ids {
+            // Пузыри — из BubbleField локации (набор меняется со временем).
+            let bubbles: Vec<[i16; 3]> = self
+                .world
+                .active_bubbles(id)
+                .into_iter()
+                .map(|anchor| zn_net::quantize_pos(anchor.to_array()))
+                .collect();
             let Some(runtime) = self.world.locations.get_mut(&id) else {
                 continue;
             };
@@ -1363,6 +1372,7 @@ impl Session {
                     loot,
                     corpses,
                     bolts,
+                    bubbles,
                     events,
                 },
             ));
@@ -1396,6 +1406,7 @@ impl Session {
                     loot: snapshot.loot.clone(),
                     corpses: snapshot.corpses.clone(),
                     bolts: snapshot.bolts.clone(),
+                    bubbles: snapshot.bubbles.clone(),
                     events: snapshot.events.clone(),
                 },
             );

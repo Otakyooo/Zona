@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use zn_net::{
-    decode_message, encode_message, ClientInput, GameEvent, InventoryAction, Message,
+    decode_message, encode_message, quantize_pos, ClientInput, GameEvent, InventoryAction, Message,
     PlayerNetState, RejectReason, StashAction, FLAG_FIRE, FLAG_GROUNDED, PROTOCOL_VERSION,
 };
 use zn_scene::{
@@ -1137,6 +1137,41 @@ fn snapshots_cover_only_the_players_location() {
         1,
         "Свалка: только разведчик"
     );
+}
+
+#[test]
+fn snapshots_carry_active_bubbles_of_the_players_location() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+
+    // База: пузырей нет — снапшот пуст.
+    match expect_message(&mut session, &client, |message| {
+        matches!(message, Message::Snapshot { .. })
+    }) {
+        Message::Snapshot { bubbles, .. } => assert!(bubbles.is_empty(), "{bubbles:?}"),
+        other => unreachable!("предикат гарантирует Snapshot: {other:?}"),
+    }
+
+    // Игрок уходит на Свалку (в центр: ни пузырей, ни переходов) — снапшот
+    // приходит уже с активными якорями Свалки.
+    assert!(session.debug_teleport(player_id, LOCATION_SVALKA, Vec3::ZERO));
+    let expected: Vec<[i16; 3]> = session
+        .active_bubbles(LOCATION_SVALKA)
+        .into_iter()
+        .map(|anchor| quantize_pos(anchor.to_array()))
+        .collect();
+    assert!(!expected.is_empty(), "на Свалке есть активные пузыри");
+    let reply = expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::Snapshot { bubbles, .. } if !bubbles.is_empty()),
+    );
+    let Message::Snapshot { bubbles, .. } = reply else {
+        unreachable!("предикат гарантирует Snapshot: {reply:?}")
+    };
+    assert_eq!(bubbles, expected, "снапшот несёт якоря активных пузырей");
 }
 
 #[test]
