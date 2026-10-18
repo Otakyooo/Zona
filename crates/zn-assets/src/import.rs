@@ -271,6 +271,9 @@ fn convert_material(material: &gltf::Material<'_>) -> CpuMaterial {
             gltf::material::AlphaMode::Blend => AlphaMode::Blend,
         },
         double_sided: material.double_sided(),
+        // У glTF-материалов — мешевые UV без тайлинга (M4g-поля только для сцен).
+        uv_scale: [1.0, 1.0],
+        world_uv: false,
     };
     cpu.normalize_metallic_roughness();
     cpu

@@ -643,7 +643,14 @@ impl Renderer {
         // Встроенный куб + нейтральный материал — базовые ресурсы сцены.
         let builtin_cube = zn_assets::builtin_mesh("cube").expect("builtin cube");
         renderer.builtin_cube_mesh = renderer.register_mesh(&builtin_cube);
-        renderer.default_material = renderer.register_material(&CpuMaterial::default(), &[]);
+        // Материал по умолчанию (M4g): диэлектрик — поверхности реагируют на
+        // солнце диффузно, а не как металл (у glTF-дефолта metallic = 1).
+        let default_material = CpuMaterial {
+            metallic_factor: 0.0,
+            roughness_factor: 0.85,
+            ..CpuMaterial::default()
+        };
+        renderer.default_material = renderer.register_material(&default_material, &[]);
 
         renderer
     }

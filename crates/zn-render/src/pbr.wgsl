@@ -23,8 +23,8 @@ struct Material {
     _pad1: f32,
     emissive_factor: vec4<f32>,
     alpha_cutoff: f32,
-    flags: u32, // 1 = alpha mask, 2 = double sided
-    _pad2: vec2<f32>,
+    flags: u32, // 1 = alpha mask, 2 = double sided, 8 = мировые (box) UV
+    uv_scale: vec2<f32>, // тайлинг текстур (M4g)
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -140,6 +140,24 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
 
+// UV материала (M4g): мешевые × тайлинг, либо box-проекция по мировой позиции
+// (стены/полы из кубов получают равномерную плотность текселей).
+fn material_uv(world_position: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>) -> vec2<f32> {
+    if ((material.flags & 8u) == 0u) {
+        return uv * material.uv_scale;
+    }
+    let n = abs(normal);
+    var planar: vec2<f32>;
+    if (n.x >= n.y && n.x >= n.z) {
+        planar = vec2<f32>(world_position.z, world_position.y);
+    } else if (n.y >= n.z) {
+        planar = vec2<f32>(world_position.x, world_position.z);
+    } else {
+        planar = vec2<f32>(world_position.x, world_position.y);
+    }
+    return planar * material.uv_scale;
+}
+
 // Тень от солнца: PCF 3×3 по карте глубины (M4g). Ноль — полностью в тени.
 fn shadow_factor(world_position: vec3<f32>) -> f32 {
     let light_clip = camera.light_view_proj * vec4<f32>(world_position, 1.0);
@@ -177,12 +195,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         double_sided_flip = -1.0;
     }
 
-    let albedo_sample = textureSample(base_tex, tex_sampler, in.uv);
-    let mr_sample = textureSample(metal_rough_tex, tex_sampler, in.uv);
-    let ao_sample = textureSample(occlusion_tex, tex_sampler, in.uv).r;
-    let emissive_sample = textureSample(emissive_tex, tex_sampler, in.uv);
-    let normal_sample = textureSample(normal_tex, tex_sampler, in.uv).xyz * 2.0 - vec3<f32>(1.0);
-    normal = perturb_normal(normal * double_sided_flip, view_dir, in.uv, normal_sample);
+    let uv = material_uv(in.world_position, normal, in.uv);
+    let albedo_sample = textureSample(base_tex, tex_sampler, uv);
+    let mr_sample = textureSample(metal_rough_tex, tex_sampler, uv);
+    let ao_sample = textureSample(occlusion_tex, tex_sampler, uv).r;
+    let emissive_sample = textureSample(emissive_tex, tex_sampler, uv);
+    let normal_sample = textureSample(normal_tex, tex_sampler, uv).xyz * 2.0 - vec3<f32>(1.0);
+    normal = perturb_normal(normal * double_sided_flip, view_dir, uv, normal_sample);
 
     let base_color = material.base_color_factor * albedo_sample * in.tint;
     let alpha = base_color.a;

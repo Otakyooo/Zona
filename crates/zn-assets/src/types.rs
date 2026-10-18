@@ -240,6 +240,10 @@ pub struct CpuMaterial {
     pub emissive_texture: Option<usize>,
     pub alpha_mode: AlphaMode,
     pub double_sided: bool,
+    /// Тайлинг UV (M4g): множитель текстурных координат (мировых или мешевых).
+    pub uv_scale: [f32; 2],
+    /// Мировые (box) UV вместо мешевых (M4g) — для стен, полов и завалов.
+    pub world_uv: bool,
 }
 
 impl Default for CpuMaterial {
@@ -257,6 +261,8 @@ impl Default for CpuMaterial {
             emissive_texture: None,
             alpha_mode: AlphaMode::Opaque,
             double_sided: false,
+            uv_scale: [1.0, 1.0],
+            world_uv: false,
         }
     }
 }

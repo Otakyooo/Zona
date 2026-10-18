@@ -4,7 +4,8 @@ use crate::renderer::cache::MaterialId;
 use zn_assets::{AlphaMode, CpuMaterial};
 
 /// Параметры материала для uniform-буфера (совпадает со структурой Material
-/// в pbr.wgsl; флаги: 1 = alpha mask, 2 = double sided, 4 = blend).
+/// в pbr.wgsl; флаги: 1 = alpha mask, 2 = double sided, 4 = blend,
+/// 8 = мировые (box) UV).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
 pub struct MaterialParams {
@@ -16,8 +17,8 @@ pub struct MaterialParams {
     pub emissive_factor: [f32; 4],
     pub alpha_cutoff: f32,
     pub flags: u32,
-    // WGSL: vec2<f32> (align 8) на смещении 56 → итого 64 байта.
-    _pad2: [f32; 2],
+    /// Тайлинг UV (M4g): WGSL `vec2<f32>` на смещении 56, итого 64 байта.
+    pub uv_scale: [f32; 2],
 }
 
 impl From<&CpuMaterial> for MaterialParams {
@@ -26,7 +27,8 @@ impl From<&CpuMaterial> for MaterialParams {
             AlphaMode::Opaque => 0u32,
             AlphaMode::Mask => 1,
             AlphaMode::Blend => FLAG_BLEND,
-        } | if material.double_sided { 2 } else { 0 };
+        } | if material.double_sided { 2 } else { 0 }
+            | if material.world_uv { FLAG_WORLD_UV } else { 0 };
         Self {
             base_color_factor: material.base_color_factor,
             metallic_factor: material.metallic_factor,
@@ -41,7 +43,19 @@ impl From<&CpuMaterial> for MaterialParams {
             ],
             alpha_cutoff: ALPHA_CUTOFF,
             flags,
-            _pad2: [0.0; 2],
+            uv_scale: [
+                // Нулевой/отрицательный масштаб из контента — как 1.0.
+                if material.uv_scale[0] > 0.0 {
+                    material.uv_scale[0]
+                } else {
+                    1.0
+                },
+                if material.uv_scale[1] > 0.0 {
+                    material.uv_scale[1]
+                } else {
+                    1.0
+                },
+            ],
         }
     }
 }
@@ -51,6 +65,9 @@ pub const ALPHA_CUTOFF: f32 = 0.5;
 
 /// Флаг blend-конвейера: инстансы рисуются вторым проходом с альфа-блендингом.
 pub const FLAG_BLEND: u32 = 4;
+
+/// Флаг мировых UV (M4g): box-проекция по мировой позиции вместо UV меша.
+pub const FLAG_WORLD_UV: u32 = 8;
 
 /// Число текстурных слотов материала.
 pub const TEXTURE_SLOTS: usize = 5;
@@ -163,6 +180,30 @@ mod tests {
         assert_eq!(params.metallic_factor, 0.1);
         assert_eq!(params.roughness_factor, 0.9);
         assert_eq!(params.emissive_factor, [0.2, 0.4, 0.6, 1.0]);
+    }
+
+    #[test]
+    fn uv_scale_and_world_flag_flow_into_params() {
+        let cpu = CpuMaterial {
+            uv_scale: [4.0, 2.0],
+            world_uv: true,
+            roughness_factor: 0.5,
+            metallic_factor: 0.0,
+            ..Default::default()
+        };
+        let params = MaterialParams::from(&cpu);
+        assert_eq!(params.uv_scale, [4.0, 2.0]);
+        assert_eq!(params.flags & FLAG_WORLD_UV, FLAG_WORLD_UV);
+        assert_eq!(params.roughness_factor, 0.5);
+        assert_eq!(params.metallic_factor, 0.0);
+        // Дефолт — без мировых UV и с единичным тайлингом.
+        assert_eq!(MaterialParams::from(&CpuMaterial::default()).flags, 0);
+        // Нулевой/отрицательный масштаб из контента выправляется в 1.0.
+        let zero = CpuMaterial {
+            uv_scale: [0.0, -2.0],
+            ..Default::default()
+        };
+        assert_eq!(MaterialParams::from(&zero).uv_scale, [1.0, 1.0]);
     }
 
     #[test]
