@@ -8,11 +8,14 @@ use std::time::Duration;
 
 use zn_net::{
     decode_message, encode_message, ClientInput, GameEvent, InventoryAction, Message,
-    PlayerNetState, RejectReason, FLAG_FIRE, FLAG_GROUNDED, PROTOCOL_VERSION,
+    PlayerNetState, RejectReason, StashAction, FLAG_FIRE, FLAG_GROUNDED, PROTOCOL_VERSION,
 };
-use zn_scene::Scene;
+use zn_scene::{
+    world_content_hash, LocationId, LocationRegistry, Scene, LOCATION_BASE, LOCATION_KORDON,
+    LOCATION_SVALKA,
+};
 use zn_server::{Session, SessionConfig};
-use zn_sim::{crate_container_id, Simulation, Vec3};
+use zn_sim::{crate_container_id, Simulation, Stack, Vec3};
 
 struct TestClient {
     socket: UdpSocket,
@@ -47,6 +50,10 @@ impl TestClient {
 
     fn inventory_action(&self, tick: u64, action: InventoryAction) {
         self.send(&Message::InventoryAction { tick, action });
+    }
+
+    fn stash_action(&self, tick: u64, action: StashAction) {
+        self.send(&Message::StashAction { tick, action });
     }
 
     fn try_recv(&self) -> Option<Message> {
@@ -97,6 +104,44 @@ fn test_session(max_players: usize) -> (Session, SocketAddr) {
     let session = Session::bind("127.0.0.1:0", &scene, test_catalog(), config).unwrap();
     let addr = session.local_addr().unwrap();
     (session, addr)
+}
+
+/// Сессия мира локаций (как `zn-server` без `--level`).
+fn test_world_session(max_players: usize) -> (Session, SocketAddr) {
+    let registry = LocationRegistry::builtin();
+    let scenes = Scene::builtin_world();
+    let config = SessionConfig {
+        max_players,
+        ..SessionConfig::default()
+    };
+    let session =
+        Session::bind_world("127.0.0.1:0", &registry, scenes, test_catalog(), config).unwrap();
+    let addr = session.local_addr().unwrap();
+    (session, addr)
+}
+
+/// Хэш мира — тот же, что клиент считает в handshake.
+fn test_world_hash() -> u64 {
+    let registry = LocationRegistry::builtin();
+    let scenes = Scene::builtin_world();
+    let refs: Vec<(LocationId, &Scene)> = scenes.iter().map(|(id, scene)| (*id, scene)).collect();
+    world_content_hash(&registry, &refs)
+}
+
+/// Крутит виртуальное время сессии (по 33 мс), пока условие не выполнится.
+fn poll_until(
+    session: &mut Session,
+    rounds: usize,
+    mut done: impl FnMut(&Session) -> bool,
+) -> bool {
+    for _ in 0..rounds {
+        session.poll(Duration::from_millis(33));
+        if done(session) {
+            return true;
+        }
+        std::thread::yield_now();
+    }
+    false
 }
 
 /// Крутит виртуальное время сессии (по 1 мс), пока клиент не получит
@@ -1012,4 +1057,301 @@ fn artifact_picked_up_in_anomaly() {
         matches!(message, Message::InventoryUpdate { slots }
             if slots.iter().flatten().any(|stack| stack.item == artifact))
     });
+}
+
+// ── Мир локаций (M4d-1) ─────────────────────────────────────────────────
+
+#[test]
+fn world_handshake_reports_base_and_rejects_scene_hash() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let reply = expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::ServerWelcome { .. } | Message::ServerReject { .. }
+        )
+    });
+
+    match reply {
+        Message::ServerWelcome {
+            player_id,
+            spawn,
+            location,
+            ..
+        } => {
+            assert_eq!(player_id, 1);
+            assert_eq!(location, LOCATION_BASE);
+            assert_eq!(spawn, Scene::base().spawn.to_array());
+        }
+        other => panic!("ожидали Welcome, получили {other:?}"),
+    }
+
+    // Хэш одной сцены вместо мирового — отказ в подключении.
+    let second = TestClient::connect(addr);
+    second.hello(Scene::kordon().content_hash());
+    let reply = expect_message(&mut session, &second, |message| {
+        matches!(message, Message::ServerReject { .. })
+    });
+    assert_eq!(
+        reply,
+        Message::ServerReject {
+            reason: RejectReason::ContentMismatch
+        }
+    );
+    assert_eq!(session.player_count(), 1);
+}
+
+#[test]
+fn snapshots_cover_only_the_players_location() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+
+    // Разведчик — в Свалке (в центре карты: ни пузырей, ни переходов).
+    let scout = session.debug_spawn();
+    assert!(session.debug_teleport(scout, LOCATION_SVALKA, Vec3::ZERO));
+    assert_eq!(session.player_location(scout), Some(LOCATION_SVALKA));
+
+    // Снапшот клиента на базе содержит только игроков базы.
+    match expect_message(&mut session, &client, |message| {
+        matches!(message, Message::Snapshot { .. })
+    }) {
+        Message::Snapshot { players, .. } => {
+            assert_eq!(players.len(), 1, "чужие локации в снапшот не попадают");
+            assert_eq!(players[0].player_id, player_id);
+        }
+        other => unreachable!("предикат гарантирует Snapshot: {other:?}"),
+    }
+    assert_eq!(
+        session.simulation().player_count(),
+        1,
+        "база: только клиент"
+    );
+    assert_eq!(
+        session
+            .simulation_at(LOCATION_SVALKA)
+            .unwrap()
+            .player_count(),
+        1,
+        "Свалка: только разведчик"
+    );
+}
+
+#[test]
+fn transition_walks_kordon_and_back_with_deposit() {
+    let (mut session, _addr) = test_world_session(10);
+    let player_id = session.debug_spawn();
+    let catalog = test_catalog();
+    let bolt = catalog.index_of("bolt").unwrap();
+    assert_eq!(session.debug_give(player_id, "bolt", 3).unwrap(), 3);
+
+    // База: идём в ворота (0,0,-20) — переход на Кордон.
+    walk_to(
+        session.simulation(),
+        player_id,
+        Vec3::new(0.0, 0.0, -20.0),
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 20, |session| {
+            session.player_location(player_id) == Some(LOCATION_KORDON)
+        }),
+        "переход на Кордон не сработал"
+    );
+    let state = session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .player_state(player_id)
+        .unwrap();
+    assert!(
+        state.position.distance(Vec3::new(0.0, 0.0, 22.0)) < 0.5,
+        "точка прибытия у ворот Кордона: {:?}",
+        state.position
+    );
+    assert!(
+        state
+            .inventory
+            .iter()
+            .flatten()
+            .any(|stack| stack.item == bolt && stack.count == 3),
+        "лут едет с игроком"
+    );
+
+    // Кордон: идём в зону «База» (0,0,26) — возвращаемся с лутом.
+    walk_to(
+        session.simulation_at(LOCATION_KORDON).unwrap(),
+        player_id,
+        Vec3::new(0.0, 0.0, 26.0),
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 40, |session| {
+            session.player_location(player_id) == Some(LOCATION_BASE)
+        }),
+        "возврат на базу не сработал"
+    );
+    let state = session.simulation().player_state(player_id).unwrap();
+    assert!(
+        state.position.distance(Vec3::new(0.0, 0.0, -16.0)) < 0.5,
+        "точка прибытия у ворот базы: {:?}",
+        state.position
+    );
+    assert!(
+        state.inventory.iter().all(Option::is_none),
+        "вход на базу сдаёт весь инвентарь"
+    );
+    assert_eq!(
+        session.stash_items(player_id),
+        &[Stack::new(bolt, 3)][..],
+        "лут переехал в склад"
+    );
+
+    // Точка прибытия вне зон перехода — петли нет.
+    poll_until(&mut session, 10, |_| false);
+    assert_eq!(session.player_location(player_id), Some(LOCATION_BASE));
+}
+
+#[test]
+fn bubble_teleports_to_kordon_arrivals_and_respawns() {
+    let (mut session, _addr) = test_world_session(10);
+    let player_id = session.debug_spawn();
+
+    // Активный пузырь Свалки: переносим игрока точно на его точку.
+    let before = session.active_bubbles(LOCATION_SVALKA);
+    assert!(!before.is_empty(), "на Свалке есть активные пузыри");
+    assert!(session.debug_teleport(player_id, LOCATION_SVALKA, before[0]));
+    assert!(
+        poll_until(&mut session, 20, |session| {
+            session.player_location(player_id) == Some(LOCATION_KORDON)
+        }),
+        "пузырь не унёс игрока на Кордон"
+    );
+    assert_eq!(
+        session.active_bubbles(LOCATION_SVALKA).len(),
+        before.len() - 1,
+        "сработавший пузырь гаснет"
+    );
+
+    // Высадка — в одной из точек прибытия Кордона («почти под базу»).
+    let state = session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .player_state(player_id)
+        .unwrap();
+    let arrivals = Scene::kordon().bubble_arrivals;
+    assert!(
+        arrivals
+            .iter()
+            .any(|arrival| arrival.distance(state.position) < 0.5),
+        "прибытие пузыря у ворот базы: {:?}",
+        state.position
+    );
+
+    // Через ~90 с использованный пузырь возвращается в свободную точку:
+    // шагаем по тику (память FixedStep ограничивает catch-up 8 шагами).
+    let consumed_tick = session.tick();
+    let mut respawned = false;
+    for _ in 0..6000 {
+        session.poll(Duration::from_millis(17));
+        if session.active_bubbles(LOCATION_SVALKA).len() == before.len() {
+            respawned = true;
+            break;
+        }
+    }
+    assert!(respawned, "пузырь должен вернуться в мир");
+    assert!(
+        session.tick() >= consumed_tick + 90 * 60,
+        "возврат не раньше 90 с: {} тиков",
+        session.tick() - consumed_tick
+    );
+}
+
+#[test]
+fn stash_put_take_over_udp_and_dedupe() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    let catalog = test_catalog();
+    let bolt = catalog.index_of("bolt").unwrap();
+    let medkit = catalog.index_of("medkit").unwrap();
+
+    // Кладём ячейку: склад получает стопку целиком.
+    assert_eq!(session.debug_give(player_id, "bolt", 3).unwrap(), 3);
+    client.stash_action(10, StashAction::Put { slot: 0 });
+    let reply = expect_message(&mut session, &client, |message| {
+        matches!(message, Message::StashUpdate { .. })
+    });
+    let Message::StashUpdate { items } = reply else {
+        unreachable!("предикат гарантирует StashUpdate: {reply:?}")
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].item, items[0].count), (bolt, 3));
+
+    // Повтор с тем же tick отброшен (дедупликация действий).
+    assert_eq!(session.debug_give(player_id, "medkit", 1).unwrap(), 1);
+    client.stash_action(10, StashAction::Put { slot: 0 });
+    for _ in 0..20 {
+        session.poll(Duration::from_millis(33));
+    }
+    let mut saw_medkit = false;
+    while let Some(message) = client.try_recv() {
+        if let Message::StashUpdate { items } = message {
+            saw_medkit = items.iter().any(|stack| stack.item == medkit);
+        }
+    }
+    assert!(!saw_medkit, "повтор с тем же tick не кладёт предмет");
+
+    // Новый tick — медикамент в складе рядом с болтами (стопки не сливаются).
+    client.stash_action(11, StashAction::Put { slot: 0 });
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::StashUpdate { items } if items.len() == 2),
+    );
+    assert_eq!(
+        session
+            .stash_items(player_id)
+            .iter()
+            .map(|stack| stack.item)
+            .collect::<Vec<_>>(),
+        [bolt, medkit]
+    );
+
+    // Забираем болты обратно: склад худеет, инвентарь полнеет.
+    client.stash_action(12, StashAction::Take { index: 0 });
+    expect_message(&mut session, &client, |message| {
+        matches!(message, Message::StashUpdate { items }
+            if items.iter().all(|stack| stack.item == medkit))
+    });
+    expect_message(&mut session, &client, |message| {
+        matches!(message, Message::InventoryUpdate { slots }
+            if slots.iter().flatten().any(|stack| stack.item == bolt && stack.count == 3))
+    });
+}
+
+#[test]
+fn stash_actions_require_base_location() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    assert_eq!(session.debug_give(player_id, "bolt", 2).unwrap(), 2);
+
+    // На Кордоне склад недоступен: действие молча отбрасывается.
+    assert!(session.debug_teleport(player_id, LOCATION_KORDON, Vec3::new(0.0, 0.0, 22.0)));
+    client.stash_action(20, StashAction::Put { slot: 0 });
+    for _ in 0..30 {
+        session.poll(Duration::from_millis(33));
+    }
+    let mut saw_stash = false;
+    while let Some(message) = client.try_recv() {
+        if matches!(message, Message::StashUpdate { .. }) {
+            saw_stash = true;
+        }
+    }
+    assert!(!saw_stash, "вне базы склад молчит");
+    assert!(session.stash_items(player_id).is_empty());
 }

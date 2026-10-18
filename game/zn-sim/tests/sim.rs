@@ -306,6 +306,64 @@ fn despawn_removes_player_and_inputs() {
     assert!(!sim.despawn_player(id));
 }
 
+// ── Перенос игрока между симуляциями (M4d) ──────────────────────────────
+
+/// Перенос состояния между локациями: позиция/инвентарь едут целиком, id
+/// сохраняется, новые id не сталкиваются; ячейки и весь инвентарь можно
+/// вынимать под склад с обновлением сети.
+#[test]
+fn player_takes_state_between_simulations() {
+    let catalog = test_catalog();
+    let mut kordon = Simulation::with_scene_and_catalog(&Scene::kordon(), catalog.clone());
+    let id = kordon.spawn_player(Vec3::new(0.0, 0.0, 22.0));
+    let bolt = catalog.index_of("bolt").unwrap();
+    let medkit = catalog.index_of("medkit").unwrap();
+    assert_eq!(kordon.give_stack(id, Stack::new(bolt, 5)), 5);
+    assert_eq!(kordon.give_stack(id, Stack::new(medkit, 1)), 1);
+
+    let mut command = ClientInput::new(0);
+    command.move_forward = 1.0;
+    kordon.queue_input(id, command);
+    kordon.step_once();
+    let before = kordon.player_state(id).unwrap();
+    assert!(before.velocity != Vec3::ZERO, "игрок в движении");
+    let updates = kordon.take_net_updates();
+    assert_eq!(updates.inventory.len(), 2, "выдачи пометили инвентарь");
+
+    let moved = kordon.take_player_state(id).expect("игрок был в Кордоне");
+    assert_eq!(moved.id, id);
+    assert_eq!(moved.position, before.position);
+    assert!(kordon.player_state(id).is_none());
+    assert_eq!(kordon.player_count(), 0);
+
+    let mut base = Simulation::with_scene_and_catalog(&Scene::base(), catalog);
+    assert_eq!(base.spawn_player_state(moved), id);
+    let after = base.player_state(id).unwrap();
+    assert_eq!(after.position, before.position);
+    assert_eq!(after.velocity, before.velocity);
+    assert_eq!(after.inventory[0], Some(Stack::new(bolt, 5)));
+    assert_eq!(after.inventory[1], Some(Stack::new(medkit, 1)));
+
+    // Свежие игроки не занимают id перенесённого.
+    let fresh = base.spawn_player(Vec3::ZERO);
+    assert!(fresh > id);
+
+    // Ячейка — в склад, остаток — авто-сдачей; сеть видит пустые ячейки.
+    assert_eq!(base.take_inventory_slot(id, 0), Some(Stack::new(bolt, 5)));
+    assert_eq!(base.take_inventory_all(id), vec![Stack::new(medkit, 1)]);
+    assert!(base
+        .player_state(id)
+        .unwrap()
+        .inventory
+        .iter()
+        .all(Option::is_none));
+    let updates = base.take_net_updates();
+    assert!(updates
+        .inventory
+        .iter()
+        .any(|(who, slots)| *who == id && slots.iter().all(Option::is_none)));
+}
+
 // ── Бой (M4a) ───────────────────────────────────────────────────────────
 
 /// Инпут с удержанием огня.

@@ -645,22 +645,36 @@ impl Simulation {
         id
     }
 
-    /// Убирает игрока и его буфер ввода. `false`, если игрока не было.
-    pub fn despawn_player(&mut self, id: u64) -> bool {
+    /// Спавнит игрока с готовым состоянием (перенос между локациями): id
+    /// сохраняется, счётчик новых id не откатывается.
+    pub fn spawn_player_state(&mut self, state: PlayerState) -> u64 {
+        let id = state.id;
+        self.next_player_id = self.next_player_id.max(id.saturating_add(1));
+        self.world.spawn((state,));
+        id
+    }
+
+    /// Убирает игрока и возвращает его состояние (перенос между локациями).
+    /// `None`, если игрока не было; буфер ввода и очередь действий чистятся.
+    pub fn take_player_state(&mut self, id: u64) -> Option<PlayerState> {
         let entity = self
             .world
             .query::<(Entity, &PlayerState)>()
             .iter()
             .find(|(_, state)| state.id == id)
-            .map(|(entity, _)| entity);
-        let Some(entity) = entity else {
-            return false;
-        };
+            .map(|(entity, _)| entity)?;
+        let state = self.player_state(id);
         self.clear_inputs(id);
         if let Some(queue) = self.world.get_resource_mut::<ActionQueue>() {
             queue.clear(id);
         }
-        self.world.despawn(entity)
+        self.world.despawn(entity);
+        state
+    }
+
+    /// Убирает игрока и его буфер ввода. `false`, если игрока не было.
+    pub fn despawn_player(&mut self, id: u64) -> bool {
+        self.take_player_state(id).is_some()
     }
 
     pub fn queue_input(&mut self, id: u64, command: ClientInput) {
@@ -833,15 +847,48 @@ impl Simulation {
     /// Отладка (консоль сервера): выдать предмет игроку — сколько влезет.
     /// Возвращает число выданных единиц.
     pub fn debug_give(&mut self, id: u64, item: u16, count: u32) -> u32 {
+        self.give_stack(id, Stack::new(item, count))
+    }
+
+    /// Выдаёт стопку игроку, сколько влезет по весу и ячейкам (взятие со
+    /// склада, отладка). Возвращает число перенесённых единиц; при переносе
+    /// помечает инвентарь «изменился» для сети.
+    pub fn give_stack(&mut self, id: u64, stack: Stack) -> u32 {
         let catalog = self.catalog();
         let moved = with_player(&mut self.world, id, |state| {
-            add_stack(&catalog, &mut state.inventory, Stack::new(item, count))
+            add_stack(&catalog, &mut state.inventory, stack)
         })
         .unwrap_or(0);
         if moved > 0 {
             push_inventory_update_of(&mut self.world, id);
         }
         moved
+    }
+
+    /// Вынимает стопку из ячейки инвентаря (положить в склад); при успехе
+    /// помечает инвентарь «изменился» для сети.
+    pub fn take_inventory_slot(&mut self, id: u64, slot: usize) -> Option<Stack> {
+        let stack = with_player(&mut self.world, id, |state| {
+            state.inventory.get_mut(slot).and_then(Option::take)
+        })
+        .flatten();
+        if stack.is_some() {
+            push_inventory_update_of(&mut self.world, id);
+        }
+        stack
+    }
+
+    /// Выгребает весь инвентарь игрока (авто-сдача на базе): ячейки пустеют,
+    /// при непустом результате сеть получает обновление инвентаря.
+    pub fn take_inventory_all(&mut self, id: u64) -> Vec<Stack> {
+        let items = with_player(&mut self.world, id, |state| {
+            drain_inventory(&mut state.inventory)
+        })
+        .unwrap_or_default();
+        if !items.is_empty() {
+            push_inventory_update_of(&mut self.world, id);
+        }
+        items
     }
 
     /// Копия каталога предметов: мутации инвентаря не должны держать
