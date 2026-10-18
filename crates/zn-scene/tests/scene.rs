@@ -157,7 +157,39 @@ mod tests {
         assert_eq!(object.effective_collider(), Some(ColliderShape::Box));
         assert_eq!(object.loot, None);
         assert!(!object.is_container());
+        // Материал поверхности (M4g) в старом RON отсутствует — дефолты.
+        assert_eq!(object.texture, None);
+        assert_eq!(object.uv_scale, 1.0);
+        assert!(!object.world_uv);
+        assert_eq!(object.roughness, None);
+        assert_eq!(object.metallic, None);
+        assert_eq!(object.emissive, None);
+        assert!(!object.has_material_overrides());
         assert!(scene.anomalies.is_empty());
+    }
+
+    #[test]
+    fn material_fields_roundtrip_and_defaults() {
+        let mut scene = Scene::new("materials");
+        scene.add(
+            SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE)
+                .with_texture("builtin://concrete", 8.0, true)
+                .with_roughness(0.4)
+                .with_metallic(0.1)
+                .with_emissive(Vec3::new(0.2, 0.3, 0.4)),
+        );
+
+        let text = scene.to_ron().unwrap();
+        let loaded = Scene::from_ron(&text).unwrap();
+        assert_eq!(loaded, scene);
+        let object = &loaded.objects[0];
+        assert_eq!(object.texture.as_deref(), Some("builtin://concrete"));
+        assert_eq!(object.uv_scale, 8.0);
+        assert!(object.world_uv);
+        assert_eq!(object.roughness, Some(0.4));
+        assert_eq!(object.metallic, Some(0.1));
+        assert_eq!(object.emissive, Some(Vec3::new(0.2, 0.3, 0.4)));
+        assert!(object.has_material_overrides());
     }
 
     #[test]

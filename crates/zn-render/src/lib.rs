@@ -1,9 +1,11 @@
 pub mod camera;
 pub mod mesh;
+pub mod object_material;
 pub mod renderer;
 
 pub use camera::Camera;
 pub use mesh::{cpu_mesh_vertices, cube_geometry, GpuMesh, Vertex};
+pub use object_material::MaterialSpec;
 pub use renderer::cull::{self, Frustum};
 pub use renderer::{
     directional_shadow_matrix, Cache, DrawBatch, DrawList, InstanceRaw, MaterialId, MaterialParams,

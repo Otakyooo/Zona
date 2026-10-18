@@ -19,7 +19,8 @@ use zn_net::{
 };
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
-    cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer,
+    cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MaterialSpec, MeshId,
+    Renderer,
 };
 use zn_scene::{AnomalyKind, LocationId, Scene, SceneObject, LOCATION_BASE};
 use zn_sim::{
@@ -292,6 +293,8 @@ pub struct ClientApp {
     assets: HashMap<String, AssetState>,
     /// Материалы с `AlphaMode::Blend` — для back-to-front сортировки кадра.
     blend_materials: HashSet<MaterialId>,
+    /// Персональные материалы объектов сцены (M4g): спека → GPU-материал.
+    scene_materials: HashMap<MaterialSpec, MaterialId>,
     /// Трейсеры выстрелов: свои — локальный отклик, чужие — события Shot.
     tracers: Vec<Tracer>,
     /// Вспышки у дула.
@@ -502,6 +505,7 @@ impl ClientApp {
             asset_loader: loader,
             assets,
             blend_materials: HashSet::new(),
+            scene_materials: HashMap::new(),
             tracers: Vec::new(),
             flashes: Vec::new(),
             next_local_fire_tick: 0,
@@ -737,26 +741,55 @@ impl ClientApp {
                 }
             }
         }
+
+        // Персональные материалы объектов сцены (M4g) — после ассетов.
+        self.ensure_scene_materials();
+    }
+
+    /// Регистрирует персональные материалы объектов сцены (M4g): текстура,
+    /// тайлинг, факторы. Материалы кэшируются по спеке — одинаковые объекты
+    /// рисуются одним материалом и батчатся.
+    fn ensure_scene_materials(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        for object in &self.scene.objects {
+            let Some(spec) = MaterialSpec::from_object(object) else {
+                continue;
+            };
+            if self.scene_materials.contains_key(&spec) {
+                continue;
+            }
+            let (material, images) = spec.to_material();
+            let refs: Vec<Option<&zn_assets::CpuImage>> =
+                images.iter().map(|image| image.as_ref()).collect();
+            let id = renderer.register_material(&material, &refs);
+            self.scene_materials.insert(spec, id);
+        }
     }
 
     /// Пары (меш, материал) для draw list; незагруженное → builtin fallback.
-    /// Приоритет материала: имя объекта → индекс материала примитива (glTF)
-    /// → первый материал ассета → дефолтный.
+    /// Приоритет материала: персональный (M4g) → имя объекта → индекс материала
+    /// примитива (glTF) → первый материал ассета → дефолтный.
     fn resolve_asset(&self, object: &SceneObject) -> Vec<(MeshId, MaterialId)> {
         let Some(renderer) = self.renderer.as_ref() else {
             return vec![(0, 0)];
         };
         let cube = renderer.builtin_cube_mesh();
         let default = renderer.default_material();
+        // Персональный материал объекта (M4g) перекрывает материалы ассета.
+        let override_material = MaterialSpec::from_object(object)
+            .and_then(|spec| self.scene_materials.get(&spec).copied());
         let key = object.asset_key();
 
         if let Some(name) = zn_assets::parse_builtin_key(key) {
+            let material = override_material.unwrap_or(default);
             return vec![if name == "cube" {
-                (cube, default)
+                (cube, material)
             } else {
                 self.builtin_mesh_ids
                     .get(name)
-                    .map_or((cube, default), |id| (*id, default))
+                    .map_or((cube, material), |id| (*id, material))
             }];
         }
 
@@ -767,7 +800,7 @@ impl ClientApp {
                 materials,
             }) => {
                 if meshes.is_empty() {
-                    return vec![(cube, default)];
+                    return vec![(cube, override_material.unwrap_or(default))];
                 }
                 // Имя материала объекта — для всех примитивов сразу.
                 if let Some(name) = object.material.as_deref() {
@@ -775,7 +808,8 @@ impl ClientApp {
                         .iter()
                         .find(|(material_name, _)| material_name.as_deref() == Some(name))
                     {
-                        return meshes.iter().map(|mesh| (*mesh, *id)).collect();
+                        let material = override_material.unwrap_or(*id);
+                        return meshes.iter().map(|mesh| (*mesh, material)).collect();
                     }
                     log::debug!("материал '{name}' не найден в '{key}' — по примитивам");
                 }
@@ -792,11 +826,11 @@ impl ClientApp {
                             })
                             .or_else(|| materials.first().map(|(_, id)| *id))
                             .unwrap_or(default);
-                        (*mesh, material)
+                        (*mesh, override_material.unwrap_or(material))
                     })
                     .collect()
             }
-            _ => vec![(cube, default)],
+            _ => vec![(cube, override_material.unwrap_or(default))],
         }
     }
 

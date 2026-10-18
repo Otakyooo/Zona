@@ -411,6 +411,24 @@ pub struct SceneObject {
     /// Фиксированный лут: наличие превращает объект в обыскиваемый контейнер.
     #[serde(default)]
     pub loot: Option<Vec<LootEntry>>,
+    /// Текстура альбедо (M4g): `builtin://…` или ключ ассета.
+    #[serde(default)]
+    pub texture: Option<String>,
+    /// Тайлинг текстур (M4g): множитель текстурных координат.
+    #[serde(default = "default_uv_scale")]
+    pub uv_scale: f32,
+    /// Мировые (box) UV вместо UV меша (M4g) — для стен, полов и завалов.
+    #[serde(default)]
+    pub world_uv: bool,
+    /// Переопределение шероховатости (M4g).
+    #[serde(default)]
+    pub roughness: Option<f32>,
+    /// Переопределение металличности (M4g).
+    #[serde(default)]
+    pub metallic: Option<f32>,
+    /// Свечение (M4g), линейный цвет: лампы, знаки, экраны.
+    #[serde(default)]
+    pub emissive: Option<Vec3>,
 }
 
 fn default_color() -> Vec4 {
@@ -419,6 +437,10 @@ fn default_color() -> Vec4 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_uv_scale() -> f32 {
+    1.0
 }
 
 /// Ящик лут-контейнера: куб 0.8 м у пола с фиксированным содержимым.
@@ -456,6 +478,12 @@ impl SceneObject {
             collider: None,
             solid: true,
             loot: None,
+            texture: None,
+            uv_scale: 1.0,
+            world_uv: false,
+            roughness: None,
+            metallic: None,
+            emissive: None,
         }
     }
 
@@ -502,6 +530,47 @@ impl SceneObject {
     pub fn with_loot(mut self, loot: Vec<LootEntry>) -> Self {
         self.loot = Some(loot);
         self
+    }
+
+    /// Текстура альбедо (M4g) с тайлингом; `world_uv` — box-проекция по миру.
+    pub fn with_texture(
+        mut self,
+        texture: impl Into<String>,
+        uv_scale: f32,
+        world_uv: bool,
+    ) -> Self {
+        self.texture = Some(texture.into());
+        self.uv_scale = uv_scale;
+        self.world_uv = world_uv;
+        self
+    }
+
+    /// Шероховатость поверхности (M4g), 0..1.
+    pub fn with_roughness(mut self, roughness: f32) -> Self {
+        self.roughness = Some(roughness);
+        self
+    }
+
+    /// Металличность поверхности (M4g), 0..1.
+    pub fn with_metallic(mut self, metallic: f32) -> Self {
+        self.metallic = Some(metallic);
+        self
+    }
+
+    /// Свечение (M4g), линейный цвет — лампы и светящиеся знаки.
+    pub fn with_emissive(mut self, emissive: Vec3) -> Self {
+        self.emissive = Some(emissive);
+        self
+    }
+
+    /// Задан ли персональный материал (M4g): текстура, тайлинг или факторы.
+    pub fn has_material_overrides(&self) -> bool {
+        self.texture.is_some()
+            || self.world_uv
+            || self.roughness.is_some()
+            || self.metallic.is_some()
+            || self.emissive.is_some()
+            || (self.uv_scale - 1.0).abs() > f32::EPSILON
     }
 
     /// Обыскиваемый контейнер: у объекта задан фиксированный лут.

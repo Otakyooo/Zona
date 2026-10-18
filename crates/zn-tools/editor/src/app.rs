@@ -11,7 +11,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowId;
 
-use zn_render::{Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer};
+use zn_render::{Camera, DrawList, InstanceRaw, MaterialId, MaterialSpec, MeshId, Renderer};
 use zn_scene::{ColliderShape, Scene, SceneObject};
 
 use crate::gizmo::{self, GizmoDelta, GizmoMode, GizmoState};
@@ -70,6 +70,8 @@ pub struct EditorApp {
     pending_place: Option<String>,
     assets: HashMap<String, LoadedAsset>,
     builtin_meshes: HashMap<String, MeshId>,
+    /// Персональные материалы объектов (M4g): спека → GPU-материал.
+    scene_materials: HashMap<MaterialSpec, MaterialId>,
     asset_files: Vec<String>,
     place_scale: f32,
     place_color: [f32; 4],
@@ -108,6 +110,7 @@ impl EditorApp {
             pending_place: None,
             assets: HashMap::new(),
             builtin_meshes: HashMap::new(),
+            scene_materials: HashMap::new(),
             asset_files: Vec::new(),
             place_scale: PLACE_SCALE_DEFAULT,
             place_color: [0.55, 0.55, 0.6, 1.0],
@@ -218,6 +221,29 @@ impl EditorApp {
             if !self.ensure_asset(&key) {
                 self.status = format!("ассет '{key}' не загружен — объекты показаны кубом");
             }
+        }
+        self.ensure_scene_materials();
+    }
+
+    /// Регистрирует персональные материалы объектов сцены (M4g): текстура,
+    /// тайлинг, факторы. Кэш по спеке — как в клиенте; вызывается каждый кадр,
+    /// чтобы правки свойств подхватывались сразу.
+    fn ensure_scene_materials(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        for object in &self.scene.objects {
+            let Some(spec) = MaterialSpec::from_object(object) else {
+                continue;
+            };
+            if self.scene_materials.contains_key(&spec) {
+                continue;
+            }
+            let (material, images) = spec.to_material();
+            let refs: Vec<Option<&zn_assets::CpuImage>> =
+                images.iter().map(|image| image.as_ref()).collect();
+            let id = renderer.register_material(&material, &refs);
+            self.scene_materials.insert(spec, id);
         }
     }
 
@@ -709,6 +735,100 @@ impl EditorApp {
                     }
                 });
 
+                // Материал поверхности (M4g): текстура, тайлинг, факторы.
+                ui.separator();
+                ui.label(RichText::new("Материал поверхности").strong());
+                ui.horizontal(|ui| {
+                    ui.label("texture");
+                    let mut texture = object.texture.clone().unwrap_or_default();
+                    let mut picked = false;
+                    egui::ComboBox::from_id_salt("object-texture")
+                        .selected_text(if texture.is_empty() {
+                            "—".to_string()
+                        } else {
+                            texture.trim_start_matches("builtin://").to_string()
+                        })
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(texture.is_empty(), "—").clicked() {
+                                texture.clear();
+                                picked = true;
+                            }
+                            for name in zn_assets::BUILTIN_TEXTURE_NAMES {
+                                let key = zn_assets::builtin_key(name);
+                                if ui.selectable_label(texture == key, *name).clicked() {
+                                    texture = key;
+                                    picked = true;
+                                }
+                            }
+                        });
+                    if picked {
+                        let had_texture = object.texture.is_some();
+                        object.texture = if texture.is_empty() {
+                            None
+                        } else {
+                            Some(texture)
+                        };
+                        // Первая текстура на кубах — сразу мировые UV: без
+                        // растяжения по граням (флажок ниже это переопределяет).
+                        if !had_texture && object.texture.is_some() {
+                            object.world_uv = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("uv scale");
+                    ui.add(
+                        egui::DragValue::new(&mut object.uv_scale)
+                            .speed(0.1)
+                            .range(0.05..=64.0),
+                    );
+                    let mut world_uv = object.world_uv;
+                    if ui.checkbox(&mut world_uv, "мировые UV").changed() {
+                        object.world_uv = world_uv;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("roughness");
+                    let mut enabled = object.roughness.is_some();
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        object.roughness = if enabled { Some(0.85) } else { None };
+                    }
+                    if let Some(value) = object.roughness.as_mut() {
+                        ui.add(egui::DragValue::new(value).speed(0.01).range(0.0..=1.0));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("metallic");
+                    let mut enabled = object.metallic.is_some();
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        object.metallic = if enabled { Some(0.0) } else { None };
+                    }
+                    if let Some(value) = object.metallic.as_mut() {
+                        ui.add(egui::DragValue::new(value).speed(0.01).range(0.0..=1.0));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("emissive");
+                    let mut enabled = object.emissive.is_some();
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        object.emissive = if enabled {
+                            Some(Vec3::new(0.8, 0.7, 0.4))
+                        } else {
+                            None
+                        };
+                    }
+                    if let Some(value) = object.emissive.as_mut() {
+                        let mut color = [value.x, value.y, value.z];
+                        if ui.color_edit_button_rgb(&mut color).changed() {
+                            *value = Vec3::from_array(color);
+                        }
+                    }
+                });
+                if object.has_material_overrides() {
+                    ui.label(RichText::new("персональный материал (M4g)").weak());
+                }
+                ui.separator();
+
                 let mut collider = object.collider;
                 egui::ComboBox::from_id_salt("collider")
                     .selected_text(
@@ -772,6 +892,9 @@ impl EditorApp {
         let mut list = DrawList::new();
         for object in &self.scene.objects {
             let key = object.asset_key();
+            // Персональный материал объекта (M4g) перекрывает материал ассета.
+            let override_material = MaterialSpec::from_object(object)
+                .and_then(|spec| self.scene_materials.get(&spec).copied());
             let (mesh, material) = self
                 .assets
                 .get(key)
@@ -795,7 +918,7 @@ impl EditorApp {
                 .unwrap_or((renderer.builtin_cube_mesh(), renderer.default_material()));
             list.push(
                 mesh,
-                material,
+                override_material.unwrap_or(material),
                 InstanceRaw {
                     model: object.model_matrix().to_cols_array(),
                     color: object.color.into(),
@@ -1084,6 +1207,8 @@ impl ApplicationHandler for EditorApp {
                     }
                 }
 
+                // Правки свойств материалов (M4g) подхватываются в этом кадре.
+                self.ensure_scene_materials();
                 let list = self.build_draw_list();
                 if let (Some(renderer), Some(ui_renderer)) =
                     (self.renderer.as_mut(), self.ui_renderer.as_mut())
