@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use zn_content::ItemCatalog;
 use zn_render::{DrawList, InstanceRaw, MaterialId, MeshId};
-use zn_scene::{Scene, SceneObject};
+use zn_scene::{LocationId, LocationRegistry, Scene, SceneObject};
 
 /// Корень контента по умолчанию (относительно cwd).
 pub const DEFAULT_CONTENT_ROOT: &str = "game/content";
-/// Имя уровня по умолчанию.
+/// Имя уровня по умолчанию (offline-режим).
 pub const DEFAULT_LEVEL: &str = "demo_zone";
 
 /// Ищет файл уровня `<content>/<levels>/<name>.scene.ron`; если нет — fallback
@@ -36,6 +37,74 @@ pub fn level_path(content_root: &Path, level: &str) -> PathBuf {
     content_root
         .join("levels")
         .join(format!("{level}.scene.ron"))
+}
+
+/// Мир локаций для клиента (M4d): реестр `<content>/locations.ron` и сцены
+/// каждой локации по id. Битые/отсутствующие файлы заменяются встроенным
+/// миром — той же логикой, что у сервера, чтобы хэш мира сошёлся.
+pub fn load_world(content_root: &Path) -> (LocationRegistry, HashMap<LocationId, Scene>) {
+    let registry_path = content_root.join("locations.ron");
+    let registry = match LocationRegistry::load_ron(&registry_path) {
+        Ok(registry) if !registry.locations.is_empty() => {
+            log::info!(
+                "реестр локаций загружен из {} ({} локаций)",
+                registry_path.display(),
+                registry.locations.len()
+            );
+            registry
+        }
+        Ok(_) => {
+            log::warn!(
+                "реестр локаций пуст ({}) — встроенный мир",
+                registry_path.display()
+            );
+            LocationRegistry::builtin()
+        }
+        Err(error) => {
+            log::warn!(
+                "реестр локаций не прочитан ({}): {error} — встроенный мир",
+                registry_path.display()
+            );
+            LocationRegistry::builtin()
+        }
+    };
+
+    let builtin: HashMap<LocationId, Scene> = Scene::builtin_world().into_iter().collect();
+    let mut scenes = HashMap::with_capacity(registry.locations.len());
+    for info in &registry.locations {
+        let scene = match registry.scene_path(content_root, info.id) {
+            Some(path) => match Scene::load_ron(&path) {
+                Ok(scene) => {
+                    log::info!(
+                        "локация '{}': загружена из {} ({} объектов)",
+                        info.name,
+                        path.display(),
+                        scene.len()
+                    );
+                    scene
+                }
+                Err(error) => {
+                    log::warn!(
+                        "локация '{}': {} не прочитана ({error}) — встроенная сцена",
+                        info.name,
+                        path.display()
+                    );
+                    builtin_scene(&builtin, info.id)
+                }
+            },
+            None => builtin_scene(&builtin, info.id),
+        };
+        scenes.insert(info.id, scene);
+    }
+    (registry, scenes)
+}
+
+/// Встроенная сцена локации по id; нет такой — пустая сцена-заглушка.
+fn builtin_scene(builtin: &HashMap<LocationId, Scene>, id: LocationId) -> Scene {
+    builtin
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| Scene::new(format!("location_{id}")))
 }
 
 /// Ищет каталог предметов `<content>/items/items.ron`; при ошибке — пустой
@@ -124,6 +193,46 @@ mod tests {
         let (loaded, ok) = load_level(&root, "test_level");
         assert!(ok);
         assert_eq!(loaded, scene);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn load_world_falls_back_to_builtin_scenes() {
+        let root = std::env::temp_dir().join("zn-client-no-such-world-root");
+        let (registry, scenes) = load_world(&root);
+        assert_eq!(registry.locations.len(), 4);
+        assert_eq!(scenes.len(), 4);
+        assert_eq!(scenes[&zn_scene::LOCATION_BASE].name, "base");
+        assert!(!scenes[&zn_scene::LOCATION_SVALKA].is_empty());
+    }
+
+    #[test]
+    fn load_world_prefers_scenes_from_disk() {
+        let root = std::env::temp_dir().join("zn-client-world-from-disk");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("levels")).unwrap();
+
+        // Реестр — встроенный, но сцена Базы на диске помечена позицией спавна.
+        LocationRegistry::builtin()
+            .save_ron(root.join("locations.ron"))
+            .unwrap();
+        let mut base = Scene::new("base_from_disk");
+        base.spawn = glam::Vec3::new(1.0, 0.0, 2.0);
+        base.add(
+            SceneObject::new(glam::Vec3::ZERO, glam::Vec3::ONE, glam::Vec4::ONE)
+                .with_asset(zn_scene::BUILTIN_CUBE),
+        );
+        base.save_ron(root.join("levels").join("base.scene.ron"))
+            .unwrap();
+
+        let (_, scenes) = load_world(&root);
+        assert_eq!(scenes[&zn_scene::LOCATION_BASE].name, "base_from_disk");
+        assert_eq!(
+            scenes[&zn_scene::LOCATION_BASE].spawn,
+            glam::Vec3::new(1.0, 0.0, 2.0)
+        );
+        // Остальные локации — встроенный fallback.
+        assert!(!scenes[&zn_scene::LOCATION_KORDON].is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 

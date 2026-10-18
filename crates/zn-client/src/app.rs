@@ -15,13 +15,13 @@ use zn_core::{FixedStep, SIMULATION_HZ};
 use zn_input::InputState;
 use zn_net::{
     dequantize_pos, dequantize_yaw, BoltNet, CorpseNet, GameEvent, GroundItemNet, InventoryAction,
-    ItemStackNet, PlayerNetState, CLIENT_TIMEOUT, INPUT_REDUNDANCY,
+    ItemStackNet, PlayerNetState, StashAction, CLIENT_TIMEOUT, INPUT_REDUNDANCY,
 };
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
     cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MeshId, Renderer,
 };
-use zn_scene::{AnomalyKind, Scene, SceneObject};
+use zn_scene::{AnomalyKind, LocationId, Scene, SceneObject, LOCATION_BASE};
 use zn_sim::{
     ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING,
     INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS, INVENTORY_SLOTS,
@@ -31,7 +31,7 @@ use zn_sim::{
 use crate::assets::{AssetEvent, AssetLoader};
 use crate::interp::{player_color, InterpolatedPlayer, INTERP_DELAY_TICKS};
 use crate::level::{
-    build_draw_list, load_catalog, load_level, DEFAULT_CONTENT_ROOT, DEFAULT_LEVEL,
+    build_draw_list, load_catalog, load_level, load_world, DEFAULT_CONTENT_ROOT, DEFAULT_LEVEL,
 };
 use crate::net::{NetClient, NetEvent, NetStatus};
 use crate::prediction::{reconcile, ErrorSmoother, InputHistory};
@@ -97,6 +97,13 @@ const ANOMALY_FLASH_COLOR: Vec4 = Vec4::new(1.0, 0.95, 0.75, 0.8);
 const BOLT_THICKNESS: f32 = 0.05;
 const BOLT_LENGTH: f32 = 0.34;
 const BOLT_COLOR: Vec4 = Vec4::new(0.85, 0.86, 0.8, 1.0);
+
+/// Мир локаций (M4d): вспышка при смене локации и вид активных пузырей.
+const TP_FLASH_TTL: Duration = Duration::from_millis(260);
+/// Радиус пузыря, если якорь не совпал ни с одним кандидатом сцены.
+const BUBBLE_DEFAULT_RADIUS: f32 = 1.2;
+const BUBBLE_COLOR: [f32; 3] = [0.45, 0.75, 1.0];
+const BUBBLE_ALPHA: f32 = 0.22;
 
 /// Интервал диагностического лога reconciliation, с.
 const RECONCILE_LOG_INTERVAL_SECS: f32 = 5.0;
@@ -184,10 +191,12 @@ struct OpenContainer {
     items: Vec<ItemStackNet>,
 }
 
-/// Фокус панелей, когда открыты обе: ↑/↓ и Enter работают с ним.
+/// Фокус панелей, когда открыто больше одной: ↑/↓ и Enter работают с ним.
+/// Порядок фокуса слева направо: контейнер, склад, инвентарь.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PanelFocus {
     Container,
+    Stash,
     Inventory,
 }
 
@@ -223,8 +232,10 @@ struct ContainerHud {
     title: String,
     items: Vec<HudItemStack>,
     select: usize,
-    /// Фокус ввода на панели (когда открыты обе: ←/→).
+    /// Фокус ввода на панели (когда открыто больше одной: ←/→).
     focused: bool,
+    /// Подсказка клавиш внизу панели (склад); обыск — без подсказки.
+    hint: Option<String>,
 }
 
 /// Срез состояния для отрисовки HUD (собирается до заимствования renderer).
@@ -245,8 +256,12 @@ struct HudData {
     inventory: Option<InventoryHud>,
     /// Панель обыска (сервер держит контейнер открытым).
     container: Option<ContainerHud>,
+    /// Панель склада базы (открыта клавишей H на базе).
+    stash: Option<ContainerHud>,
     /// Полоска лечения: доля оставшегося времени (1.0 — только началась).
     healing: Option<f32>,
+    /// Вспышка смены локации: доля времени жизни (1.0 — только что перешёл).
+    flash: Option<f32>,
 }
 
 pub struct ClientApp {
@@ -322,7 +337,7 @@ pub struct ClientApp {
     open_container: Option<OpenContainer>,
     /// Панель инвентаря открыта (клавиша I).
     inventory_open: bool,
-    /// Фокус панелей при открытых обеих (←/→).
+    /// Фокус панелей при нескольких открытых (←/→).
     panel_focus: PanelFocus,
     /// Выбранная ячейка инвентаря (сетка 8×5).
     inventory_select: usize,
@@ -334,32 +349,90 @@ pub struct ClientApp {
     interact_hint: Option<HintKind>,
     /// Монотонный счётчик действий — дедупликация повторов на сервере.
     action_seq: u64,
+    /// Мир локаций (M4d): сцены по id; пусто в одиночном режиме.
+    scenes: HashMap<LocationId, Scene>,
+    /// Имена локаций мира (`locations.ron`); пусто в одиночном режиме.
+    location_names: HashMap<LocationId, String>,
+    /// Текущая локация игрока (0 в одиночном режиме).
+    location: LocationId,
+    /// Активные пузыри текущей локации (якоря из снапшота).
+    world_bubbles: Vec<Vec3>,
+    /// Вспышка смены локации: белый экран гаснет до этого мгновения.
+    tp_flash: Option<Instant>,
+    /// Содержимое склада базы (последний `StashUpdate`).
+    stash_items: Vec<ItemStackNet>,
+    /// Панель склада открыта (клавиша H, только на базе).
+    stash_open: bool,
+    /// Выбранная строка склада.
+    stash_select: usize,
 }
 
 impl ClientApp {
     /// Новая offline-сессия клиента: уровень с диска (или demo_zone-fallback),
     /// симуляция с коллайдерами сцены, фоновый загрузчик ассетов.
     pub fn with_content(content_root: impl Into<PathBuf>, level: &str) -> Self {
-        Self::new_session(content_root, level, None)
+        Self::new_session(content_root, Some(level), None)
     }
 
-    /// Сессия клиента с подключением к серверу (`--server host:port`);
-    /// движение до/без сервера — локальное предсказание.
+    /// Сессия клиента с подключением к серверу (`--server host:port`); движение
+    /// до/без сервера — локальное предсказание. `level` — одиночная сцена
+    /// (`--level`); без него загружается мир локаций и его хэш.
     pub fn with_server(
         server: impl Into<String>,
         content_root: impl Into<PathBuf>,
-        level: &str,
+        level: Option<&str>,
     ) -> Self {
         Self::new_session(content_root, level, Some(server.into()))
     }
 
-    fn new_session(content_root: impl Into<PathBuf>, level: &str, server: Option<String>) -> Self {
+    fn new_session(
+        content_root: impl Into<PathBuf>,
+        level: Option<&str>,
+        server: Option<String>,
+    ) -> Self {
         let content_root = content_root.into();
-        let (scene, _) = load_level(&content_root, level);
-        log::info!("уровень '{}': {} объектов", scene.name, scene.len());
-
         let catalog = load_catalog(&content_root);
         let items_hash = catalog.content_hash();
+
+        // Одиночная сцена (`--level`) или мир локаций: мир — когда уровня нет
+        // (обязан сходиться по `world_content_hash` с сервером).
+        let mut scenes: HashMap<LocationId, Scene> = HashMap::new();
+        let mut location_names: HashMap<LocationId, String> = HashMap::new();
+        let (scene, content_hash) = match level {
+            Some(level) => {
+                let (scene, _) = load_level(&content_root, level);
+                log::info!("уровень '{}': {} объектов", scene.name, scene.len());
+                let hash = scene.content_hash();
+                (scene, hash)
+            }
+            None => {
+                let (registry, world) = load_world(&content_root);
+                for (id, scene) in &world {
+                    scenes.insert(*id, scene.clone());
+                }
+                for info in &registry.locations {
+                    location_names.insert(info.id, info.name.clone());
+                }
+                let base_id = registry.base_id().unwrap_or(LOCATION_BASE);
+                let scene = world
+                    .get(&base_id)
+                    .cloned()
+                    .unwrap_or_else(Scene::demo_zone);
+                let mut ids: Vec<LocationId> = world.keys().copied().collect();
+                ids.sort_unstable();
+                let refs: Vec<(LocationId, &Scene)> =
+                    ids.iter().map(|id| (*id, &world[id])).collect();
+                let hash = zn_scene::world_content_hash(&registry, &refs);
+                log::info!(
+                    "мир локаций: {} локаций, старт на '{}' ({} объектов)",
+                    world.len(),
+                    scene.name,
+                    scene.len()
+                );
+                (scene, hash)
+            }
+        };
+
         let mut simulation = Simulation::with_scene_and_catalog(&scene, catalog.clone());
         let player_id = simulation.spawn_player(scene.spawn);
         let camera = Camera::new(
@@ -369,7 +442,7 @@ impl ClientApp {
         );
 
         let net = server.and_then(|addr| {
-            match NetClient::connect(&addr, scene.content_hash(), items_hash, CLIENT_NAME) {
+            match NetClient::connect(&addr, content_hash, items_hash, CLIENT_NAME) {
                 Ok(net) => {
                     log::info!("подключаемся к серверу {addr}");
                     Some(net)
@@ -381,9 +454,14 @@ impl ClientApp {
             }
         });
 
+        // Внешние ассеты — из активной сцены и всех локаций мира.
         let mut assets = HashMap::new();
         let loader = AssetLoader::new(&content_root);
-        for object in &scene.objects {
+        for object in scenes
+            .values()
+            .flat_map(|scene| scene.objects.iter())
+            .chain(scene.objects.iter())
+        {
             let key = object.asset_key().to_string();
             if key.starts_with("builtin://") {
                 continue;
@@ -396,6 +474,12 @@ impl ClientApp {
         if assets.is_empty() {
             log::info!("внешних ассетов в уровне нет — только встроенные примитивы");
         }
+
+        let location = location_names
+            .keys()
+            .copied()
+            .min()
+            .unwrap_or(LOCATION_BASE);
 
         Self {
             renderer: None,
@@ -449,6 +533,14 @@ impl ClientApp {
             healing: None,
             interact_hint: None,
             action_seq: 0,
+            scenes,
+            location_names,
+            location,
+            world_bubbles: Vec::new(),
+            tp_flash: None,
+            stash_items: Vec::new(),
+            stash_open: false,
+            stash_select: 0,
         }
     }
 
@@ -474,6 +566,78 @@ impl ClientApp {
         self.cursor_grabbed = grab;
     }
 
+    /// Имя локации для логов и титула; пусто — локации нет в реестре (одиночный
+    /// режим без имён).
+    fn location_name(&self, location: LocationId) -> &str {
+        self.location_names
+            .get(&location)
+            .map_or("", String::as_str)
+    }
+
+    /// Склад доступен только в сети и только на базе.
+    fn stash_available(&self) -> bool {
+        self.net.is_some() && self.location == LOCATION_BASE
+    }
+
+    /// Открытые панели в порядке фокуса слева направо.
+    fn open_panels(&self) -> Vec<PanelFocus> {
+        let mut panels = Vec::with_capacity(3);
+        if self.open_container.is_some() {
+            panels.push(PanelFocus::Container);
+        }
+        if self.stash_open && self.stash_available() {
+            panels.push(PanelFocus::Stash);
+        }
+        if self.inventory_open {
+            panels.push(PanelFocus::Inventory);
+        }
+        panels
+    }
+
+    /// Переход в локацию мира (Welcome или `LocationChanged`): сцена и коллайдеры
+    /// меняются, локальный игрок переносится в точку прибытия, экран вспыхивает.
+    /// `None` в `yaw` — поворот спавна сцены.
+    fn enter_location(&mut self, location: LocationId, position: [f32; 3], yaw: Option<f32>) {
+        let Some(scene) = self.scenes.get(&location).cloned() else {
+            log::warn!("локация {location} отсутствует в загруженном мире — остаёмся");
+            return;
+        };
+        let position = Vec3::from_array(position);
+        self.scene = scene;
+        self.simulation = Simulation::with_scene_and_catalog(&self.scene, self.catalog.clone());
+        self.player_id = self.simulation.spawn_player(position);
+        // Поворот прибытия: спавн смотрит по +X сцены — ставим целевой yaw.
+        if let Some(mut state) = self
+            .simulation
+            .player_state(self.player_id)
+            .map(|state| state.net_state())
+        {
+            state.yaw = yaw.unwrap_or(self.scene.spawn_yaw);
+            let _ = self.simulation.restore_player(self.player_id, &state);
+        }
+        self.history = InputHistory::new();
+        self.smoother = ErrorSmoother::default();
+        self.remote.clear();
+        self.world_loot.clear();
+        self.world_corpses.clear();
+        self.world_bolts.clear();
+        self.world_bubbles.clear();
+        self.revealed.clear();
+        self.anomaly_flashes.clear();
+        self.open_container = None;
+        self.location = location;
+        self.tp_flash = Some(Instant::now() + TP_FLASH_TTL);
+        if !self.stash_available() {
+            self.stash_open = false;
+        }
+        self.sync_camera_from_simulation();
+        log::info!(
+            "локация '{}' (id {location}): {} объектов",
+            self.scene.name,
+            self.scene.len()
+        );
+    }
+
     /// Регистрирует загруженные ассеты в GPU-кэшах и добирает builtin-меши
     /// (sphere/cylinder/quad), встречающиеся в сцене.
     fn register_loaded_assets(&mut self) {
@@ -485,12 +649,16 @@ impl ClientApp {
             if *name == "cube" || self.builtin_mesh_ids.contains_key(*name) {
                 continue;
             }
-            if !self
+            // Меш нужен, если он встречается в текущей сцене или любой локации
+            // мира — при смене локации builtin-кэш должен быть готов.
+            let wanted = format!("builtin://{name}");
+            let present = self
                 .scene
                 .objects
                 .iter()
-                .any(|object| object.asset_key() == format!("builtin://{name}"))
-            {
+                .chain(self.scenes.values().flat_map(|scene| scene.objects.iter()))
+                .any(|object| object.asset_key() == wanted);
+            if !present {
                 continue;
             }
             if let Some(mesh) = zn_assets::builtin_mesh(name) {
@@ -800,6 +968,36 @@ impl ClientApp {
             );
         }
 
+        // Активные пузыри локации (M4d): полупрозрачные сферы у пола; набор
+        // приходит снапшотом и меняется при использовании/респавне. Радиус —
+        // у кандидата сцены, если якорь с ним совпал.
+        for anchor in &self.world_bubbles {
+            let radius = self
+                .scene
+                .bubbles
+                .iter()
+                .find(|bubble| (bubble.position - *anchor).length_squared() < 1e-4)
+                .map_or(BUBBLE_DEFAULT_RADIUS, |bubble| bubble.radius);
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::splat(radius * 2.0),
+                Quat::IDENTITY,
+                *anchor + Vec3::Y * radius,
+            );
+            list.push(
+                sphere,
+                anomaly_material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: [
+                        BUBBLE_COLOR[0],
+                        BUBBLE_COLOR[1],
+                        BUBBLE_COLOR[2],
+                        BUBBLE_ALPHA,
+                    ],
+                },
+            );
+        }
+
         // Болты в полёте (M4c): палочка по направлению движения, позиция —
         // интерполяция между снапшотами (offline — из локальной симуляции).
         for view in &self.world_bolts {
@@ -1060,8 +1258,9 @@ impl ClientApp {
     }
 
     /// Действия вне инпутов: E (обыск/подбор/закрыть), G (бросок болта),
-    /// I (инвентарь), T (взять всё), Q (выбросить), Enter (взять/использовать),
-    /// стрелки (навигация). Панели passive — курсор остаётся в игре.
+    /// I (инвентарь), H (склад на базе), T (взять всё), Q (выбросить),
+    /// Enter (взять/использовать/сдать), стрелки (навигация). Панели passive —
+    /// курсор остаётся в игре.
     fn handle_action_keys(&mut self) {
         if self.input.just_pressed(KeyCode::KeyE) {
             self.send_action(PlayerAction::Interact);
@@ -1071,6 +1270,12 @@ impl ClientApp {
         }
         if self.input.just_pressed(KeyCode::KeyI) {
             self.inventory_open = !self.inventory_open;
+        }
+        if self.input.just_pressed(KeyCode::KeyH) && self.stash_available() {
+            self.stash_open = !self.stash_open;
+            if self.stash_open {
+                self.panel_focus = PanelFocus::Stash;
+            }
         }
         if self.input.just_pressed(KeyCode::KeyT) {
             if let Some(container) = self.open_container.as_ref().map(|open| open.container) {
@@ -1106,8 +1311,19 @@ impl ClientApp {
         }
     }
 
-    /// Enter: взять выбранную строку контейнера (фокус на контейнере) или
-    /// использовать предмет инвентаря (фокус на инвентаре).
+    /// Отправляет действие склада: серверу (с повтором `INPUT_REDUNDANCY` раз).
+    /// Offline склад недоступен (`stash_available` гейтит панель).
+    fn send_stash_action(&mut self, action: StashAction) {
+        self.action_seq += 1;
+        let tick = self.action_seq;
+        if let Some(net) = self.net.as_mut() {
+            net.send_stash_action(tick, action);
+        }
+    }
+
+    /// Enter: взять выбранную строку контейнера (фокус на контейнере), взять
+    /// стопку со склада или сдать туда ячейку инвентаря (склад открыт),
+    /// иначе — использовать предмет инвентаря.
     fn press_enter(&mut self) {
         match self.effective_focus() {
             Some(PanelFocus::Container) => {
@@ -1124,8 +1340,27 @@ impl ClientApp {
                     index,
                 }));
             }
+            Some(PanelFocus::Stash) => {
+                if self.stash_select >= self.stash_items.len() {
+                    return;
+                }
+                self.send_stash_action(StashAction::Take {
+                    index: self.stash_select as u16,
+                });
+            }
             Some(PanelFocus::Inventory) => {
                 let slot = self.inventory_select.min(INVENTORY_SLOTS - 1);
+                // Открытый склад превращает Enter в «сдать ячейку».
+                if self.stash_open && self.stash_available() {
+                    let occupied = self
+                        .inventory
+                        .get(slot)
+                        .is_some_and(|stack| stack.is_some());
+                    if occupied {
+                        self.send_stash_action(StashAction::Put { slot: slot as u8 });
+                    }
+                    return;
+                }
                 let usable = self
                     .inventory
                     .get(slot)
@@ -1158,18 +1393,24 @@ impl ClientApp {
         occupied.then_some(slot as u8)
     }
 
-    /// Эффективный фокус панелей: обе открыты — выбранный ←/→; одна — она.
+    /// Эффективный фокус панелей: одна открыта — она; несколько — выбранный
+    /// ←/→ (если фокус указывает на закрытую — первая открытая).
     fn effective_focus(&self) -> Option<PanelFocus> {
-        match (self.open_container.is_some(), self.inventory_open) {
-            (true, true) => Some(self.panel_focus),
-            (true, false) => Some(PanelFocus::Container),
-            (false, true) => Some(PanelFocus::Inventory),
-            (false, false) => None,
+        let panels = self.open_panels();
+        match panels.len() {
+            0 => None,
+            1 => Some(panels[0]),
+            _ => Some(if panels.contains(&self.panel_focus) {
+                self.panel_focus
+            } else {
+                panels[0]
+            }),
         }
     }
 
-    /// Стрелки: ↑/↓ — выделение внутри панели фокуса; ←/→ при двух открытых
-    /// панелях — переключение фокуса, иначе ←/→ двигают по сетке инвентаря.
+    /// Стрелки: ↑/↓ — выделение внутри панели фокуса; ←/→ при нескольких
+    /// открытых панелях — переключение фокуса (слева направо: контейнер,
+    /// склад, инвентарь), иначе ←/→ двигают по сетке инвентаря.
     fn handle_panel_navigation(&mut self) {
         let up = self.input.just_pressed(KeyCode::ArrowUp);
         let down = self.input.just_pressed(KeyCode::ArrowDown);
@@ -1179,16 +1420,20 @@ impl ClientApp {
             return;
         }
 
-        let both = self.open_container.is_some() && self.inventory_open;
-        if both {
-            if left {
-                self.panel_focus = PanelFocus::Container;
-                return;
-            }
-            if right {
-                self.panel_focus = PanelFocus::Inventory;
-                return;
-            }
+        let panels = self.open_panels();
+        let multiple = panels.len() > 1;
+        if multiple && (left || right) {
+            let current = panels
+                .iter()
+                .position(|panel| *panel == self.effective_focus().unwrap_or(panels[0]))
+                .unwrap_or(0);
+            let next = if left {
+                current.saturating_sub(1)
+            } else {
+                (current + 1).min(panels.len() - 1)
+            };
+            self.panel_focus = panels[next];
+            return;
         }
 
         match self.effective_focus() {
@@ -1204,6 +1449,15 @@ impl ClientApp {
                     self.container_select += 1;
                 }
             }
+            Some(PanelFocus::Stash) => {
+                let rows = self.stash_items.len();
+                if up {
+                    self.stash_select = self.stash_select.saturating_sub(1);
+                }
+                if down && rows > 0 && self.stash_select + 1 < rows {
+                    self.stash_select += 1;
+                }
+            }
             Some(PanelFocus::Inventory) => {
                 let mut col = self.inventory_select % INVENTORY_COLS;
                 let mut row = self.inventory_select / INVENTORY_COLS;
@@ -1211,9 +1465,9 @@ impl ClientApp {
                     row = row.saturating_sub(1);
                 } else if down {
                     row = (row + 1).min(INVENTORY_ROWS - 1);
-                } else if left && !both {
+                } else if left && !multiple {
                     col = col.saturating_sub(1);
-                } else if right && !both {
+                } else if right && !multiple {
                     col = (col + 1).min(INVENTORY_COLS - 1);
                 }
                 self.inventory_select = row * INVENTORY_COLS + col;
@@ -1308,6 +1562,17 @@ impl ClientApp {
         })
     }
 
+    /// Стек для панелей со списком сервера (контейнер, склад): неизвестный
+    /// каталогу предмет остаётся строкой-заглушкой, чтобы индексы строк
+    /// совпадали с серверными.
+    fn hud_stack_or_placeholder(&self, stack: ItemStackNet) -> HudItemStack {
+        self.hud_stack(stack).unwrap_or(HudItemStack {
+            name: format!("предмет #{}", stack.item),
+            count: stack.count,
+            color: [0.5, 0.5, 0.5],
+        })
+    }
+
     /// Суммарный вес инвентаря, кг (неизвестные предметы не считаются).
     fn inventory_weight_kg(&self) -> f32 {
         self.inventory
@@ -1354,6 +1619,10 @@ impl ClientApp {
                          локация {location}, спавн {spawn:?}"
                     );
                     self.net_player_id = Some(player_id);
+                    if !self.scenes.is_empty() && location != self.location {
+                        // Мир: Welcome уточняет стартовую локацию (обычно база).
+                        self.enter_location(location, spawn, None);
+                    }
                 }
                 NetEvent::Reject(reason) => {
                     log::warn!("сервер отклонил подключение: {reason:?} — offline-режим");
@@ -1366,8 +1635,7 @@ impl ClientApp {
                     loot,
                     corpses,
                     bolts,
-                    // M4d-1D: пузыри рисуются после включения рендера мира.
-                    bubbles: _,
+                    bubbles,
                     events,
                 } => {
                     // Мировые списки лута/трупов — прямое замещение снапшотом,
@@ -1375,6 +1643,7 @@ impl ClientApp {
                     self.world_loot = loot;
                     self.world_corpses = corpses;
                     self.apply_snapshot_bolts(&bolts, server_tick);
+                    self.apply_snapshot_bubbles(&bubbles);
                     self.apply_snapshot(server_tick, acked_input_tick, &players, &events, now);
                 }
                 NetEvent::InventoryUpdate { slots } => self.inventory = slots,
@@ -1386,12 +1655,13 @@ impl ClientApp {
                     position,
                     yaw,
                 } => {
-                    // M4d-1D: перезагрузка сцены и перенос своего игрока.
-                    log::info!("смена локации на {location}: позиция {position:?}, yaw {yaw:.2}");
+                    self.enter_location(location, position, Some(yaw));
                 }
                 NetEvent::StashUpdate { items } => {
-                    // M4d-1D: панель склада базы.
-                    log::debug!("склад базы: {} стопок", items.len());
+                    self.stash_items = items;
+                    self.stash_select = self
+                        .stash_select
+                        .min(self.stash_items.len().saturating_sub(1));
                 }
             }
         }
@@ -1431,10 +1701,14 @@ impl ClientApp {
         self.world_loot.clear();
         self.world_corpses.clear();
         self.world_bolts.clear();
+        self.world_bubbles.clear();
         self.revealed.clear();
         self.anomaly_flashes.clear();
         self.inventory.clear();
         self.open_container = None;
+        // Склад существует только на сервере.
+        self.stash_items.clear();
+        self.stash_open = false;
     }
 
     /// Болты из снапшота: список замещается, но позиции обновляются с
@@ -1462,6 +1736,14 @@ impl ClientApp {
                 }),
             }
         }
+    }
+
+    /// Активные пузыри локации из снапшота: якоря на полу (квантованные).
+    fn apply_snapshot_bubbles(&mut self, bubbles: &[[i16; 3]]) {
+        self.world_bubbles = bubbles
+            .iter()
+            .map(|anchor| Vec3::from_array(dequantize_pos(*anchor)))
+            .collect();
     }
 
     /// Снапшот сервера: события боя, буферы удалённых игроков, время рендера
@@ -1631,16 +1913,43 @@ impl ClientApp {
                 );
             ContainerHud {
                 title,
+                // Индексы строк — индексы стека на сервере: неизвестный
+                // предмет остаётся строкой-заглушкой (взять его всё равно
+                // можно, название подтянет каталог).
                 items: open
                     .items
                     .iter()
-                    .filter_map(|stack| self.hud_stack(*stack))
+                    .map(|stack| self.hud_stack_or_placeholder(*stack))
                     .collect(),
                 select: self
                     .container_select
                     .min(open.items.len().saturating_sub(1)),
                 focused: self.effective_focus() == Some(PanelFocus::Container),
+                hint: None,
             }
+        });
+
+        let stash = (self.stash_open && self.stash_available()).then(|| ContainerHud {
+            title: "Склад базы".to_string(),
+            items: self
+                .stash_items
+                .iter()
+                .map(|stack| self.hud_stack_or_placeholder(*stack))
+                .collect(),
+            select: self
+                .stash_select
+                .min(self.stash_items.len().saturating_sub(1)),
+            focused: self.effective_focus() == Some(PanelFocus::Stash),
+            hint: Some("↑/↓ — выбор · Enter — взять (инвентарь: сдать) · H — закрыть".to_string()),
+        });
+
+        // Вспышка смены локации гаснет линейно.
+        if self.tp_flash.is_some_and(|until| until <= now) {
+            self.tp_flash = None;
+        }
+        let flash = self.tp_flash.map(|until| {
+            (until.saturating_duration_since(now).as_secs_f32() / TP_FLASH_TTL.as_secs_f32())
+                .clamp(0.0, 1.0)
         });
 
         HudData {
@@ -1661,25 +1970,38 @@ impl ClientApp {
             hint,
             inventory,
             container,
+            stash,
             healing,
+            flash,
         }
     }
 
-    /// Заголовок окна: режим связи и RTT (`ZONA — ping 42 ms`). Обновляется
-    /// только при изменении, чтобы не дёргать ОС каждый кадр.
+    /// Заголовок окна: локация мира (если есть) и режим связи
+    /// (`ZONA — База · ping 42 ms`). Обновляется только при изменении, чтобы
+    /// не дёргать ОС каждый кадр.
     fn update_window_title(&mut self) {
-        let title = match self.net.as_ref() {
+        let location = self.location_name(self.location);
+        let mut base = String::from("ZONA");
+        let separator = if location.is_empty() {
+            " — "
+        } else {
+            base.push_str(" — ");
+            base.push_str(location);
+            " · "
+        };
+        let status = match self.net.as_ref() {
             Some(net) => match net.status() {
                 NetStatus::Connected => match net.rtt_ms() {
-                    Some(rtt) => format!("ZONA — ping {rtt:.0} ms"),
-                    None => "ZONA — в сети".to_string(),
+                    Some(rtt) => format!("ping {rtt:.0} ms"),
+                    None => "в сети".to_string(),
                 },
-                NetStatus::Connecting => "ZONA — подключение…".to_string(),
-                NetStatus::Rejected(_) => "ZONA — offline".to_string(),
+                NetStatus::Connecting => "подключение…".to_string(),
+                NetStatus::Rejected(_) => "offline".to_string(),
             },
-            None if self.connection_lost => "ZONA — нет связи".to_string(),
-            None => "ZONA — offline".to_string(),
+            None if self.connection_lost => "нет связи".to_string(),
+            None => "offline".to_string(),
         };
+        let title = format!("{base}{separator}{status}");
         if title == self.window_title {
             return;
         }
@@ -2016,7 +2338,8 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         );
     }
 
-    // Панели лута (M4b): инвентарь справа снизу, обыск — слева от него.
+    // Панели (M4b/M4d): инвентарь справа снизу; левее — обыск и склад
+    // (слева направо: склад, обыск, инвентарь).
     let inventory_rect = hud.inventory.as_ref().map(|inventory| {
         let size = inventory_panel_size();
         let min = egui::pos2(
@@ -2027,12 +2350,30 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         draw_inventory_panel(&painter, inventory, rect);
         rect
     });
-    if let Some(container) = &hud.container {
-        let rows = container.items.len().max(1) as f32;
-        let size = egui::vec2(280.0, 46.0 + rows * 24.0);
+    let container_rect = hud.container.as_ref().map(|container| {
+        let size = list_panel_size(container.items.len(), container.hint.is_some());
         let right = inventory_rect.map_or(screen.right() - 14.0, |rect| rect.left() - 12.0);
         let min = egui::pos2(right - size.x, screen.bottom() - 14.0 - size.y);
-        draw_container_panel(&painter, container, egui::Rect::from_min_size(min, size));
+        let rect = egui::Rect::from_min_size(min, size);
+        draw_container_panel(&painter, container, rect);
+        rect
+    });
+    if let Some(stash) = &hud.stash {
+        let size = list_panel_size(stash.items.len(), stash.hint.is_some());
+        let right = container_rect
+            .or(inventory_rect)
+            .map_or(screen.right() - 14.0, |rect| rect.left() - 12.0);
+        let min = egui::pos2(right - size.x, screen.bottom() - 14.0 - size.y);
+        draw_container_panel(&painter, stash, egui::Rect::from_min_size(min, size));
+    }
+
+    // Вспышка смены локации — поверх панелей, под экраном смерти.
+    if let Some(flash) = hud.flash {
+        painter.rect_filled(
+            screen,
+            0.0,
+            egui::Color32::from_white_alpha((flash.clamp(0.0, 1.0) * 230.0) as u8),
+        );
     }
 
     // Экран смерти.
@@ -2086,6 +2427,15 @@ fn grid_size() -> egui::Vec2 {
 fn inventory_panel_size() -> egui::Vec2 {
     let grid = grid_size();
     egui::vec2(grid.x + 20.0, 34.0 + grid.y + 66.0)
+}
+
+/// Размер панели-списка (обыск, склад): заголовок, строки и опциональная
+/// подсказка клавиш внизу.
+fn list_panel_size(rows: usize, hint: bool) -> egui::Vec2 {
+    egui::vec2(
+        280.0,
+        46.0 + rows.max(1) as f32 * 24.0 + if hint { 20.0 } else { 0.0 },
+    )
 }
 
 /// Цвет предмета из каталога для egui.
@@ -2190,6 +2540,16 @@ fn draw_container_panel(painter: &egui::Painter, panel: &ContainerHud, rect: egu
         egui::FontId::proportional(17.0),
         egui::Color32::from_white_alpha(235),
     );
+
+    if let Some(hint) = &panel.hint {
+        painter.text(
+            egui::pos2(rect.left() + 10.0, rect.bottom() - 20.0),
+            egui::Align2::LEFT_TOP,
+            hint,
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_white_alpha(140),
+        );
+    }
 
     if panel.items.is_empty() {
         painter.text(
@@ -2954,5 +3314,218 @@ mod tests {
             !app.anomaly_flashes.is_empty(),
             "вспышка в месте срабатывания болта"
         );
+    }
+
+    // ── Мир локаций (M4d-1D) ────────────────────────────────────────────
+
+    /// Клиент мира: все сцены локаций, старт на базе (без сети — offline-мир).
+    fn world_app() -> ClientApp {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        ClientApp::new_session(content, None, None)
+    }
+
+    #[test]
+    fn world_client_loads_all_locations_and_starts_on_base() {
+        let mut app = world_app();
+        assert_eq!(app.scenes.len(), 4, "все локации мира загружены");
+        assert_eq!(app.location, zn_scene::LOCATION_BASE);
+        assert_eq!(app.scene.name, "base");
+        assert_eq!(app.location_name(app.location), "База");
+        // Коллайдеры базы на месте, игрок — в точке спавна сцены.
+        assert!(app.simulation.static_collider_count() > 0);
+        let player = app.simulation.player_state(app.player_id).unwrap();
+        assert_eq!(player.position, app.scene.spawn);
+    }
+
+    #[test]
+    fn location_changed_switches_scene_player_and_flash() {
+        let mut app = world_app();
+        app.enter_location(
+            zn_scene::LOCATION_KORDON,
+            [0.0, 0.0, 22.0],
+            Some(std::f32::consts::PI),
+        );
+
+        assert_eq!(app.location, zn_scene::LOCATION_KORDON);
+        assert_eq!(app.scene.name, "kordon");
+        let player = app.simulation.player_state(app.player_id).unwrap();
+        assert!((player.position - Vec3::new(0.0, 0.0, 22.0)).length() < 1e-3);
+        assert!(
+            (player.yaw - std::f32::consts::PI).abs() < 1e-3,
+            "yaw = {}",
+            player.yaw
+        );
+        // Камера синхронизирована с точкой прибытия.
+        assert!(
+            (app.camera.position - (player.position + Vec3::Y * PLAYER_EYE_HEIGHT)).length() < 1e-3
+        );
+
+        // Вспышка перехода живёт в HUD и гаснет со временем.
+        let flash = app.collect_hud_data().flash.expect("вспышка перехода");
+        assert!((0.5..=1.0).contains(&flash), "flash = {flash}");
+        assert!(app.tp_flash.is_some());
+
+        // Симуляция новой локации работает: после шага игрок на полу.
+        app.simulate(std::time::Duration::from_millis(17));
+        let player = app.simulation.player_state(app.player_id).unwrap();
+        assert!(player.position.y.abs() < 1e-2, "{:?}", player.position);
+    }
+
+    #[test]
+    fn stash_panel_opens_only_on_base_with_connection() {
+        let mut app = world_app();
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.net = Some(
+            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap(),
+        );
+
+        // На базе H открывает панель.
+        app.input.press_key(KeyCode::KeyH);
+        app.simulate(std::time::Duration::from_millis(17));
+        assert!(app.stash_open, "склад открывается клавишей H");
+        app.input.release_key(KeyCode::KeyH);
+
+        app.stash_items = vec![ItemStackNet { item: 0, count: 3 }];
+        let hud = app.collect_hud_data();
+        let stash = hud.stash.as_ref().expect("панель склада в HUD");
+        assert_eq!(stash.title, "Склад базы");
+        assert_eq!(stash.items.len(), 1);
+        assert_eq!(stash.select, 0);
+        assert!(stash.hint.is_some(), "подсказка клавиш у склада");
+
+        // Смена локации закрывает склад и убирает панель из HUD.
+        app.enter_location(zn_scene::LOCATION_KORDON, [0.0, 0.0, 22.0], None);
+        assert!(!app.stash_open);
+        assert!(app.collect_hud_data().stash.is_none());
+
+        // Offline склад недоступен.
+        app.enter_location(zn_scene::LOCATION_BASE, [0.0, 0.0, 14.0], None);
+        app.net = None;
+        app.input.press_key(KeyCode::KeyH);
+        app.simulate(std::time::Duration::from_millis(17));
+        assert!(!app.stash_open, "без сети склад не открывается");
+    }
+
+    #[test]
+    fn snapshot_bubbles_follow_location_switch() {
+        let mut app = world_app();
+        app.apply_snapshot_bubbles(&[
+            zn_net::quantize_pos([12.0, 0.0, -16.0]),
+            zn_net::quantize_pos([18.0, 0.0, 20.0]),
+        ]);
+        assert_eq!(app.world_bubbles.len(), 2);
+        assert!((app.world_bubbles[0] - Vec3::new(12.0, 0.0, -16.0)).length() < 0.1);
+
+        // Смена локации чистит пузыри прежней карты.
+        app.enter_location(zn_scene::LOCATION_SVALKA, [0.0, 0.0, 0.0], None);
+        assert!(app.world_bubbles.is_empty());
+    }
+
+    #[test]
+    fn world_window_title_includes_location_name() {
+        let mut app = world_app();
+        app.update_window_title();
+        assert_eq!(app.window_title, "ZONA — База · offline");
+
+        app.enter_location(zn_scene::LOCATION_KORDON, [0.0, 0.0, 22.0], None);
+        app.update_window_title();
+        assert_eq!(app.window_title, "ZONA — Кордон · offline");
+    }
+
+    #[test]
+    fn stash_enter_takes_stack_and_inventory_enter_puts_slot() {
+        let mut app = world_app();
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        app.net = Some(
+            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap(),
+        );
+
+        // Доводим клиента до Connected (Hello → Welcome): без этого действия
+        // не уходят на сервер.
+        {
+            let net = app.net.as_mut().unwrap();
+            net.poll(Instant::now());
+            let mut buf = [0u8; 2048];
+            let mut from = None;
+            for _ in 0..1000 {
+                if let Ok((len, addr)) = server.recv_from(&mut buf) {
+                    let message: zn_net::Message = zn_net::decode_message(&buf[..len]).unwrap();
+                    assert!(matches!(message, zn_net::Message::ClientHello { .. }));
+                    from = Some(addr);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let from = from.expect("ClientHello дошёл до сервера");
+            let welcome = zn_net::encode_message(&zn_net::Message::ServerWelcome {
+                player_id: 1,
+                server_tick: 10,
+                spawn: [0.0, 0.0, 14.0],
+                location: 0,
+            })
+            .unwrap();
+            server.send_to(&welcome, from).unwrap();
+            let events = net.poll(Instant::now());
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, NetEvent::Welcome { .. })),
+                "ожидался Welcome: {events:?}"
+            );
+        }
+
+        app.stash_open = true;
+        app.inventory_open = true; // обе панели открыты — фокус по ←/→
+        app.stash_items = vec![
+            ItemStackNet { item: 0, count: 3 },
+            ItemStackNet { item: 1, count: 7 },
+        ];
+        app.inventory = vec![None; INVENTORY_SLOTS];
+
+        // Вычитывает действия склада из датаграмм (прочие пакеты пропускает).
+        fn drain_stash_actions(server: &std::net::UdpSocket) -> Vec<(u64, StashAction)> {
+            let mut actions = Vec::new();
+            let mut buf = [0u8; 2048];
+            while let Ok((len, _)) = server.recv_from(&mut buf) {
+                let message: zn_net::Message = zn_net::decode_message(&buf[..len]).unwrap();
+                if let zn_net::Message::StashAction { tick, action } = message {
+                    actions.push((tick, action));
+                }
+            }
+            actions
+        }
+
+        // Фокус на складе: Enter берёт выделенную строку (с повтором).
+        app.panel_focus = PanelFocus::Stash;
+        app.stash_select = 1;
+        app.press_enter();
+        let actions = drain_stash_actions(&server);
+        assert_eq!(actions.len(), INPUT_REDUNDANCY, "{actions:?}");
+        assert!(
+            actions
+                .iter()
+                .all(|(tick, action)| *tick == 1 && *action == StashAction::Take { index: 1 }),
+            "взяли стопку под индексом 1: {actions:?}"
+        );
+
+        // Фокус на инвентаре: Enter сдаёт занятую ячейку в склад.
+        app.panel_focus = PanelFocus::Inventory;
+        app.inventory[4] = Some(ItemStackNet { item: 2, count: 1 });
+        app.inventory_select = 4;
+        app.press_enter();
+        let actions = drain_stash_actions(&server);
+        assert!(
+            actions
+                .iter()
+                .all(|(tick, action)| *tick == 2 && *action == StashAction::Put { slot: 4 }),
+            "сдали ячейку 4: {actions:?}"
+        );
+        assert_eq!(actions.len(), INPUT_REDUNDANCY, "{actions:?}");
+
+        // Пустая ячейка — Enter молчит.
+        app.inventory_select = 5;
+        app.press_enter();
+        assert!(drain_stash_actions(&server).is_empty());
     }
 }

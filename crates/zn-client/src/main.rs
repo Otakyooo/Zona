@@ -12,7 +12,8 @@ use std::path::PathBuf;
 
 struct Cli {
     content_root: PathBuf,
-    level: String,
+    /// Имя одиночного уровня; `None` — мир локаций (нужен сервер).
+    level: Option<String>,
     server: Option<String>,
 }
 
@@ -24,8 +25,9 @@ fn usage() -> String {
          Опции:\n  \
            --content-root <путь>  корень контента (по умолчанию {DEFAULT_CONTENT_ROOT});\n                              \
                                    переменная окружения ZN_CONTENT_ROOT переопределяет\n  \
-           --level <имя>          имя уровня из <content-root>/levels/<имя>.scene.ron\n                              \
-                                   (по умолчанию {DEFAULT_LEVEL})\n  \
+           --level <имя>          одиночная сцена из <content-root>/levels/<имя>.scene.ron:\n                              \
+                                   offline — по умолчанию {DEFAULT_LEVEL};\n                              \
+                                   с сервером без опции загружается мир локаций (locations.ron)\n  \
            --server host:port     подключиться к UDP-серверу (без опции — offline)\n  \
            -h, --help             эта справка\n"
     )
@@ -73,7 +75,6 @@ fn parse_args() -> Cli {
     let content_root = content_root
         .or_else(|| std::env::var_os("ZN_CONTENT_ROOT").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTENT_ROOT));
-    let level = level.unwrap_or_else(|| DEFAULT_LEVEL.to_string());
 
     Cli {
         content_root,
@@ -86,16 +87,19 @@ fn main() {
     env_logger::init();
     let cli = parse_args();
     log::info!(
-        "ZONA client starting: content-root={}, level={}, server={}",
+        "ZONA client starting: content-root={}, режим={}, server={}",
         cli.content_root.display(),
-        cli.level,
+        cli.level.as_deref().unwrap_or("<мир локаций>"),
         cli.server.as_deref().unwrap_or("<offline>")
     );
 
     let event_loop = winit::event_loop::EventLoop::new().expect("failed to create event loop");
     let mut client = match cli.server {
-        Some(server) => ClientApp::with_server(server, cli.content_root, &cli.level),
-        None => ClientApp::with_content(cli.content_root, &cli.level),
+        Some(server) => ClientApp::with_server(server, cli.content_root, cli.level.as_deref()),
+        None => {
+            let level = cli.level.as_deref().unwrap_or(DEFAULT_LEVEL);
+            ClientApp::with_content(cli.content_root, level)
+        }
     };
     if let Err(error) = event_loop.run_app(&mut client) {
         log::error!("client terminated with error: {error}");

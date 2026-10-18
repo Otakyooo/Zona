@@ -1018,8 +1018,9 @@ impl Session {
                 let moved = self.world.deposit_on_base(change.player_id);
                 if moved > 0 {
                     log::info!("склад: игрок {} сдал {moved} стопок", change.player_id);
-                    self.send_stash_update(change.player_id);
                 }
+                // Даже пустая сдача освежает панель: клиент всегда видит склад.
+                self.send_stash_update(change.player_id);
             }
         }
     }

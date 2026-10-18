@@ -9,8 +9,8 @@ use std::time::Instant;
 
 use zn_net::{
     decode_message, encode_message, BoltNet, ClientInput, CorpseNet, GameEvent, GroundItemNet,
-    InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason, CLIENT_TIMEOUT,
-    HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL, PROTOCOL_VERSION,
+    InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason, StashAction,
+    CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL, PROTOCOL_VERSION,
 };
 
 /// События для приложения, извлечённые из входящих пакетов.
@@ -200,6 +200,16 @@ impl NetClient {
         }
         for _ in 0..INPUT_REDUNDANCY {
             self.send(&Message::ThrowBolt { tick });
+        }
+    }
+
+    /// Отправляет действие склада (взять/положить) с тем же повтором.
+    pub fn send_stash_action(&mut self, tick: u64, action: StashAction) {
+        if self.status != NetStatus::Connected {
+            return;
+        }
+        for _ in 0..INPUT_REDUNDANCY {
+            self.send(&Message::StashAction { tick, action });
         }
     }
 
@@ -762,6 +772,18 @@ mod tests {
                     assert_eq!(action, InventoryAction::Drop { slot: 3 });
                 }
                 other => panic!("ожидался InventoryAction, получили {}", other.kind()),
+            }
+        }
+
+        // Действие склада уходит с тем же повтором (дедуп по tick на сервере).
+        client.send_stash_action(9, StashAction::Put { slot: 0 });
+        for _ in 0..INPUT_REDUNDANCY {
+            match expect_message(&server).0 {
+                Message::StashAction { tick, action } => {
+                    assert_eq!(tick, 9);
+                    assert_eq!(action, StashAction::Put { slot: 0 });
+                }
+                other => panic!("ожидался StashAction, получили {}", other.kind()),
             }
         }
 
