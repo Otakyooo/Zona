@@ -1,6 +1,8 @@
 //! Встроенные процедурные текстуры (M4g): генерируются на CPU, без внешних
 //! файлов. Тайлятся бесшовно (периодический value-noise), детерминированы —
-//! одни и те же байты на всех платформах.
+//! одни и те же байты на всех платформах. Значения — в sRGB-шкале (как в
+//! редакторе изображений): картинка создаётся с `srgb = true`, GPU сам
+//! декодирует её в линейное пространство.
 
 use crate::types::CpuImage;
 
@@ -33,7 +35,7 @@ pub fn builtin_texture(name: &str) -> Option<CpuImage> {
     Some(image.with_mips().with_name(format!("builtin://{name}")))
 }
 
-/// Вызывает `fill(x, y) -> [f32; 3]` (линейные значения 0..1) и кодирует в RGBA8.
+/// Вызывает `fill(x, y) -> [f32; 3]` (sRGB-значения 0..1) и кодирует в RGBA8.
 fn generate(size: u32, mut fill: impl FnMut(u32, u32, f32, f32) -> [f32; 3]) -> CpuImage {
     let mut pixels = vec![255u8; (size * size * 4) as usize];
     let inv = 1.0 / size as f32;
@@ -113,7 +115,7 @@ fn concrete(size: u32) -> CpuImage {
         let gx = (u * 4.0).fract();
         let gy = (v * 4.0).fract();
         let seam = if gx < 0.02 || gy < 0.02 { -0.13 } else { 0.0 };
-        let value = 0.54 * (0.85 + 0.30 * mottling) + 0.07 * (grain - 0.5) + speck + seam;
+        let value = 0.66 * (0.85 + 0.30 * mottling) + 0.07 * (grain - 0.5) + speck + seam;
         [value, value * 0.995, value * 0.97]
     })
 }
@@ -128,7 +130,7 @@ fn asphalt(size: u32) -> CpuImage {
         } else {
             0.0
         };
-        let value = 0.16 * (0.8 + 0.5 * patches) + 0.05 * (grain - 0.5) + pebble;
+        let value = 0.42 * (0.8 + 0.5 * patches) + 0.05 * (grain - 0.5) + pebble;
         [value, value * 0.99, value * 0.96]
     })
 }
@@ -140,10 +142,10 @@ fn metal(size: u32) -> CpuImage {
         let brushed = value_noise(u, v, 160, 4, 0x71);
         let mottling = fbm(u, v, 4, 4, 3, 0x72);
         let rust = fbm(u, v, 6, 6, 4, 0x73);
-        let base = 0.42 * (0.9 + 0.2 * brushed) + 0.05 * (mottling - 0.5);
+        let base = 0.52 * (0.9 + 0.2 * brushed) + 0.05 * (mottling - 0.5);
         // Ржавчина: участки с высоким fbm получают тёплый оттенок.
         let rust_amount = ((rust - 0.62) * 3.0).clamp(0.0, 1.0) * 0.8;
-        let rust_color = [0.34, 0.18, 0.10];
+        let rust_color = [0.46, 0.27, 0.15];
         [
             base * (1.0 - rust_amount) + rust_color[0] * rust_amount,
             base * (1.0 - rust_amount) + rust_color[1] * rust_amount,
@@ -163,8 +165,8 @@ fn dirt(size: u32) -> CpuImage {
             0.0
         };
         let dark = if pits < 0.30 { -0.08 } else { 0.0 };
-        let value = 0.36 + 0.22 * (clumps - 0.5) + dark + stones;
-        [value, value * 0.80, value * 0.58]
+        let value = 0.52 + 0.18 * (clumps - 0.5) + dark + stones;
+        [value, value * 0.82, value * 0.60]
     })
 }
 

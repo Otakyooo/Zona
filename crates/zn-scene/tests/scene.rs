@@ -108,6 +108,38 @@ mod tests {
     }
 
     #[test]
+    fn world_locations_use_builtin_textures() {
+        for scene in [
+            Scene::base(),
+            Scene::kordon(),
+            Scene::svalka(),
+            Scene::podzemka(),
+        ] {
+            let textured: Vec<_> = scene
+                .objects
+                .iter()
+                .filter(|object| object.texture.is_some())
+                .collect();
+            assert!(
+                textured.len() >= 5,
+                "{}: ожидались текстурированные пол и стены",
+                scene.name
+            );
+            for object in textured {
+                assert!(object.world_uv, "{}: у поверхностей мировые UV", scene.name);
+                assert_eq!(object.asset_key(), BUILTIN_CUBE);
+                assert!(object.has_material_overrides());
+            }
+        }
+        // Лампы подземки (M4g) светятся emissive-материалом.
+        let podzemka = Scene::podzemka();
+        assert!(podzemka
+            .objects
+            .iter()
+            .any(|object| object.emissive.is_some()));
+    }
+
+    #[test]
     fn demo_zone_has_solids_and_spawn() {
         let scene = Scene::demo_zone();
         assert!(!scene.is_empty());

@@ -5,7 +5,7 @@
 use zn_assets::{builtin_texture, parse_builtin_texture_key, CpuImage, CpuMaterial};
 use zn_scene::SceneObject;
 
-use crate::renderer::material::{SLOT_ALBEDO, TEXTURE_SLOTS};
+use crate::renderer::material::{SLOT_ALBEDO, SLOT_EMISSIVE, TEXTURE_SLOTS};
 
 /// Шероховатость по умолчанию для персональных материалов (неметалл).
 pub const DEFAULT_ROUGHNESS: f32 = 0.85;
@@ -81,6 +81,11 @@ impl MaterialSpec {
             f32::from_bits(self.emissive_bits[1]),
             f32::from_bits(self.emissive_bits[2]),
         ];
+        // Заполнитель emissive-слота чёрный; для свечения нужна белая карта,
+        // иначе `emissive_factor` умножается на ноль.
+        if emissive != [0.0, 0.0, 0.0] {
+            slots[SLOT_EMISSIVE] = Some(CpuImage::new(1, 1, vec![255, 255, 255, 255], true));
+        }
         let material = CpuMaterial {
             name: Some("scene-object".to_string()),
             metallic_factor: self
@@ -160,6 +165,45 @@ mod tests {
             albedo.pixels.len(),
             (zn_assets::BUILTIN_TEXTURE_SIZE.pow(2) * 4) as usize
         );
+    }
+
+    #[test]
+    fn emissive_gets_white_texture_slot() {
+        let spec = MaterialSpec::from_object(&object().with_emissive(Vec3::new(1.1, 0.9, 0.4)))
+            .expect("спека");
+        let (_, slots) = spec.to_material();
+        let image = slots[SLOT_EMISSIVE].as_ref().expect("белый emissive-слот");
+        assert_eq!(image.pixels, vec![255, 255, 255, 255]);
+        // Без свечения слот остаётся дефолтным (чёрным) — экономия текстур.
+        let plain = MaterialSpec::from_object(&object().with_roughness(0.5)).expect("спека");
+        let (_, slots) = plain.to_material();
+        assert!(slots[SLOT_EMISSIVE].is_none());
+    }
+
+    #[test]
+    fn scene_texture_keys_are_builtin() {
+        for key in [
+            zn_scene::TEXTURE_ASPHALT,
+            zn_scene::TEXTURE_CONCRETE,
+            zn_scene::TEXTURE_DIRT,
+            zn_scene::TEXTURE_METAL,
+        ] {
+            assert!(zn_assets::parse_builtin_texture_key(key).is_some(), "{key}");
+        }
+        // Текстурированные поверхности локаций получают карту альбедо.
+        for scene in [zn_scene::Scene::base(), zn_scene::Scene::svalka()] {
+            for object in &scene.objects {
+                let Some(spec) = MaterialSpec::from_object(object) else {
+                    continue;
+                };
+                if spec.texture().is_none() {
+                    continue;
+                }
+                let (material, slots) = spec.to_material();
+                assert!(slots[SLOT_ALBEDO].is_some(), "{}", scene.name);
+                assert!(material.world_uv, "{}", scene.name);
+            }
+        }
     }
 
     #[test]

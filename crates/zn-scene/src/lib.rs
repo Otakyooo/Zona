@@ -13,6 +13,26 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// Ключ ассета по умолчанию: встроенный процедурный куб.
 pub const BUILTIN_CUBE: &str = "builtin://cube";
 
+/// Встроенные текстуры поверхностей (M4g): ключи совпадают с zn-assets.
+pub const TEXTURE_CONCRETE: &str = "builtin://concrete";
+pub const TEXTURE_ASPHALT: &str = "builtin://asphalt";
+pub const TEXTURE_METAL: &str = "builtin://metal";
+pub const TEXTURE_DIRT: &str = "builtin://dirt";
+
+/// Куб-поверхность в текстуре (M4g): мировые (box) UV — плотность текселей
+/// не зависит от размеров объекта, стены и полы текстурируются одинаково.
+fn textured_cube(
+    position: Vec3,
+    scale: Vec3,
+    color: Vec4,
+    texture: &str,
+    uv_scale: f32,
+) -> SceneObject {
+    SceneObject::new(position, scale, color)
+        .with_asset(BUILTIN_CUBE)
+        .with_texture(texture, uv_scale, true)
+}
+
 /// Форма прокси-коллайдера объекта сцены. Размеры берутся из `scale` объекта.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ColliderShape {
@@ -766,37 +786,34 @@ impl Scene {
             sky_horizon: Vec3::new(0.68, 0.68, 0.66),
         };
 
+        // Пол и периметр — текстуры (M4g): асфальт площадки, бетон стен.
+        scene.add(textured_cube(
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(60.0, 0.5, 60.0),
+            Vec4::new(0.95, 0.95, 0.90, 1.0),
+            TEXTURE_ASPHALT,
+            0.25,
+        ));
+
+        let wall_color = Vec4::new(0.30, 0.30, 0.32, 1.0);
+        for (position, scale) in [
+            (Vec3::new(0.0, 2.5, -30.0), Vec3::new(31.0, 3.0, 1.0)),
+            (Vec3::new(0.0, 2.5, 30.0), Vec3::new(31.0, 3.0, 1.0)),
+            (Vec3::new(-30.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 31.0)),
+            (Vec3::new(30.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 31.0)),
+        ] {
+            scene.add(textured_cube(
+                position,
+                scale,
+                wall_color,
+                TEXTURE_CONCRETE,
+                0.5,
+            ));
+        }
+
         let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
             scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
         };
-
-        push(
-            Vec3::new(0.0, -0.5, 0.0),
-            Vec3::new(60.0, 0.5, 60.0),
-            Vec4::new(0.18, 0.19, 0.16, 1.0),
-        );
-
-        let wall_color = Vec4::new(0.10, 0.10, 0.11, 1.0);
-        push(
-            Vec3::new(0.0, 2.5, -30.0),
-            Vec3::new(31.0, 3.0, 1.0),
-            wall_color,
-        );
-        push(
-            Vec3::new(0.0, 2.5, 30.0),
-            Vec3::new(31.0, 3.0, 1.0),
-            wall_color,
-        );
-        push(
-            Vec3::new(-30.0, 2.5, 0.0),
-            Vec3::new(1.0, 3.0, 31.0),
-            wall_color,
-        );
-        push(
-            Vec3::new(30.0, 2.5, 0.0),
-            Vec3::new(1.0, 3.0, 31.0),
-            wall_color,
-        );
 
         let pillar = Vec4::new(0.24, 0.25, 0.22, 1.0);
         for x in -20..=20 {
@@ -907,43 +924,50 @@ impl Scene {
             sky_horizon: Vec3::new(0.60, 0.70, 0.80),
         };
 
-        let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
-            scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
-        };
+        // Площадка, периметр и постройки — текстуры бетона (M4g).
+        let ground = Vec4::new(0.62, 0.64, 0.60, 1.0);
+        let wall = Vec4::new(0.45, 0.46, 0.45, 1.0);
+        let building = Vec4::new(0.78, 0.78, 0.75, 1.0);
 
-        let ground = Vec4::new(0.20, 0.21, 0.18, 1.0);
-        let wall = Vec4::new(0.12, 0.13, 0.12, 1.0);
-        let building = Vec4::new(0.26, 0.26, 0.24, 1.0);
-
-        // Площадка 48×48 и периметр.
-        push(
+        scene.add(textured_cube(
             Vec3::new(0.0, -0.5, 0.0),
             Vec3::new(48.0, 0.5, 48.0),
             ground,
-        );
-        push(Vec3::new(0.0, 2.5, -24.0), Vec3::new(49.0, 3.0, 1.0), wall);
-        push(Vec3::new(0.0, 2.5, 24.0), Vec3::new(49.0, 3.0, 1.0), wall);
-        push(Vec3::new(-24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
-        push(Vec3::new(24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
+            TEXTURE_CONCRETE,
+            0.25,
+        ));
+        for (position, scale) in [
+            (Vec3::new(0.0, 2.5, -24.0), Vec3::new(49.0, 3.0, 1.0)),
+            (Vec3::new(0.0, 2.5, 24.0), Vec3::new(49.0, 3.0, 1.0)),
+            (Vec3::new(-24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0)),
+            (Vec3::new(24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0)),
+        ] {
+            scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
+        }
 
-        // Постройки: казарма и ангар.
-        push(
-            Vec3::new(-12.0, 2.5, -8.0),
-            Vec3::new(12.0, 5.0, 10.0),
-            building,
-        );
-        push(
-            Vec3::new(10.0, 2.0, 6.0),
-            Vec3::new(8.0, 4.0, 8.0),
-            building,
-        );
+        // Постройки: казарма и ангар — бетонные блоки.
+        for (position, scale) in [
+            (Vec3::new(-12.0, 2.5, -8.0), Vec3::new(12.0, 5.0, 10.0)),
+            (Vec3::new(10.0, 2.0, 6.0), Vec3::new(8.0, 4.0, 8.0)),
+        ] {
+            scene.add(textured_cube(
+                position,
+                scale,
+                building,
+                TEXTURE_CONCRETE,
+                0.4,
+            ));
+        }
 
-        // Склад (декор): контейнер у спавна; склад-панель — по действию игрока.
-        push(
+        // Склад (декор): контейнер у спавна — ржавый металл; склад-панель —
+        // по действию игрока.
+        scene.add(textured_cube(
             Vec3::new(4.0, 0.6, 10.0),
             Vec3::new(1.6, 1.2, 1.6),
-            Vec4::new(0.45, 0.33, 0.18, 1.0),
-        );
+            Vec4::new(0.90, 0.66, 0.36, 1.0),
+            TEXTURE_METAL,
+            0.5,
+        ));
 
         // Ворота на Кордон (у северной стены).
         scene.add(pad(0.0, -20.0, 5.0, Vec4::new(0.20, 0.55, 0.25, 1.0)));
@@ -1033,25 +1057,28 @@ impl Scene {
             sky_horizon: Vec3::new(0.60, 0.54, 0.44),
         };
 
-        let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
-            scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
-        };
+        // Пол и периметр — текстуры (M4g): земля Свалки, бетон стен.
+        let ground = Vec4::new(0.78, 0.72, 0.62, 1.0);
+        let wall = Vec4::new(0.34, 0.34, 0.32, 1.0);
+        let pile = Vec4::new(0.90, 0.88, 0.85, 1.0);
 
-        let ground = Vec4::new(0.20, 0.19, 0.16, 1.0);
-        let wall = Vec4::new(0.11, 0.11, 0.10, 1.0);
-        let pile = Vec4::new(0.28, 0.27, 0.23, 1.0);
-
-        push(
+        scene.add(textured_cube(
             Vec3::new(0.0, -0.5, 0.0),
             Vec3::new(96.0, 0.5, 96.0),
             ground,
-        );
-        push(Vec3::new(0.0, 2.5, -48.0), Vec3::new(97.0, 3.0, 1.0), wall);
-        push(Vec3::new(0.0, 2.5, 48.0), Vec3::new(97.0, 3.0, 1.0), wall);
-        push(Vec3::new(-48.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 97.0), wall);
-        push(Vec3::new(48.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 97.0), wall);
+            TEXTURE_DIRT,
+            0.25,
+        ));
+        for (position, scale) in [
+            (Vec3::new(0.0, 2.5, -48.0), Vec3::new(97.0, 3.0, 1.0)),
+            (Vec3::new(0.0, 2.5, 48.0), Vec3::new(97.0, 3.0, 1.0)),
+            (Vec3::new(-48.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 97.0)),
+            (Vec3::new(48.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 97.0)),
+        ] {
+            scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
+        }
 
-        // Завалы: башни и разбросанные блоки.
+        // Завалы: башни и разбросанные блоки — ржавый металл.
         let piles = [
             (Vec3::new(-10.0, 4.0, -12.0), Vec3::new(6.0, 8.0, 6.0)),
             (Vec3::new(12.0, 3.0, 14.0), Vec3::new(5.0, 6.0, 5.0)),
@@ -1060,7 +1087,7 @@ impl Scene {
             (Vec3::new(-34.0, 1.5, -30.0), Vec3::new(5.0, 3.0, 7.0)),
         ];
         for (position, scale) in piles {
-            push(position, scale, pile);
+            scene.add(textured_cube(position, scale, pile, TEXTURE_METAL, 0.35));
         }
         let debris = [
             (Vec3::new(4.0, 0.75, -20.0), Vec3::new(3.0, 1.5, 2.0)),
@@ -1071,12 +1098,16 @@ impl Scene {
             (Vec3::new(-28.0, 0.7, -8.0), Vec3::new(2.0, 1.4, 4.0)),
         ];
         for (position, scale) in debris {
-            push(position, scale, pile);
+            scene.add(textured_cube(position, scale, pile, TEXTURE_METAL, 0.35));
         }
 
         // Заборы-стенки, делящие карту.
-        push(Vec3::new(-2.0, 1.5, -30.0), Vec3::new(20.0, 3.0, 1.0), wall);
-        push(Vec3::new(-20.0, 1.5, 8.0), Vec3::new(1.0, 3.0, 18.0), wall);
+        for (position, scale) in [
+            (Vec3::new(-2.0, 1.5, -30.0), Vec3::new(20.0, 3.0, 1.0)),
+            (Vec3::new(-20.0, 1.5, 8.0), Vec3::new(1.0, 3.0, 18.0)),
+        ] {
+            scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
+        }
 
         // Ящики: лут по всей карте.
         let crates = [
@@ -1135,13 +1166,12 @@ impl Scene {
         scene.spawn = Vec3::new(-15.0, 0.0, 0.0);
         scene.spawn_yaw = std::f32::consts::FRAC_PI_2;
         // Подземка: почти нет солнца, холодный ambient, тёмная мгла коридоров.
-        // Лампы (emissive) появятся в G2/G5 — пока ambient чуть выше минимума,
-        // чтобы коридоры читались.
+        // Читаемость держат фактуры бетона и лампы (emissive) на стенах.
         scene.environment = SceneEnvironment {
             sun_direction: Vec3::new(0.0, 1.0, 0.0),
             sun_color: Vec3::new(0.70, 0.78, 0.95),
-            sun_intensity: 0.20,
-            ambient_color: Vec3::new(0.20, 0.22, 0.26),
+            sun_intensity: 0.24,
+            ambient_color: Vec3::new(0.22, 0.24, 0.29),
             ambient_intensity: 1.0,
             fog_color: Vec3::new(0.04, 0.05, 0.07),
             fog_density: 0.035,
@@ -1149,29 +1179,52 @@ impl Scene {
             sky_horizon: Vec3::new(0.02, 0.025, 0.04),
         };
 
-        let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
-            scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
-        };
+        // Пол, периметр и коридоры — бетон (M4g): фактура читается даже при
+        // слабом свете подземки.
+        let ground = Vec4::new(0.42, 0.42, 0.41, 1.0);
+        let wall = Vec4::new(0.34, 0.34, 0.33, 1.0);
+        let inner = Vec4::new(0.48, 0.48, 0.47, 1.0);
 
-        let ground = Vec4::new(0.16, 0.16, 0.15, 1.0);
-        let wall = Vec4::new(0.10, 0.10, 0.09, 1.0);
-        let inner = Vec4::new(0.22, 0.22, 0.21, 1.0);
-
-        push(
+        scene.add(textured_cube(
             Vec3::new(0.0, -0.5, 0.0),
             Vec3::new(48.0, 0.5, 48.0),
             ground,
-        );
-        push(Vec3::new(0.0, 2.5, -24.0), Vec3::new(49.0, 3.0, 1.0), wall);
-        push(Vec3::new(0.0, 2.5, 24.0), Vec3::new(49.0, 3.0, 1.0), wall);
-        push(Vec3::new(-24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
-        push(Vec3::new(24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0), wall);
+            TEXTURE_CONCRETE,
+            0.4,
+        ));
+        for (position, scale) in [
+            (Vec3::new(0.0, 2.5, -24.0), Vec3::new(49.0, 3.0, 1.0)),
+            (Vec3::new(0.0, 2.5, 24.0), Vec3::new(49.0, 3.0, 1.0)),
+            (Vec3::new(-24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0)),
+            (Vec3::new(24.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 49.0)),
+        ] {
+            scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
+        }
 
         // Коридоры: длинные стены с проходами.
-        push(Vec3::new(-8.0, 2.0, -9.0), Vec3::new(1.0, 4.0, 18.0), inner);
-        push(Vec3::new(8.0, 2.0, 9.0), Vec3::new(1.0, 4.0, 18.0), inner);
-        push(Vec3::new(0.0, 2.0, -16.0), Vec3::new(14.0, 4.0, 1.0), inner);
-        push(Vec3::new(0.0, 2.0, 16.0), Vec3::new(14.0, 4.0, 1.0), inner);
+        for (position, scale) in [
+            (Vec3::new(-8.0, 2.0, -9.0), Vec3::new(1.0, 4.0, 18.0)),
+            (Vec3::new(8.0, 2.0, 9.0), Vec3::new(1.0, 4.0, 18.0)),
+            (Vec3::new(0.0, 2.0, -16.0), Vec3::new(14.0, 4.0, 1.0)),
+            (Vec3::new(0.0, 2.0, 16.0), Vec3::new(14.0, 4.0, 1.0)),
+        ] {
+            scene.add(textured_cube(position, scale, inner, TEXTURE_CONCRETE, 0.5));
+        }
+
+        // Лампы (M4g): светящиеся плафоны на стенах коридоров — emissive.
+        // Источниками света пока не являются (динамический свет — позже).
+        for (position, scale) in [
+            (Vec3::new(-7.35, 2.6, -9.0), Vec3::new(0.3, 0.5, 0.3)),
+            (Vec3::new(7.35, 2.6, 9.0), Vec3::new(0.3, 0.5, 0.3)),
+            (Vec3::new(-3.0, 2.6, -15.35), Vec3::new(0.3, 0.3, 0.3)),
+            (Vec3::new(3.0, 2.6, 15.35), Vec3::new(0.3, 0.3, 0.3)),
+        ] {
+            scene.add(
+                SceneObject::new(position, scale, Vec4::new(0.10, 0.09, 0.08, 1.0))
+                    .with_asset(BUILTIN_CUBE)
+                    .with_emissive(Vec3::new(1.1, 0.85, 0.45)),
+            );
+        }
 
         let crates = [
             crate_object(-16.0, 20.0, &[("medkit", 1), ("bandage", 2)]),

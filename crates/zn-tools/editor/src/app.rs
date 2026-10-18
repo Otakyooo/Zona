@@ -531,6 +531,7 @@ impl EditorApp {
                 ui.label(RichText::new("Объекты").strong());
                 let mut selection = self.selected;
                 egui::ScrollArea::vertical()
+                    .id_salt("objects-list")
                     .max_height(280.0)
                     .show(ui, |ui| {
                         for (index, object) in self.scene.objects.iter().enumerate() {
@@ -572,32 +573,34 @@ impl EditorApp {
                     }
                 });
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(RichText::new("Встроенные примитивы").weak());
-                    for name in zn_assets::BUILTIN_MESH_NAMES {
-                        let key = zn_assets::builtin_key(name);
-                        ui.horizontal(|ui| {
-                            ui.label(&key);
-                            if ui.small_button("поставить").clicked() {
-                                self.pending_place = Some(key.clone());
-                                self.status = format!("клик по сцене разместит {key}");
-                            }
-                        });
-                    }
-                    ui.label(RichText::new("Файлы (content/assets)").weak());
-                    if self.asset_files.is_empty() {
-                        ui.label(RichText::new("<пусто>").weak());
-                    }
-                    for key in self.asset_files.clone() {
-                        ui.horizontal(|ui| {
-                            let label = key.replace('\\', "/");
-                            if ui.small_button(&label).clicked() {
-                                self.pending_place = Some(key.clone());
-                                self.status = format!("клик по сцене разместит {key}");
-                            }
-                        });
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .id_salt("assets-list")
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Встроенные примитивы").weak());
+                        for name in zn_assets::BUILTIN_MESH_NAMES {
+                            let key = zn_assets::builtin_key(name);
+                            ui.horizontal(|ui| {
+                                ui.label(&key);
+                                if ui.small_button("поставить").clicked() {
+                                    self.pending_place = Some(key.clone());
+                                    self.status = format!("клик по сцене разместит {key}");
+                                }
+                            });
+                        }
+                        ui.label(RichText::new("Файлы (content/assets)").weak());
+                        if self.asset_files.is_empty() {
+                            ui.label(RichText::new("<пусто>").weak());
+                        }
+                        for key in self.asset_files.clone() {
+                            ui.horizontal(|ui| {
+                                let label = key.replace('\\', "/");
+                                if ui.small_button(&label).clicked() {
+                                    self.pending_place = Some(key.clone());
+                                    self.status = format!("клик по сцене разместит {key}");
+                                }
+                            });
+                        }
+                    });
             });
 
         egui::Panel::right("properties")
