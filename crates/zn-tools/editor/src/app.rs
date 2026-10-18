@@ -1088,6 +1088,8 @@ impl ApplicationHandler for EditorApp {
                 if let (Some(renderer), Some(ui_renderer)) =
                     (self.renderer.as_mut(), self.ui_renderer.as_mut())
                 {
+                    // Атмосфера редактируемой локации (M4g) — как в игре.
+                    renderer.set_atmosphere(&self.scene.environment);
                     renderer.update_draw_list(&list);
                     let device = renderer.device().clone();
                     let queue = renderer.queue().clone();

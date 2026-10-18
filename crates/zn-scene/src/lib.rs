@@ -94,6 +94,62 @@ impl SceneAnomaly {
     }
 }
 
+// ── Атмосфера локации (M4g) ─────────────────────────────────────────────
+
+/// Атмосфера сцены (M4g): солнце и ambient для PBR, туман и градиент неба.
+/// Визуал клиента — симуляция эти поля не читает. Цвета линейные; направление
+/// солнца нормализует рендер (и [`Self::sun_direction_normalized`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneEnvironment {
+    /// Направление НА солнце (им освещаются поверхности).
+    pub sun_direction: Vec3,
+    /// Цвет солнечного света.
+    pub sun_color: Vec3,
+    /// Интенсивность солнца (масштаб прямого света).
+    pub sun_intensity: f32,
+    /// Цвет неба-ambient (рассеянный свет).
+    pub ambient_color: Vec3,
+    /// Интенсивность ambient.
+    pub ambient_intensity: f32,
+    /// Цвет тумана (к нему уходит дальний план).
+    pub fog_color: Vec3,
+    /// Плотность экспоненциального тумана (0 — туман выключен).
+    pub fog_density: f32,
+    /// Цвет неба в зените.
+    pub sky_top: Vec3,
+    /// Цвет неба у горизонта.
+    pub sky_horizon: Vec3,
+}
+
+impl Default for SceneEnvironment {
+    /// Нейтраль эпохи M4c: тёмный фон, один тёплый источник, без тумана.
+    fn default() -> Self {
+        Self {
+            sun_direction: Vec3::new(0.4, 0.8, 0.3),
+            sun_color: Vec3::new(1.0, 0.96, 0.88),
+            sun_intensity: 1.0,
+            ambient_color: Vec3::new(0.18, 0.20, 0.26),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.06, 0.07, 0.09),
+            fog_density: 0.0,
+            sky_top: Vec3::new(0.01, 0.012, 0.02),
+            sky_horizon: Vec3::new(0.03, 0.035, 0.05),
+        }
+    }
+}
+
+impl SceneEnvironment {
+    /// Направление НА солнце, нормализованное (защита от нулевого вектора).
+    pub fn sun_direction_normalized(&self) -> Vec3 {
+        let length = self.sun_direction.length();
+        if length > 1e-6 {
+            self.sun_direction / length
+        } else {
+            Vec3::Y
+        }
+    }
+}
+
 // ── Локации и переходы (M4d) ────────────────────────────────────────────
 
 /// Идентификатор локации мира (`LocationRegistry`).
@@ -514,6 +570,9 @@ pub struct Scene {
     /// Точки прибытия пузырей (M4d): сюда сервер высаживает игрока после ТП.
     #[serde(default)]
     pub bubble_arrivals: Vec<Vec3>,
+    /// Атмосфера локации (M4g): солнце, ambient, туман, небо.
+    #[serde(default)]
+    pub environment: SceneEnvironment,
 }
 
 impl Scene {
@@ -527,7 +586,14 @@ impl Scene {
             transitions: Vec::new(),
             bubbles: Vec::new(),
             bubble_arrivals: Vec::new(),
+            environment: SceneEnvironment::default(),
         }
+    }
+
+    /// Задаёт атмосферу локации (M4g).
+    pub fn with_environment(mut self, environment: SceneEnvironment) -> Self {
+        self.environment = environment;
+        self
     }
 
     pub fn add(&mut self, object: SceneObject) -> &mut Self {
@@ -602,6 +668,18 @@ impl Scene {
         let mut scene = Scene::new("demo_zone");
         scene.spawn = Vec3::new(0.0, 0.0, 14.0);
         scene.spawn_yaw = std::f32::consts::PI;
+        // Пасмурный день Зоны: мягкое солнце, серый горизонт, лёгкая дымка.
+        scene.environment = SceneEnvironment {
+            sun_direction: Vec3::new(0.4, 0.8, 0.3),
+            sun_color: Vec3::new(1.0, 0.95, 0.85),
+            sun_intensity: 0.9,
+            ambient_color: Vec3::new(0.24, 0.25, 0.28),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.62, 0.63, 0.60),
+            fog_density: 0.010,
+            sky_top: Vec3::new(0.35, 0.42, 0.52),
+            sky_horizon: Vec3::new(0.68, 0.68, 0.66),
+        };
 
         let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
             scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
@@ -731,6 +809,18 @@ impl Scene {
         let mut scene = Scene::new("base");
         scene.spawn = Vec3::new(0.0, 0.0, 14.0);
         scene.spawn_yaw = std::f32::consts::PI;
+        // Ясный день (безопасная зона): выше солнце, синее небо, дымка слабая.
+        scene.environment = SceneEnvironment {
+            sun_direction: Vec3::new(-0.35, 0.75, 0.45),
+            sun_color: Vec3::new(1.0, 0.95, 0.86),
+            sun_intensity: 1.1,
+            ambient_color: Vec3::new(0.28, 0.30, 0.36),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.60, 0.66, 0.75),
+            fog_density: 0.006,
+            sky_top: Vec3::new(0.12, 0.26, 0.55),
+            sky_horizon: Vec3::new(0.60, 0.70, 0.80),
+        };
 
         let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
             scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
@@ -845,6 +935,18 @@ impl Scene {
         let mut scene = Scene::new("svalka");
         scene.spawn = Vec3::new(38.0, 0.0, 0.0);
         scene.spawn_yaw = -std::f32::consts::FRAC_PI_2;
+        // Свалка: низкое пыльное солнце, рыжая мгла, тяжёлый туман.
+        scene.environment = SceneEnvironment {
+            sun_direction: Vec3::new(-0.25, 0.62, 0.50),
+            sun_color: Vec3::new(1.0, 0.88, 0.68),
+            sun_intensity: 0.8,
+            ambient_color: Vec3::new(0.30, 0.27, 0.22),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.50, 0.44, 0.35),
+            fog_density: 0.020,
+            sky_top: Vec3::new(0.30, 0.29, 0.26),
+            sky_horizon: Vec3::new(0.60, 0.54, 0.44),
+        };
 
         let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
             scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));
@@ -947,6 +1049,20 @@ impl Scene {
         let mut scene = Scene::new("podzemka");
         scene.spawn = Vec3::new(-15.0, 0.0, 0.0);
         scene.spawn_yaw = std::f32::consts::FRAC_PI_2;
+        // Подземка: почти нет солнца, холодный ambient, тёмная мгла коридоров.
+        // Лампы (emissive) появятся в G2/G5 — пока ambient чуть выше минимума,
+        // чтобы коридоры читались.
+        scene.environment = SceneEnvironment {
+            sun_direction: Vec3::new(0.0, 1.0, 0.0),
+            sun_color: Vec3::new(0.70, 0.78, 0.95),
+            sun_intensity: 0.20,
+            ambient_color: Vec3::new(0.20, 0.22, 0.26),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.04, 0.05, 0.07),
+            fog_density: 0.035,
+            sky_top: Vec3::new(0.004, 0.005, 0.009),
+            sky_horizon: Vec3::new(0.02, 0.025, 0.04),
+        };
 
         let mut push = |position: Vec3, scale: Vec3, color: Vec4| {
             scene.add(SceneObject::new(position, scale, color).with_asset(BUILTIN_CUBE));

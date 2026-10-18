@@ -2131,6 +2131,9 @@ impl ApplicationHandler for ClientApp {
                 let list = self.build_frame_draw_list();
                 let hud = self.collect_hud_data();
                 if let Some(renderer) = self.renderer.as_mut() {
+                    // Атмосфера локации (M4g): свет, туман и небо каждый кадр —
+                    // смена локации подхватывается сразу.
+                    renderer.set_atmosphere(&self.scene.environment);
                     // Ресурсы всех батчей помечаем использованными до кулинга:
                     // оффскрин-объекты не должны вытеснять видимые из LRU.
                     renderer.touch_scene(&list);

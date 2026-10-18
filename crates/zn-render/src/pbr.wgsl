@@ -1,9 +1,13 @@
 struct Camera {
     view_proj: mat4x4<f32>,
+    inverse_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
     light_dir: vec4<f32>,
-    light_color: vec4<f32>,
-    ambient: vec4<f32>,
+    light_color: vec4<f32>, // rgb — цвет солнца, w — интенсивность
+    ambient: vec4<f32>, // rgb — цвет ambient, w — интенсивность
+    fog_color: vec4<f32>, // rgb — цвет тумана, w — плотность
+    sky_top: vec4<f32>,
+    sky_horizon: vec4<f32>,
     output_srgb: f32,
     _pad0: f32,
     _pad1: f32,
@@ -171,7 +175,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let ndotv = max(dot(n, v), 1e-4);
 
     let f0 = mix(vec3<f32>(0.04), base_color.rgb, metallic);
-    let radiance = camera.light_color.rgb * ndotl;
+    let radiance = camera.light_color.rgb * camera.light_color.w * ndotl;
 
     let ndf = distribution_ggx(n, h, roughness);
     let g = geometry_smith(n, v, l, roughness);
@@ -181,10 +185,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let diffuse = kd * base_color.rgb / PI;
 
     let direct = (diffuse + specular) * radiance;
-    let ambient = camera.ambient.rgb * base_color.rgb * ao_sample;
+    let ambient = camera.ambient.rgb * camera.ambient.w * base_color.rgb * ao_sample;
     let emissive = material.emissive_factor.rgb * emissive_sample.rgb;
 
     var color = direct + ambient + emissive;
+
+    // Туман (M4g): экспоненциально по дистанции до камеры, в линейном цвете.
+    let fog_distance = length(camera.camera_pos.xyz - in.world_position);
+    let fog_factor = clamp(1.0 - exp(-camera.fog_color.w * fog_distance), 0.0, 1.0);
+    color = mix(color, camera.fog_color.rgb, fog_factor);
+
     color = aces_fitted(color);
     if (camera.output_srgb > 0.5) {
         color = linear_to_srgb(color);

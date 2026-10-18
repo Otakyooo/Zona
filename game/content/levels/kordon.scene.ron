@@ -951,4 +951,15 @@
         (6.0, 0.0, 19.0),
         (-8.0, 0.0, 20.0),
     ],
+    environment: (
+        sun_direction: (0.4, 0.8, 0.3),
+        sun_color: (1.0, 0.95, 0.85),
+        sun_intensity: 0.9,
+        ambient_color: (0.24, 0.25, 0.28),
+        ambient_intensity: 1.0,
+        fog_color: (0.62, 0.63, 0.6),
+        fog_density: 0.01,
+        sky_top: (0.35, 0.42, 0.52),
+        sky_horizon: (0.68, 0.68, 0.66),
+    ),
 )

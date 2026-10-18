@@ -3,8 +3,9 @@ mod tests {
     use glam::Vec3;
     use zn_scene::{
         distances_to_base, world_content_hash, AnomalyKind, ColliderShape, LocationRegistry,
-        LootEntry, Scene, SceneAnomaly, SceneBubble, SceneObject, SceneTransition, BUILTIN_CUBE,
-        LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA, LOCATION_SVALKA,
+        LootEntry, Scene, SceneAnomaly, SceneBubble, SceneEnvironment, SceneObject,
+        SceneTransition, BUILTIN_CUBE, LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA,
+        LOCATION_SVALKA,
     };
 
     #[test]
@@ -20,6 +21,76 @@ mod tests {
         let text = scene.to_ron().unwrap();
         let loaded = Scene::from_ron(&text).unwrap();
         assert_eq!(loaded, scene);
+    }
+
+    #[test]
+    fn legacy_ron_missing_environment_gets_default() {
+        let legacy = r#"
+(
+    name: "legacy",
+    spawn: (0.0, 2.0, 0.0),
+    objects: [],
+)
+"#;
+        let scene = Scene::from_ron(legacy).unwrap();
+        assert_eq!(scene.environment, SceneEnvironment::default());
+        assert_eq!(scene.environment.fog_density, 0.0);
+    }
+
+    #[test]
+    fn environment_roundtrips_through_ron() {
+        let mut scene = Scene::new("atmo");
+        scene.environment = SceneEnvironment {
+            sun_direction: Vec3::new(-1.0, 2.0, 0.5),
+            sun_color: Vec3::new(1.0, 0.8, 0.6),
+            sun_intensity: 0.7,
+            ambient_color: Vec3::new(0.1, 0.12, 0.2),
+            ambient_intensity: 0.5,
+            fog_color: Vec3::new(0.3, 0.3, 0.4),
+            fog_density: 0.03,
+            sky_top: Vec3::new(0.1, 0.2, 0.5),
+            sky_horizon: Vec3::new(0.5, 0.6, 0.7),
+        };
+
+        let text = scene.to_ron().unwrap();
+        let loaded = Scene::from_ron(&text).unwrap();
+        assert_eq!(loaded, scene);
+        assert_eq!(loaded.environment, scene.environment);
+    }
+
+    #[test]
+    fn sun_direction_normalizes_and_survives_zero() {
+        let mut env = SceneEnvironment {
+            sun_direction: Vec3::new(0.0, 5.0, 0.0),
+            ..Default::default()
+        };
+        assert!((env.sun_direction_normalized() - Vec3::Y).length() < 1e-6);
+
+        env.sun_direction = Vec3::ZERO;
+        assert_eq!(env.sun_direction_normalized(), Vec3::Y);
+    }
+
+    #[test]
+    fn world_locations_have_distinct_environments() {
+        let base = Scene::base();
+        let kordon = Scene::kordon();
+        let svalka = Scene::svalka();
+        let podzemka = Scene::podzemka();
+
+        // Кордон — тот же день, что demo_zone (наследует).
+        assert_eq!(kordon.environment, Scene::demo_zone().environment);
+        // База светлее Кордона, туман слабее.
+        assert!(base.environment.fog_density < kordon.environment.fog_density);
+        assert!(
+            base.environment.ambient_color.length() > kordon.environment.ambient_color.length()
+        );
+        // Свалка мглистее Кордона, Подземка — тёмная и самая плотная.
+        assert!(svalka.environment.fog_density > kordon.environment.fog_density);
+        assert!(podzemka.environment.fog_density > svalka.environment.fog_density);
+        assert!(podzemka.environment.sun_intensity < 0.5);
+        assert!(
+            podzemka.environment.ambient_color.length() < svalka.environment.ambient_color.length()
+        );
     }
 
     #[test]

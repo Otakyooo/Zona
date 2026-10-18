@@ -382,4 +382,15 @@
         ),
     ],
     bubble_arrivals: [],
+    environment: (
+        sun_direction: (-0.25, 0.62, 0.5),
+        sun_color: (1.0, 0.88, 0.68),
+        sun_intensity: 0.8,
+        ambient_color: (0.3, 0.27, 0.22),
+        ambient_intensity: 1.0,
+        fog_color: (0.5, 0.44, 0.35),
+        fog_density: 0.02,
+        sky_top: (0.3, 0.29, 0.26),
+        sky_horizon: (0.6, 0.54, 0.44),
+    ),
 )

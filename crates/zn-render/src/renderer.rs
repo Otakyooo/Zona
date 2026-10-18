@@ -19,6 +19,7 @@ use crate::camera::Camera;
 use crate::mesh::{cpu_mesh_vertices, GpuMesh, Vertex};
 use crate::renderer::types::CameraUniform;
 use zn_assets::{CpuImage, CpuMaterial, CpuMesh};
+use zn_scene::SceneEnvironment;
 
 pub const MAX_INSTANCES: usize = 8192;
 
@@ -67,6 +68,8 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
     blend_pipeline: wgpu::RenderPipeline,
+    /// Фон-небо (M4g): полноэкранный пасс с градиентом и солнцем.
+    sky_pipeline: wgpu::RenderPipeline,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -161,16 +164,22 @@ impl Renderer {
         // Не-sRGB поверхность (Bgra8Unorm): шейдер кодирует линейный цвет сам.
         let output_srgb = if config.format.is_srgb() { 0.0 } else { 1.0 };
 
-        let light_direction = glam::Vec3::new(0.4, 0.8, 0.3).normalize();
-        let camera_uniform = CameraUniform {
+        // Стартовая атмосфера — нейтраль контента (M4g): клиент перезапишет
+        // её атмосферой загруженной локации.
+        let mut camera_uniform = CameraUniform {
             view_projection: glam::Mat4::IDENTITY.to_cols_array(),
+            inverse_view_projection: glam::Mat4::IDENTITY.to_cols_array(),
             camera_position: [0.0, 0.0, 0.0, 1.0],
-            light_direction: [light_direction.x, light_direction.y, light_direction.z, 0.0],
-            light_color: [1.0, 0.96, 0.88, 1.0],
-            ambient_color: [0.18, 0.20, 0.26, 1.0],
+            light_direction: [0.0, 1.0, 0.0, 0.0],
+            light_color: [1.0, 1.0, 1.0, 1.0],
+            ambient_color: [0.0, 0.0, 0.0, 1.0],
+            fog_color: [0.0, 0.0, 0.0, 0.0],
+            sky_top: [0.0, 0.0, 0.0, 0.0],
+            sky_horizon: [0.0, 0.0, 0.0, 0.0],
             output_srgb,
             _padding: [0.0; 3],
         };
+        camera_uniform.apply_environment(&SceneEnvironment::default());
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zn-camera-uniform"),
             size: std::mem::size_of::<CameraUniform>() as u64,
@@ -372,6 +381,53 @@ impl Renderer {
         });
         let blend_pipeline = device.create_render_pipeline(&blend_descriptor);
 
+        // Небо (M4g): полноэкранный треугольник без вершинных буферов; глубина
+        // не пишется и не проверяется — пасс идёт первым и служит фоном.
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("zn-sky-shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("sky.wgsl"))),
+        });
+        let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("zn-sky-layout"),
+            bind_group_layouts: &[Some(&camera_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("zn-sky-pipeline"),
+            layout: Some(&sky_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_main"),
+                targets: &opaque_targets,
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zn-instances"),
             size: (MAX_INSTANCES * std::mem::size_of::<InstanceRaw>()) as u64,
@@ -389,6 +445,7 @@ impl Renderer {
             depth_view,
             pipeline,
             blend_pipeline,
+            sky_pipeline,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -765,13 +822,21 @@ impl Renderer {
     // --- кадровый цикл -----------------------------------------------------
 
     pub fn update_camera(&mut self, camera: &Camera) {
-        self.camera_uniform.view_projection = camera.view_projection().to_cols_array();
+        let view_projection = camera.view_projection();
+        self.camera_uniform.view_projection = view_projection.to_cols_array();
+        self.camera_uniform.inverse_view_projection = view_projection.inverse().to_cols_array();
         self.camera_uniform.camera_position = camera.position.extend(1.0).to_array();
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
+    }
+
+    /// Применяет атмосферу локации (M4g): солнце, ambient, туман и цвета неба.
+    /// Проводится каждый кадр — смена локации подхватывается сразу.
+    pub fn set_atmosphere(&mut self, environment: &SceneEnvironment) {
+        self.camera_uniform.apply_environment(environment);
     }
 
     /// Загружает кадровый DrawList: плоский буфер инстансов + диапазоны
@@ -912,6 +977,12 @@ impl Renderer {
             order.extend(blend_indices);
 
             let mut blend_pass_active = false;
+
+            // Фон-небо (M4g) — первым; сцена с depth-тестом перекрывает его.
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
