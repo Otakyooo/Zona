@@ -5,6 +5,7 @@ pub mod builtin;
 pub mod error;
 pub mod images;
 pub mod import;
+pub mod textures;
 pub mod types;
 
 pub use builtin::{
@@ -13,6 +14,9 @@ pub use builtin::{
 pub use error::AssetError;
 pub use images::{decode_image, decode_image_bytes, scan_asset_directory, IMAGE_EXTENSIONS};
 pub use import::{apply_base_color_srgb, import_gltf};
+pub use textures::{
+    builtin_texture, parse_builtin_texture_key, BUILTIN_TEXTURE_NAMES, BUILTIN_TEXTURE_SIZE,
+};
 pub use types::{
     generate_mip_chain, AlphaMode, AssetVertex, Bounds, CpuImage, CpuMaterial, CpuMesh,
     ImportedAsset,
