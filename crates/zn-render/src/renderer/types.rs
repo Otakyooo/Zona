@@ -3,6 +3,8 @@ use bytemuck::{Pod, Zeroable};
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub(crate) struct CameraUniform {
+    /// Матрица теневого прохода (M4g) — первой: shadow.wgsl читает только её.
+    pub light_view_projection: [f32; 16],
     pub view_projection: [f32; 16],
     /// Обратная view-projection — для лучей неба по экрану (M4g).
     pub inverse_view_projection: [f32; 16],
@@ -114,10 +116,10 @@ mod tests {
 
     #[test]
     fn camera_uniform_is_16_byte_aligned() {
-        // 2×[f32;16] + 7×[f32;4] + f32 + [f32;3].
+        // 3×[f32;16] + 7×[f32;4] + f32 + [f32;3].
         let size = std::mem::size_of::<CameraUniform>();
         assert_eq!(size % 16, 0, "uniform должен быть кратен 16: {size}");
-        assert_eq!(size, 256);
+        assert_eq!(size, 320);
     }
 
     #[test]

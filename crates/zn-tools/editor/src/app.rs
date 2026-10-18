@@ -1090,6 +1090,8 @@ impl ApplicationHandler for EditorApp {
                 {
                     // Атмосфера редактируемой локации (M4g) — как в игре.
                     renderer.set_atmosphere(&self.scene.environment);
+                    let (bounds_min, bounds_max) = self.scene.bounds();
+                    renderer.set_shadow_bounds(bounds_min, bounds_max);
                     renderer.update_draw_list(&list);
                     let device = renderer.device().clone();
                     let queue = renderer.queue().clone();

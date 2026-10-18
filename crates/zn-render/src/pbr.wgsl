@@ -1,4 +1,5 @@
 struct Camera {
+    light_view_proj: mat4x4<f32>,
     view_proj: mat4x4<f32>,
     inverse_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
@@ -27,6 +28,8 @@ struct Material {
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_sampler: sampler_comparison;
 @group(1) @binding(0) var<uniform> material: Material;
 @group(1) @binding(1) var base_tex: texture_2d<f32>;
 @group(1) @binding(2) var metal_rough_tex: texture_2d<f32>;
@@ -137,6 +140,30 @@ fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
 
+// Тень от солнца: PCF 3×3 по карте глубины (M4g). Ноль — полностью в тени.
+fn shadow_factor(world_position: vec3<f32>) -> f32 {
+    let light_clip = camera.light_view_proj * vec4<f32>(world_position, 1.0);
+    let uv = vec2<f32>(light_clip.x * 0.5 + 0.5, 0.5 - light_clip.y * 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0; // вне карты — считаем освещённым
+    }
+    let depth = light_clip.z;
+    if (depth < 0.0 || depth > 1.0) {
+        return 1.0;
+    }
+
+    let texel = 1.0 / f32(textureDimensions(shadow_map, 0).x);
+    let bias = 0.0015;
+    var sum = 0.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel;
+            sum = sum + textureSampleCompare(shadow_map, shadow_sampler, uv + offset, depth - bias);
+        }
+    }
+    return sum / 9.0;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let view_dir = normalize(camera.camera_pos.xyz - in.world_position);
@@ -184,7 +211,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let kd = (vec3<f32>(1.0) - f) * (1.0 - metallic);
     let diffuse = kd * base_color.rgb / PI;
 
-    let direct = (diffuse + specular) * radiance;
+    let direct = (diffuse + specular) * radiance * shadow_factor(in.world_position);
     let ambient = camera.ambient.rgb * camera.ambient.w * base_color.rgb * ao_sample;
     let emissive = material.emissive_factor.rgb * emissive_sample.rgb;
 

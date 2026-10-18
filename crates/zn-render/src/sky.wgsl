@@ -2,6 +2,7 @@
 // Рисуется первым в главном проходе как фон (глубина не пишется).
 
 struct Camera {
+    light_view_proj: mat4x4<f32>,
     view_proj: mat4x4<f32>,
     inverse_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
@@ -70,9 +71,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let below = clamp(-direction.y * 3.0, 0.0, 1.0);
     color = mix(color, camera.fog_color.rgb, below);
 
-    // Солнце: мягкий блик и ядро.
+    // Солнце: узкое ядро и совсем слабый ореол.
     let sun_amount = max(dot(direction, normalize(camera.light_dir.xyz)), 0.0);
-    let glow = pow(sun_amount, 8.0) * 0.10 + pow(sun_amount, 128.0) * 0.60;
+    let glow = pow(sun_amount, 12.0) * 0.05 + pow(sun_amount, 256.0) * 0.8;
     color += camera.light_color.rgb * camera.light_color.w * glow;
 
     color = aces_fitted(color);

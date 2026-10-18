@@ -633,6 +633,22 @@ impl Scene {
         self.objects.iter().filter(|o| o.solid)
     }
 
+    /// AABB всех объектов сцены (M4g: охват теневой карты). Для пустой
+    /// сцены — точка спавна.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        let mut min = Vec3::splat(f32::INFINITY);
+        let mut max = Vec3::splat(f32::NEG_INFINITY);
+        for object in &self.objects {
+            let (object_min, object_max) = object.bounds();
+            min = min.min(object_min);
+            max = max.max(object_max);
+        }
+        if !min.is_finite() || !max.is_finite() {
+            return (self.spawn, self.spawn);
+        }
+        (min, max)
+    }
+
     pub fn to_ron(&self) -> Result<String, ron::Error> {
         ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())
     }

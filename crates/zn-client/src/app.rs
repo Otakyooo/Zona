@@ -2134,6 +2134,9 @@ impl ApplicationHandler for ClientApp {
                     // Атмосфера локации (M4g): свет, туман и небо каждый кадр —
                     // смена локации подхватывается сразу.
                     renderer.set_atmosphere(&self.scene.environment);
+                    // Охват теневой карты — по AABB текущей локации.
+                    let (bounds_min, bounds_max) = self.scene.bounds();
+                    renderer.set_shadow_bounds(bounds_min, bounds_max);
                     // Ресурсы всех батчей помечаем использованными до кулинга:
                     // оффскрин-объекты не должны вытеснять видимые из LRU.
                     renderer.touch_scene(&list);

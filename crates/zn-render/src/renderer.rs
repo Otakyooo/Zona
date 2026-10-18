@@ -13,6 +13,9 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+use glam::camera::rh::proj::directx::orthographic;
+use glam::camera::rh::view::look_at_mat4;
+
 use std::sync::Arc;
 
 use crate::camera::Camera;
@@ -22,6 +25,34 @@ use zn_assets::{CpuImage, CpuMaterial, CpuMesh};
 use zn_scene::SceneEnvironment;
 
 pub const MAX_INSTANCES: usize = 8192;
+
+/// Сторона карты теней (M4g): одна ортопроекция на локацию, PCF 3×3.
+pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// Матрица теневого прохода (M4g): ортопроекция вдоль направления солнца,
+/// накрывающая AABB сцены (сфера радиуса `radius` вокруг центра). Нулевое
+/// направление трактуется как строго вверх. Чистая функция — тестируется без GPU.
+pub fn directional_shadow_matrix(
+    direction: glam::Vec3,
+    min: glam::Vec3,
+    max: glam::Vec3,
+) -> glam::Mat4 {
+    let mut direction = direction.normalize_or_zero();
+    if direction == glam::Vec3::ZERO {
+        direction = glam::Vec3::Y;
+    }
+    let center = (min + max) * 0.5;
+    let radius = ((max - min).length() * 0.5).max(1.0);
+    let up = if direction.y.abs() > 0.99 {
+        glam::Vec3::Z
+    } else {
+        glam::Vec3::Y
+    };
+    let eye = center + direction * (radius + 1.0);
+    let view = look_at_mat4(eye, center, up);
+    let projection = orthographic(-radius, radius, -radius, radius, 0.0, 2.0 * radius + 2.0);
+    projection * view
+}
 
 fn create_depth(
     device: &wgpu::Device,
@@ -70,6 +101,12 @@ pub struct Renderer {
     blend_pipeline: wgpu::RenderPipeline,
     /// Фон-небо (M4g): полноэкранный пасс с градиентом и солнцем.
     sky_pipeline: wgpu::RenderPipeline,
+    /// Теневой проход (M4g): глубина сцены вдоль солнца.
+    shadow_pipeline: wgpu::RenderPipeline,
+    shadow_camera_bind_group: wgpu::BindGroup,
+    shadow_view: wgpu::TextureView,
+    /// Границы сцены для теневой карты (обновляет клиент/редактор).
+    shadow_bounds: (glam::Vec3, glam::Vec3),
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -161,12 +198,40 @@ impl Renderer {
 
         let (depth_texture, depth_view) = create_depth(&device, &config);
 
+        // Карта теней (M4g): depth-only цель солнца, сравнивается sampler'ом.
+        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("zn-shadow-map"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("zn-shadow-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+
         // Не-sRGB поверхность (Bgra8Unorm): шейдер кодирует линейный цвет сам.
         let output_srgb = if config.format.is_srgb() { 0.0 } else { 1.0 };
 
         // Стартовая атмосфера — нейтраль контента (M4g): клиент перезапишет
         // её атмосферой загруженной локации.
         let mut camera_uniform = CameraUniform {
+            light_view_projection: glam::Mat4::IDENTITY.to_cols_array(),
             view_projection: glam::Mat4::IDENTITY.to_cols_array(),
             inverse_view_projection: glam::Mat4::IDENTITY.to_cols_array(),
             camera_position: [0.0, 0.0, 0.0, 1.0],
@@ -191,26 +256,55 @@ impl Renderer {
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("zn-camera-layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(
-                            std::mem::size_of::<CameraUniform>() as u64,
-                        ),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                std::mem::size_of::<CameraUniform>() as u64,
+                            ),
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    // Карта теней (M4g): глубина солнца + сравнивающий сэмплер.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                ],
             });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("zn-camera-bind-group"),
             layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+            ],
         });
 
         // Layout материала: uniform + 5 текстур + сэмплер.
@@ -428,6 +522,82 @@ impl Renderer {
             cache: None,
         });
 
+        // Теневой проход (M4g): глубина вдоль солнца, без цвета и материала.
+        // Отсекаются лицевые грани (пишем дальние) — меньше acne на кубах;
+        // slope-scale bias добавляет pipeline.
+        // Отдельный bind group только с матрицей: карта теней не должна быть
+        // одновременно целью записи и ресурсом в одном проходе.
+        let shadow_camera_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zn-shadow-camera-layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<CameraUniform>() as u64,
+                        ),
+                    },
+                    count: None,
+                }],
+            });
+        let shadow_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zn-shadow-camera-bind-group"),
+            layout: &shadow_camera_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("zn-shadow-shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "shadow.wgsl"
+            ))),
+        });
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("zn-shadow-layout"),
+                bind_group_layouts: &[Some(&shadow_camera_layout)],
+                immediate_size: 0,
+            });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("zn-shadow-pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(Vertex::desc()), Some(InstanceRaw::desc())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Front),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zn-instances"),
             size: (MAX_INSTANCES * std::mem::size_of::<InstanceRaw>()) as u64,
@@ -446,6 +616,10 @@ impl Renderer {
             pipeline,
             blend_pipeline,
             sky_pipeline,
+            shadow_pipeline,
+            shadow_camera_bind_group,
+            shadow_view,
+            shadow_bounds: (glam::Vec3::splat(-1.0), glam::Vec3::splat(1.0)),
             camera_uniform,
             camera_buffer,
             camera_bind_group,
@@ -826,6 +1000,14 @@ impl Renderer {
         self.camera_uniform.view_projection = view_projection.to_cols_array();
         self.camera_uniform.inverse_view_projection = view_projection.inverse().to_cols_array();
         self.camera_uniform.camera_position = camera.position.extend(1.0).to_array();
+        // Теневая матрица (M4g) — от текущего солнца и границ локации.
+        let light = &self.camera_uniform.light_direction;
+        self.camera_uniform.light_view_projection = directional_shadow_matrix(
+            glam::Vec3::new(light[0], light[1], light[2]),
+            self.shadow_bounds.0,
+            self.shadow_bounds.1,
+        )
+        .to_cols_array();
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -837,6 +1019,11 @@ impl Renderer {
     /// Проводится каждый кадр — смена локации подхватывается сразу.
     pub fn set_atmosphere(&mut self, environment: &SceneEnvironment) {
         self.camera_uniform.apply_environment(environment);
+    }
+
+    /// Границы сцены (AABB объектов) для охвата теневой карты (M4g).
+    pub fn set_shadow_bounds(&mut self, min: glam::Vec3, max: glam::Vec3) {
+        self.shadow_bounds = (min, max);
     }
 
     /// Загружает кадровый DrawList: плоский буфер инстансов + диапазоны
@@ -927,6 +1114,43 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("zn-frame"),
             });
+
+        // Теневой проход (M4g): только непрозрачные кастеры, глубину пишем
+        // в карту; главный проход затем сэмплирует её в pbr.wgsl.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("zn-shadow-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.shadow_pipeline);
+            pass.set_bind_group(0, &self.shadow_camera_bind_group, &[]);
+            let stride = std::mem::size_of::<InstanceRaw>() as u64;
+            for range in &self.draw_ranges {
+                if range.blend {
+                    continue; // полупрозрачные (ауры, пузыри) тени не бросают
+                }
+                let Some(mesh) = self.mesh_cache.peek(range.mesh) else {
+                    continue;
+                };
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                let start = range.instance_offset as u64 * stride;
+                let end = start + range.instance_count as u64 * stride;
+                pass.set_vertex_buffer(1, self.instance_buffer.slice(start..end));
+                pass.draw_indexed(0..mesh.index_count, 0, 0..range.instance_count);
+            }
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

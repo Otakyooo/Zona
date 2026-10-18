@@ -94,6 +94,20 @@ mod tests {
     }
 
     #[test]
+    fn scene_bounds_cover_objects_and_empty_falls_back_to_spawn() {
+        let kordon = Scene::kordon();
+        let (min, max) = kordon.bounds();
+        // Периметр demo_zone — стены ±30 с полутолщиной 0.5.
+        assert!(min.x <= -30.5 && max.x >= 30.5, "bounds: {min:?}..{max:?}");
+        assert!(min.z <= -30.5 && max.z >= 30.5);
+        assert!(max.y >= 3.0);
+
+        let mut empty = Scene::new("empty");
+        empty.spawn = Vec3::new(1.0, 2.0, 3.0);
+        assert_eq!(empty.bounds(), (empty.spawn, empty.spawn));
+    }
+
+    #[test]
     fn demo_zone_has_solids_and_spawn() {
         let scene = Scene::demo_zone();
         assert!(!scene.is_empty());
