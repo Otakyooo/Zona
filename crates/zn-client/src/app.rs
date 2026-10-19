@@ -20,7 +20,7 @@ use zn_net::{
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
     cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MaterialSpec, MeshId,
-    Renderer,
+    PostSettings, Renderer,
 };
 use zn_scene::{AnomalyKind, LocationId, Scene, SceneObject, LOCATION_BASE};
 use zn_sim::{
@@ -93,6 +93,10 @@ const ANOMALY_FLASH_SIZE: f32 = 1.1;
 const ANOMALY_HEAT_COLOR: [f32; 3] = [1.0, 0.45, 0.2];
 const ANOMALY_GRAVITY_COLOR: [f32; 3] = [0.5, 0.35, 1.0];
 const ANOMALY_FLASH_COLOR: Vec4 = Vec4::new(1.0, 0.95, 0.75, 0.8);
+/// HDR-усиление ярких эффектов (M4g-G3): цвет выше единицы — bloom
+/// подхватывает проявленные аномалии и вспышки, базовая мгла остаётся
+/// еле заметной (её вклад мал из-за низкой альфы).
+const ANOMALY_HDR_GAIN: f32 = 3.2;
 
 /// Болт в полёте: тонкая палочка вдоль направления движения.
 const BOLT_THICKNESS: f32 = 0.05;
@@ -105,6 +109,44 @@ const TP_FLASH_TTL: Duration = Duration::from_millis(260);
 const BUBBLE_DEFAULT_RADIUS: f32 = 1.2;
 const BUBBLE_COLOR: [f32; 3] = [0.45, 0.75, 1.0];
 const BUBBLE_ALPHA: f32 = 0.22;
+
+/// Артефакты светятся (M4g-G3): цвет из каталога усиливается до HDR, bloom
+/// делает лежащие в аномалиях артефакты заметными с первого взгляда.
+const ARTIFACT_HDR_GAIN: f32 = 2.4;
+/// Префикс ключей артефактов в каталоге предметов.
+const ARTIFACT_KEY_PREFIX: &str = "artifact_";
+
+/// Настройки постобработки (M4g-G3) — клавиши F6 (виньетка), F7 (bloom),
+/// F8 (порог bloom); подсказка с текущими значениями живёт `POST_HINT_TTL`.
+const VIGNETTE_ON: f32 = 0.35;
+const BLOOM_INTENSITY_STEPS: [f32; 4] = [0.0, 0.25, 0.45, 0.8];
+const BLOOM_THRESHOLD_STEPS: [f32; 3] = [0.6, 0.9, 1.2];
+const POST_HINT_TTL: Duration = Duration::from_secs(2);
+
+/// Следующее значение цикла настроек: ближайшее в `steps`, иначе первый шаг.
+fn cycle_value(current: f32, steps: &[f32]) -> f32 {
+    let index = steps
+        .iter()
+        .position(|step| (*step - current).abs() < 1e-4)
+        .map_or(0, |index| (index + 1) % steps.len());
+    steps[index]
+}
+
+/// Цвет предмета на земле (M4g-G3): артефакты усиливаются до HDR, чтобы
+/// bloom делал их заметными издалека; обычный лут остаётся в LDR.
+fn ground_item_color(definition: &zn_content::Item) -> Vec4 {
+    let gain = if definition.key.starts_with(ARTIFACT_KEY_PREFIX) {
+        ARTIFACT_HDR_GAIN
+    } else {
+        1.0
+    };
+    Vec4::new(
+        definition.color[0] * gain,
+        definition.color[1] * gain,
+        definition.color[2] * gain,
+        1.0,
+    )
+}
 
 /// Интервал диагностического лога reconciliation, с.
 const RECONCILE_LOG_INTERVAL_SECS: f32 = 5.0;
@@ -173,6 +215,13 @@ struct AnomalyFlash {
 /// Строка kill-фида: текст и время жизни.
 #[derive(Debug)]
 struct KillFeedEntry {
+    text: String,
+    until: Instant,
+}
+
+/// Подсказка настроек постобработки (M4g-G3): текст и время жизни.
+#[derive(Debug)]
+struct PostHint {
     text: String,
     until: Instant,
 }
@@ -249,6 +298,8 @@ struct HudData {
     respawn_secs: Option<f32>,
     /// Строки kill-фида: текст и альфа (1 — свежая, 0 — угасла).
     feed: Vec<(String, f32)>,
+    /// Подсказка настроек постобработки (F6–F8), пока свежа.
+    post_hint: Option<String>,
     /// Секунды с запуска клиента — время для egui.
     time: f64,
     /// Подсказка взаимодействия под прицелом («[E] Обыскать»).
@@ -314,6 +365,11 @@ pub struct ClientApp {
     my_killer: Option<String>,
     /// Последние смерти — строки kill-фида.
     kill_feed: Vec<KillFeedEntry>,
+    /// Подсказка настроек постобработки (клавиши F6–F8).
+    post_hint: Option<PostHint>,
+    /// Настройки постобработки (M4g-G3): источник правды клиента, кладётся
+    /// в рендер при его создании и при каждой правке клавишами.
+    post_settings: PostSettings,
     builtin_mesh_ids: HashMap<String, MeshId>,
     cursor_grabbed: bool,
     fixed: FixedStep,
@@ -516,6 +572,8 @@ impl ClientApp {
             my_respawn_tick: None,
             my_killer: None,
             kill_feed: Vec::new(),
+            post_hint: None,
+            post_settings: PostSettings::default(),
             builtin_mesh_ids: HashMap::new(),
             cursor_grabbed: false,
             fixed: FixedStep::from_hz(60),
@@ -902,14 +960,7 @@ impl ClientApp {
             let color = self
                 .catalog
                 .get(item.item)
-                .map_or(DEFAULT_ITEM_COLOR, |definition| {
-                    Vec4::new(
-                        definition.color[0],
-                        definition.color[1],
-                        definition.color[2],
-                        1.0,
-                    )
-                });
+                .map_or(DEFAULT_ITEM_COLOR, ground_item_color);
             let model = Mat4::from_scale_rotation_translation(
                 Vec3::splat(GROUND_ITEM_SIZE),
                 Quat::IDENTITY,
@@ -980,7 +1031,14 @@ impl ClientApp {
                 anomaly_material,
                 InstanceRaw {
                     model: model.to_cols_array(),
-                    color: [rgb[0], rgb[1], rgb[2], alpha],
+                    // HDR (M4g-G3): проявленная аномалия ярче единицы — bloom
+                    // подсвечивает её, базовая мгла (низкая альфа) — нет.
+                    color: [
+                        rgb[0] * ANOMALY_HDR_GAIN,
+                        rgb[1] * ANOMALY_HDR_GAIN,
+                        rgb[2] * ANOMALY_HDR_GAIN,
+                        alpha,
+                    ],
                 },
             );
         }
@@ -997,7 +1055,13 @@ impl ClientApp {
                 anomaly_material,
                 InstanceRaw {
                     model: model.to_cols_array(),
-                    color: ANOMALY_FLASH_COLOR.to_array(),
+                    // Вспышка — тоже HDR (M4g-G3): короткий яркий импульс.
+                    color: [
+                        ANOMALY_FLASH_COLOR.x * ANOMALY_HDR_GAIN,
+                        ANOMALY_FLASH_COLOR.y * ANOMALY_HDR_GAIN,
+                        ANOMALY_FLASH_COLOR.z * ANOMALY_HDR_GAIN,
+                        ANOMALY_FLASH_COLOR.w,
+                    ],
                 },
             );
         }
@@ -1293,8 +1357,8 @@ impl ClientApp {
 
     /// Действия вне инпутов: E (обыск/подбор/закрыть), G (бросок болта),
     /// I (инвентарь), H (склад на базе), T (взять всё), Q (выбросить),
-    /// Enter (взять/использовать/сдать), стрелки (навигация). Панели passive —
-    /// курсор остаётся в игре.
+    /// Enter (взять/использовать/сдать), стрелки (навигация), F6–F8
+    /// (постобработка). Панели passive — курсор остаётся в игре.
     fn handle_action_keys(&mut self) {
         if self.input.just_pressed(KeyCode::KeyE) {
             self.send_action(PlayerAction::Interact);
@@ -1326,7 +1390,51 @@ impl ClientApp {
         if self.input.just_pressed(KeyCode::Enter) {
             self.press_enter();
         }
+        self.handle_post_keys();
         self.handle_panel_navigation();
+    }
+
+    /// Настройки постобработки (M4g-G3): F6 — виньетка вкл/выкл, F7 — цикл
+    /// интенсивности bloom, F8 — цикл порога. Клиент держит значения у себя
+    /// (работает и без рендера), рендер получает их при создании и правке.
+    fn handle_post_keys(&mut self) {
+        let mut changed = false;
+        if self.input.just_pressed(KeyCode::F6) {
+            self.post_settings.vignette = if self.post_settings.vignette > 0.0 {
+                0.0
+            } else {
+                VIGNETTE_ON
+            };
+            changed = true;
+        }
+        if self.input.just_pressed(KeyCode::F7) {
+            self.post_settings.bloom_intensity =
+                cycle_value(self.post_settings.bloom_intensity, &BLOOM_INTENSITY_STEPS);
+            changed = true;
+        }
+        if self.input.just_pressed(KeyCode::F8) {
+            self.post_settings.bloom_threshold =
+                cycle_value(self.post_settings.bloom_threshold, &BLOOM_THRESHOLD_STEPS);
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_post_settings(self.post_settings);
+        }
+        let vignette = if self.post_settings.vignette > 0.0 {
+            "вкл"
+        } else {
+            "выкл"
+        };
+        self.post_hint = Some(PostHint {
+            text: format!(
+                "виньетка {vignette} (F6) · bloom {:.2} (F7) · порог {:.2} (F8)",
+                self.post_settings.bloom_intensity, self.post_settings.bloom_threshold
+            ),
+            until: Instant::now() + POST_HINT_TTL,
+        });
     }
 
     /// Отправляет действие: серверу (с повтором `INPUT_REDUNDANCY` раз) либо в
@@ -1881,6 +1989,13 @@ impl ClientApp {
             self.healing = None;
         }
         self.kill_feed.retain(|entry| entry.until > now);
+        if self
+            .post_hint
+            .as_ref()
+            .is_some_and(|hint| hint.until <= now)
+        {
+            self.post_hint = None;
+        }
         let feed = self
             .kill_feed
             .iter()
@@ -2000,6 +2115,7 @@ impl ClientApp {
             },
             respawn_secs: if health == 0 { respawn_secs } else { None },
             feed,
+            post_hint: self.post_hint.as_ref().map(|hint| hint.text.clone()),
             time: self.started.elapsed().as_secs_f64(),
             hint,
             inventory,
@@ -2061,6 +2177,8 @@ impl ApplicationHandler for ClientApp {
         // HUD: egui-wgpu поверх сцены (msaa 1 — кадр без мультисэмплинга,
         // depth не нужен: проход оверлея идёт без depth attach).
         if let Some(renderer) = self.renderer.as_mut() {
+            // Настройки постобработки (M4g-G3), накопленные клиентом.
+            renderer.set_post_settings(self.post_settings);
             self.egui_ctx
                 .set_pixels_per_point(renderer.window().scale_factor() as f32);
             self.ui_renderer = Some(egui_wgpu::Renderer::new(
@@ -2331,6 +2449,17 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
             color,
         );
         y += 20.0;
+    }
+
+    // Подсказка настроек постобработки (M4g-G3) — верхний левый угол.
+    if let Some(hint) = &hud.post_hint {
+        painter.text(
+            egui::pos2(screen.left() + 18.0, screen.top() + 14.0),
+            egui::Align2::LEFT_TOP,
+            hint,
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_white_alpha(210),
+        );
     }
 
     // HP — левый нижний угол: полоска и число.
@@ -3567,5 +3696,81 @@ mod tests {
         app.inventory_select = 5;
         app.press_enter();
         assert!(drain_stash_actions(&server).is_empty());
+    }
+
+    // ── Постобработка (M4g-G3) ──────────────────────────────────────────
+
+    #[test]
+    fn cycle_value_walks_steps_and_wraps() {
+        let steps = [0.0, 0.25, 0.45];
+        assert_eq!(cycle_value(0.0, &steps), 0.25);
+        assert_eq!(cycle_value(0.25, &steps), 0.45);
+        assert_eq!(cycle_value(0.45, &steps), 0.0, "цикл замкнут");
+        // Неизвестное значение — первый шаг цикла.
+        assert_eq!(cycle_value(9.0, &steps), 0.0);
+    }
+
+    #[test]
+    fn post_keys_cycle_settings_and_show_hint() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        let defaults = app.post_settings;
+        assert!(defaults.vignette > 0.0);
+        assert!(BLOOM_INTENSITY_STEPS.contains(&defaults.bloom_intensity));
+
+        // F6 гасит виньетку, подсказка с текущими значениями уходит в HUD.
+        app.input.press_key(KeyCode::F6);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::F6);
+        assert_eq!(app.post_settings.vignette, 0.0);
+        let hud = app.collect_hud_data();
+        let hint = hud.post_hint.expect("подсказка настроек показана");
+        assert!(hint.contains("виньетка выкл"), "{hint}");
+
+        // Повторный F6 возвращает виньетку.
+        app.input.press_key(KeyCode::F6);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::F6);
+        assert_eq!(app.post_settings.vignette, VIGNETTE_ON);
+
+        // F7 идёт по кругу интенсивности bloom, F8 — по порогу.
+        app.input.press_key(KeyCode::F7);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::F7);
+        assert!(BLOOM_INTENSITY_STEPS.contains(&app.post_settings.bloom_intensity));
+        assert_ne!(app.post_settings.bloom_intensity, defaults.bloom_intensity);
+
+        app.input.press_key(KeyCode::F8);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::F8);
+        assert!(BLOOM_THRESHOLD_STEPS.contains(&app.post_settings.bloom_threshold));
+        assert_ne!(app.post_settings.bloom_threshold, defaults.bloom_threshold);
+    }
+
+    #[test]
+    fn artifact_ground_color_is_hdr_and_regular_loot_is_not() {
+        let artifact = zn_content::Item {
+            key: "artifact_heat".to_string(),
+            display_name: "Артефакт «Жар»".to_string(),
+            weight_kg: 0.5,
+            stack_max: 1,
+            use_effect: None,
+            color: [0.95, 0.72, 0.15],
+        };
+        let ammo = zn_content::Item {
+            key: "ammo_545".to_string(),
+            ..artifact.clone()
+        };
+
+        let color = ground_item_color(&artifact);
+        assert!(
+            color.x > 1.0 && color.y > 1.0,
+            "артефакт светится: {color:?}"
+        );
+        assert_eq!(color.w, 1.0, "непрозрачность обычная");
+        assert_eq!(
+            ground_item_color(&ammo),
+            Vec4::new(0.95, 0.72, 0.15, 1.0),
+            "обычный лут остаётся в LDR"
+        );
     }
 }
