@@ -3,7 +3,6 @@
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 use zn_launcher::install::{self, Config, Layout};
 use zn_launcher::manifest;
@@ -18,14 +17,17 @@ struct Cli {
     install_dir: Option<PathBuf>,
     check_only: bool,
     keep_console: bool,
+    /// Принудительный консольный режим (по умолчанию — GUI).
+    cli_mode: bool,
 }
 
 fn usage() -> String {
     format!(
         "ZONA launcher {VERSION}\n\n\
          Использование:\n  \
-           zn-launcher [--channel <канал>] [--install-dir <путь>] [--check] [--console]\n\n\
+           zn-launcher [--cli] [--channel <канал>] [--install-dir <путь>] [--check] [--console]\n\n\
          Опции:\n  \
+           --cli                 консольный режим вместо GUI;\n  \
            --channel <канал>    канал обновлений (по умолчанию dev);\n  \
            --install-dir <путь> куда ставить игру (абсолютный путь); без флага —\n  \
                                 папка из конфига или выбор при первом запуске;\n  \
@@ -42,10 +44,12 @@ fn parse_args() -> std::result::Result<Cli, String> {
         install_dir: None,
         check_only: false,
         keep_console: false,
+        cli_mode: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
+            "--cli" => cli.cli_mode = true,
             "--channel" => {
                 cli.channel = args
                     .next()
@@ -73,19 +77,51 @@ fn parse_args() -> std::result::Result<Cli, String> {
     Ok(cli)
 }
 
-fn main() -> ExitCode {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cli = match parse_args() {
         Ok(cli) => cli,
         Err(message) => {
             eprintln!("{message}");
-            return ExitCode::from(2);
+            std::process::exit(2);
         }
     };
+    if !cli.cli_mode {
+        // В GUI-режиме флаги не молчим: --install-dir/--channel засеивают
+        // конфиг, GUI стартует сразу с нужной папкой (без диалога).
+        if let Some(dir) = &cli.install_dir {
+            install::validate_install_dir(dir)?;
+        }
+        if cli.install_dir.is_some() || cli.channel != manifest::DEFAULT_CHANNEL {
+            let config_home = install::config_home()?;
+            let path = Config::path_in(&config_home);
+            let mut config = Config::load(&path)?;
+            if let Some(dir) = &cli.install_dir {
+                config.install_dir = Some(dir.clone());
+            }
+            if cli.channel != manifest::DEFAULT_CHANNEL {
+                config.channel = cli.channel.clone();
+            }
+            config.save(&path)?;
+        }
+        // GUI-режим по умолчанию: тестер дважды кликает по exe.
+        let options = eframe::NativeOptions {
+            viewport: eframe::egui::ViewportBuilder::default()
+                .with_inner_size([520.0, 400.0])
+                .with_title("ZONA launcher"),
+            ..Default::default()
+        };
+        eframe::run_native(
+            "ZONA launcher",
+            options,
+            Box::new(|_cc| Ok(Box::new(zn_launcher::gui::LauncherApp::new()))),
+        )?;
+        return Ok(());
+    }
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => Ok(()),
         Err(error) => {
             eprintln!("ошибка: {error}");
-            ExitCode::FAILURE
+            std::process::exit(1);
         }
     }
 }

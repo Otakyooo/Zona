@@ -32,7 +32,7 @@ fn unknown_flag_exits_with_code_2() {
 #[test]
 fn relative_install_dir_rejected_before_any_io() {
     let output = launcher()
-        .args(["--install-dir", "relative/path"])
+        .args(["--cli", "--install-dir", "relative/path"])
         .output()
         .unwrap();
     assert!(!output.status.success());

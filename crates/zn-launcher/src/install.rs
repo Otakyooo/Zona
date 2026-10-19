@@ -38,6 +38,9 @@ pub struct Config {
     /// Выбранная игроком папка установки; `None` до первого выбора.
     #[serde(default)]
     pub install_dir: Option<PathBuf>,
+    /// «Свой сервер» (`host:port`) из GUI — приоритетнее манифеста.
+    #[serde(default)]
+    pub server_override: Option<String>,
 }
 
 fn default_channel() -> String {
@@ -49,6 +52,7 @@ impl Default for Config {
         Self {
             channel: default_channel(),
             install_dir: None,
+            server_override: None,
         }
     }
 }
@@ -284,10 +288,12 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.channel, "dev");
         assert!(cfg.install_dir.is_none());
+        assert!(cfg.server_override.is_none());
         // запись и чтение обратно
         let cfg = Config {
             channel: "dev".into(),
             install_dir: Some(dir.path().join("D:/Games/ZONA")),
+            server_override: Some("10.0.0.5:7700".into()),
         };
         cfg.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), cfg);
@@ -318,6 +324,7 @@ mod tests {
         let config = Config {
             channel: "dev".into(),
             install_dir: Some(home.path().join("from-config")),
+            server_override: None,
         };
         let flag = home.path().join("from-flag");
         // флаг бьёт конфиг
