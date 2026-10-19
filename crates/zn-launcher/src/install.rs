@@ -213,7 +213,7 @@ pub fn resolve_install_dir(
 }
 
 /// Абсолютность пути — минимальное требование к папке игрока.
-fn validate_install_dir(path: &Path) -> Result<PathBuf> {
+pub fn validate_install_dir(path: &Path) -> Result<PathBuf> {
     if path.as_os_str().is_empty() {
         return Err(Error::Install("путь установки пуст".into()));
     }

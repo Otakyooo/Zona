@@ -17,10 +17,14 @@ pub enum Error {
     Version(String),
     /// Манифест структурно невалиден.
     Manifest(String),
+    /// sha256 скачанного файла не совпал с манифестом.
+    Integrity { expected: String, actual: String },
     /// Канал манифеста не совпал с ожидаемым.
     Channel { expected: String, actual: String },
     /// Папка установки: не абсолютный путь или нет прав на запись.
     Install(String),
+    /// Клиент запущен: нельзя подменить exe — нужно закрыть игру.
+    GameRunning,
     /// Конфиг лаунчера повреждён.
     Config(String),
 }
@@ -33,10 +37,17 @@ impl fmt::Display for Error {
             Error::Json(e) => write!(f, "JSON: {e}"),
             Error::Version(m) => write!(f, "версия: {m}"),
             Error::Manifest(m) => write!(f, "манифест: {m}"),
+            Error::Integrity { expected, actual } => write!(
+                f,
+                "контрольная сумма не совпала: ожидалась {expected}, получена {actual}"
+            ),
             Error::Channel { expected, actual } => {
                 write!(f, "канал '{actual}' не совпадает с ожидаемым '{expected}'")
             }
             Error::Install(m) => write!(f, "установка: {m}"),
+            Error::GameRunning => {
+                write!(f, "игра запущена — закройте ZONA и повторите обновление")
+            }
             Error::Config(m) => write!(f, "конфиг: {m}"),
         }
     }
