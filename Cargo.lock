@@ -5112,6 +5112,7 @@ dependencies = [
  "wgpu",
  "winit",
  "zn-assets",
+ "zn-audio",
  "zn-content",
  "zn-core",
  "zn-input",

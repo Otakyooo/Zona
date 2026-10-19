@@ -10,6 +10,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, WindowId};
 
+use zn_audio::{AudioEngine, SoundId};
 use zn_content::ItemCatalog;
 use zn_core::{FixedStep, SIMULATION_HZ};
 use zn_input::InputState;
@@ -219,7 +220,7 @@ struct KillFeedEntry {
     until: Instant,
 }
 
-/// Подсказка настроек постобработки (M4g-G3): текст и время жизни.
+/// Подсказка настроек (F6–F10): текст и время жизни.
 #[derive(Debug)]
 struct PostHint {
     text: String,
@@ -298,7 +299,7 @@ struct HudData {
     respawn_secs: Option<f32>,
     /// Строки kill-фида: текст и альфа (1 — свежая, 0 — угасла).
     feed: Vec<(String, f32)>,
-    /// Подсказка настроек постобработки (F6–F8), пока свежа.
+    /// Подсказка настроек (F6–F10), пока свежа.
     post_hint: Option<String>,
     /// Секунды с запуска клиента — время для egui.
     time: f64,
@@ -365,11 +366,13 @@ pub struct ClientApp {
     my_killer: Option<String>,
     /// Последние смерти — строки kill-фида.
     kill_feed: Vec<KillFeedEntry>,
-    /// Подсказка настроек постобработки (клавиши F6–F8).
+    /// Подсказка настроек (клавиши F6–F10).
     post_hint: Option<PostHint>,
     /// Настройки постобработки (M4g-G3): источник правды клиента, кладётся
     /// в рендер при его создании и при каждой правке клавишами.
     post_settings: PostSettings,
+    /// Аудио-слой (A1): процедурные звуки, громкость (F9) и мьют (F10).
+    audio: AudioEngine,
     builtin_mesh_ids: HashMap<String, MeshId>,
     cursor_grabbed: bool,
     fixed: FixedStep,
@@ -574,6 +577,7 @@ impl ClientApp {
             kill_feed: Vec::new(),
             post_hint: None,
             post_settings: PostSettings::default(),
+            audio: AudioEngine::new(),
             builtin_mesh_ids: HashMap::new(),
             cursor_grabbed: false,
             fixed: FixedStep::from_hz(60),
@@ -1228,9 +1232,11 @@ impl ClientApp {
                 match event {
                     GameEvent::UseStarted { player, ticks } if *player == self.player_id => {
                         self.start_healing_view(*ticks, now);
+                        self.audio.play(SoundId::Heal);
                     }
                     GameEvent::AnomalyRevealed { anomaly, position } => {
                         self.reveal_anomaly(*anomaly, *position, now);
+                        self.audio.play(SoundId::BoltAnomaly);
                     }
                     _ => {}
                 }
@@ -1258,7 +1264,6 @@ impl ClientApp {
             // Online: локальные апдейты предсказания не нужны — истина в сети.
             let _ = self.simulation.take_net_updates();
         }
-
         self.update_interact_hint();
     }
 
@@ -1279,6 +1284,7 @@ impl ClientApp {
             to: end,
             until: now + TRACER_TTL,
         });
+        self.audio.play(SoundId::Shot);
     }
 
     /// События боя из снапшота: чужие выстрелы (трейсер и вспышка) и смерти
@@ -1312,6 +1318,7 @@ impl ClientApp {
                         to: end,
                         until: now + TRACER_TTL,
                     });
+                    self.audio.play(SoundId::Shot);
                 }
                 GameEvent::Death {
                     victim,
@@ -1331,15 +1338,18 @@ impl ClientApp {
                     if Some(*victim) == self.net_player_id {
                         self.my_killer = Some(killer_text);
                     }
+                    self.audio.play(SoundId::Death);
                 }
                 GameEvent::UseStarted { player, ticks } => {
                     if Some(*player) == self.net_player_id {
                         self.start_healing_view(*ticks, now);
+                        self.audio.play(SoundId::Heal);
                     }
                 }
                 // Болт сработал в аномалии (M4c): яркая подсветка и вспышка.
                 GameEvent::AnomalyRevealed { anomaly, position } => {
                     self.reveal_anomaly(*anomaly, *position, now);
+                    self.audio.play(SoundId::BoltAnomaly);
                 }
             }
         }
@@ -1358,39 +1368,46 @@ impl ClientApp {
     /// Действия вне инпутов: E (обыск/подбор/закрыть), G (бросок болта),
     /// I (инвентарь), H (склад на базе), T (взять всё), Q (выбросить),
     /// Enter (взять/использовать/сдать), стрелки (навигация), F6–F8
-    /// (постобработка). Панели passive — курсор остаётся в игре.
+    /// (постобработка), F9/F10 (звук). Панели passive — курсор остаётся в игре.
     fn handle_action_keys(&mut self) {
         if self.input.just_pressed(KeyCode::KeyE) {
             self.send_action(PlayerAction::Interact);
+            self.audio.play(SoundId::Panel);
         }
         if self.input.just_pressed(KeyCode::KeyG) {
             self.send_action(PlayerAction::ThrowBolt);
+            self.audio.play(SoundId::Throw);
         }
         if self.input.just_pressed(KeyCode::KeyI) {
             self.inventory_open = !self.inventory_open;
+            self.audio.play(SoundId::Panel);
         }
         if self.input.just_pressed(KeyCode::KeyH) && self.stash_available() {
             self.stash_open = !self.stash_open;
             if self.stash_open {
                 self.panel_focus = PanelFocus::Stash;
             }
+            self.audio.play(SoundId::Panel);
         }
         if self.input.just_pressed(KeyCode::KeyT) {
             if let Some(container) = self.open_container.as_ref().map(|open| open.container) {
                 self.send_action(PlayerAction::Inventory(InventoryAction::TakeAll {
                     container,
                 }));
+                self.audio.play(SoundId::Pickup);
             }
         }
         if self.input.just_pressed(KeyCode::KeyQ) {
             if let Some(slot) = self.selected_inventory_slot() {
                 self.send_action(PlayerAction::Inventory(InventoryAction::Drop { slot }));
+                self.audio.play(SoundId::Pickup);
             }
         }
         if self.input.just_pressed(KeyCode::Enter) {
             self.press_enter();
         }
         self.handle_post_keys();
+        self.handle_audio_keys();
         self.handle_panel_navigation();
     }
 
@@ -1433,6 +1450,32 @@ impl ClientApp {
                 "виньетка {vignette} (F6) · bloom {:.2} (F7) · порог {:.2} (F8)",
                 self.post_settings.bloom_intensity, self.post_settings.bloom_threshold
             ),
+            until: Instant::now() + POST_HINT_TTL,
+        });
+    }
+
+    /// Настройки аудио (A1): F9 — цикл громкости, F10 — мьют. Клиент держит
+    /// значения у себя (движок звука общий для сетевой и offline-сессии).
+    fn handle_audio_keys(&mut self) {
+        let mut changed = false;
+        if self.input.just_pressed(KeyCode::F9) {
+            self.audio.cycle_volume();
+            changed = true;
+        }
+        if self.input.just_pressed(KeyCode::F10) {
+            self.audio.set_muted(!self.audio.muted());
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+        let sound = if self.audio.muted() {
+            "выкл".to_string()
+        } else {
+            format!("{:.0}%", self.audio.volume() * 100.0)
+        };
+        self.post_hint = Some(PostHint {
+            text: format!("звук {sound} (F9/F10)"),
             until: Instant::now() + POST_HINT_TTL,
         });
     }
@@ -1798,6 +1841,7 @@ impl ClientApp {
                     yaw,
                 } => {
                     self.enter_location(location, position, Some(yaw));
+                    self.audio.play(SoundId::Transition);
                 }
                 NetEvent::StashUpdate { items } => {
                     self.stash_items = items;
@@ -3744,6 +3788,33 @@ mod tests {
         app.input.release_key(KeyCode::F8);
         assert!(BLOOM_THRESHOLD_STEPS.contains(&app.post_settings.bloom_threshold));
         assert_ne!(app.post_settings.bloom_threshold, defaults.bloom_threshold);
+    }
+
+    #[test]
+    fn audio_keys_cycle_volume_and_toggle_mute() {
+        let mut app = ClientApp::new();
+        let volume = app.audio.volume();
+        assert_eq!(volume, zn_audio::DEFAULT_VOLUME);
+        assert!(!app.audio.muted());
+
+        // F9 идёт по шагам громкости, подсказка уходит в HUD.
+        app.input.press_key(KeyCode::F9);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::F9);
+        assert_eq!(app.audio.volume(), 0.75);
+        let hud = app.collect_hud_data();
+        let hint = hud.post_hint.expect("подсказка настроек показана");
+        assert!(hint.contains("звук"), "{hint}");
+
+        // F10 — мьют: громкость сохраняется, звук выключен.
+        app.input.press_key(KeyCode::F10);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::F10);
+        assert!(app.audio.muted());
+        assert_eq!(app.audio.volume(), 0.75, "громкость не сбрасывается");
+        let hud = app.collect_hud_data();
+        let hint = hud.post_hint.expect("подсказка настроек показана");
+        assert!(hint.contains("выкл"), "{hint}");
     }
 
     #[test]
