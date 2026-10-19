@@ -20,9 +20,6 @@ pub(crate) struct CameraUniform {
     pub sky_top: [f32; 4],
     /// Цвет неба у горизонта (M4g).
     pub sky_horizon: [f32; 4],
-    /// 1.0 — поверхность не-sRGB, шейдер кодирует линейный цвет вручную.
-    pub output_srgb: f32,
-    pub _padding: [f32; 3],
 }
 
 impl CameraUniform {
@@ -62,6 +59,16 @@ impl CameraUniform {
             0.0,
         ];
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub(crate) struct PostUniform {
+    /// Сила виньетки 0..1 (0 — выключена), зеркало `PostSettings`.
+    pub vignette: f32,
+    /// 1.0 — поверхность не-sRGB, пост-пасс кодирует линейный цвет вручную.
+    pub output_srgb: f32,
+    pub _padding: [f32; 2],
 }
 
 #[repr(C)]
@@ -116,10 +123,15 @@ mod tests {
 
     #[test]
     fn camera_uniform_is_16_byte_aligned() {
-        // 3×[f32;16] + 7×[f32;4] + f32 + [f32;3].
+        // 3×[f32;16] + 7×[f32;4].
         let size = std::mem::size_of::<CameraUniform>();
         assert_eq!(size % 16, 0, "uniform должен быть кратен 16: {size}");
-        assert_eq!(size, 320);
+        assert_eq!(size, 304);
+    }
+
+    #[test]
+    fn post_uniform_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<PostUniform>(), 16);
     }
 
     #[test]
@@ -145,8 +157,7 @@ mod tests {
         assert_eq!(uniform.ambient_color[3], 0.5);
         assert_eq!(uniform.fog_color[3], 0.03);
         assert_eq!(uniform.sky_top, [0.1, 0.2, 0.3, 0.0]);
-        // Матрицы, позиция камеры и флаг sRGB — не трогаются.
-        assert_eq!(uniform.output_srgb, 0.0);
+        // Матрицы и позиция камеры — не трогаются.
         assert_eq!(uniform.camera_position, [0.0; 4]);
     }
 }

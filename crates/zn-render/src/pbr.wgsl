@@ -9,10 +9,6 @@ struct Camera {
     fog_color: vec4<f32>, // rgb — цвет тумана, w — плотность
     sky_top: vec4<f32>,
     sky_horizon: vec4<f32>,
-    output_srgb: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
 };
 
 struct Material {
@@ -123,23 +119,6 @@ fn perturb_normal(n: vec3<f32>, view_dir: vec3<f32>, uv: vec2<f32>, map_n: vec3<
     return normalize(perturbed);
 }
 
-fn aces_fitted(x: vec3<f32>) -> vec3<f32> {
-    // ACES-аппроксимация (Krzysztof Narkowicz), тени чуть сняты.
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    let clamped = clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
-    return clamped * clamped;
-}
-
-fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
-    let lo = c * 12.92;
-    let hi = pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.4)) * 1.055 - vec3<f32>(0.055);
-    return select(hi, lo, c <= vec3<f32>(0.0031308));
-}
-
 // UV материала (M4g): мешевые × тайлинг, либо box-проекция по мировой позиции
 // (стены/полы из кубов получают равномерную плотность текселей).
 fn material_uv(world_position: vec3<f32>, normal: vec3<f32>, uv: vec2<f32>) -> vec2<f32> {
@@ -241,9 +220,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fog_factor = clamp(1.0 - exp(-camera.fog_color.w * fog_distance), 0.0, 1.0);
     color = mix(color, camera.fog_color.rgb, fog_factor);
 
-    color = aces_fitted(color);
-    if (camera.output_srgb > 0.5) {
-        color = linear_to_srgb(color);
-    }
+    // Тонмаппинг (ACES) и кодирование делает пост-пасс (M4g-G3): сцена
+    // отдаёт линейный HDR-цвет.
     return vec4<f32>(color, alpha);
 }

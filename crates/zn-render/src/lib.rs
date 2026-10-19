@@ -9,7 +9,8 @@ pub use object_material::MaterialSpec;
 pub use renderer::cull::{self, Frustum};
 pub use renderer::{
     directional_shadow_matrix, Cache, DrawBatch, DrawList, InstanceRaw, MaterialId, MaterialParams,
-    MeshId, Renderer, MESH_BUDGET_BYTES, SHADOW_MAP_SIZE, TEXTURE_BUDGET_BYTES,
+    MeshId, PostSettings, Renderer, HDR_FORMAT, MESH_BUDGET_BYTES, SHADOW_MAP_SIZE,
+    TEXTURE_BUDGET_BYTES,
 };
 
 use zn_scene::Scene;

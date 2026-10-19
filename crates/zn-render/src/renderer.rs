@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use crate::camera::Camera;
 use crate::mesh::{cpu_mesh_vertices, GpuMesh, Vertex};
-use crate::renderer::types::CameraUniform;
+use crate::renderer::types::{CameraUniform, PostUniform};
 use zn_assets::{CpuImage, CpuMaterial, CpuMesh};
 use zn_scene::SceneEnvironment;
 
@@ -28,6 +28,37 @@ pub const MAX_INSTANCES: usize = 8192;
 
 /// Сторона карты теней (M4g): одна ортопроекция на локацию, PCF 3×3.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// Формат offscreen-таргета сцены (M4g-G3): линейный HDR до тонмаппинга.
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Настройки постобработки (M4g-G3): виньетка; bloom — G3b.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PostSettings {
+    /// Сила виньетки 0..1 (0 — выключена).
+    pub vignette: f32,
+}
+
+impl Default for PostSettings {
+    fn default() -> Self {
+        Self { vignette: 0.35 }
+    }
+}
+
+/// Мягкий порог (smoothstep), как в WGSL.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+impl PostSettings {
+    /// Затемнение виньетки по дистанции от центра кадра: 0 — центр,
+    /// 1 — углы (дистанция нормирована по полудиагонали). Зеркало формулы
+    /// из `post.wgsl`, закрыто тестом.
+    pub fn vignette_factor(&self, d: f32) -> f32 {
+        1.0 - self.vignette * smoothstep(0.45, 1.0, d)
+    }
+}
 
 /// Матрица теневого прохода (M4g): ортопроекция вдоль направления солнца,
 /// накрывающая AABB сцены (сфера радиуса `radius` вокруг центра). Нулевое
@@ -76,6 +107,29 @@ fn create_depth(
     (texture, view)
 }
 
+/// HDR-таргет сцены (M4g-G3): сцена рисуется в него, пост-пасс читает.
+fn create_hdr(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("zn-hdr-target"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HDR_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
 /// Диапазон инстансов батча в общем буфере: смещение и количество.
 #[derive(Clone, Copy, Debug)]
 struct DrawRange {
@@ -97,6 +151,15 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// Offscreen HDR-таргет сцены (M4g-G3) — вход пост-пасса.
+    hdr_texture: wgpu::Texture,
+    hdr_view: wgpu::TextureView,
+    /// Пост-пасс (M4g-G3): ACES, виньетка, кодирование в sRGB поверхности.
+    post_pipeline: wgpu::RenderPipeline,
+    post_bind_group: wgpu::BindGroup,
+    post_uniform_buffer: wgpu::Buffer,
+    post_sampler: wgpu::Sampler,
+    post_settings: PostSettings,
     pipeline: wgpu::RenderPipeline,
     blend_pipeline: wgpu::RenderPipeline,
     /// Фон-небо (M4g): полноэкранный пасс с градиентом и солнцем.
@@ -197,6 +260,8 @@ impl Renderer {
         surface.configure(&device, &config);
 
         let (depth_texture, depth_view) = create_depth(&device, &config);
+        // HDR-таргет сцены (M4g-G3) — размер окна, пересоздаётся в resize.
+        let (hdr_texture, hdr_view) = create_hdr(&device, &config);
 
         // Карта теней (M4g): depth-only цель солнца, сравнивается sampler'ом.
         let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -225,7 +290,7 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Не-sRGB поверхность (Bgra8Unorm): шейдер кодирует линейный цвет сам.
+        // Не-sRGB поверхность (Bgra8Unorm): пост-пасс кодирует линейный цвет сам.
         let output_srgb = if config.format.is_srgb() { 0.0 } else { 1.0 };
 
         // Стартовая атмосфера — нейтраль контента (M4g): клиент перезапишет
@@ -241,8 +306,6 @@ impl Renderer {
             fog_color: [0.0, 0.0, 0.0, 0.0],
             sky_top: [0.0, 0.0, 0.0, 0.0],
             sky_horizon: [0.0, 0.0, 0.0, 0.0],
-            output_srgb,
-            _padding: [0.0; 3],
         };
         camera_uniform.apply_environment(&SceneEnvironment::default());
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -409,13 +472,15 @@ impl Renderer {
             immediate_size: 0,
         });
 
+        // Сцена рисуется в HDR-таргет (M4g-G3); в поверхность окна пишет
+        // пост-пасс. Формат целей сцены — HDR_FORMAT, у пост-пайплайна — поверхность.
         let opaque_targets = [Some(wgpu::ColorTargetState {
-            format: config.format,
+            format: HDR_FORMAT,
             blend: Some(wgpu::BlendState::REPLACE),
             write_mask: wgpu::ColorWrites::ALL,
         })];
         let blend_targets = [Some(wgpu::ColorTargetState {
-            format: config.format,
+            format: HDR_FORMAT,
             blend: Some(wgpu::BlendState::ALPHA_BLENDING),
             write_mask: wgpu::ColorWrites::ALL,
         })];
@@ -598,6 +663,128 @@ impl Renderer {
             cache: None,
         });
 
+        // Постобработка (M4g-G3): полноэкранный треугольник поверх HDR-кадра.
+        // Свой layout: uniform настроек + HDR-текстура + сэмплер.
+        let post_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("zn-post-uniform"),
+            size: std::mem::size_of::<PostUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let post_uniform = PostUniform {
+            vignette: PostSettings::default().vignette,
+            output_srgb,
+            _padding: [0.0; 2],
+        };
+        queue.write_buffer(
+            &post_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[post_uniform]),
+        );
+        let post_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("zn-post-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let post_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("zn-post-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                std::mem::size_of::<PostUniform>() as u64,
+                            ),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let post_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zn-post-bind-group"),
+            layout: &post_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: post_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&hdr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&post_sampler),
+                },
+            ],
+        });
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("zn-post-shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("post.wgsl"))),
+        });
+        let post_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("zn-post-pipeline-layout"),
+            bind_group_layouts: &[Some(&post_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("zn-post-pipeline"),
+            layout: Some(&post_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &post_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &post_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("zn-instances"),
             size: (MAX_INSTANCES * std::mem::size_of::<InstanceRaw>()) as u64,
@@ -613,6 +800,13 @@ impl Renderer {
             config,
             depth_texture,
             depth_view,
+            hdr_texture,
+            hdr_view,
+            post_pipeline,
+            post_bind_group,
+            post_uniform_buffer,
+            post_sampler,
+            post_settings: PostSettings::default(),
             pipeline,
             blend_pipeline,
             sky_pipeline,
@@ -703,6 +897,28 @@ impl Renderer {
         let (texture, view) = create_depth(&self.device, &self.config);
         self.depth_texture = texture;
         self.depth_view = view;
+        // HDR-таргет и его биндинг пост-пасса пересоздаются под новый размер.
+        let (hdr_texture, hdr_view) = create_hdr(&self.device, &self.config);
+        self.hdr_texture = hdr_texture;
+        self.hdr_view = hdr_view;
+        self.post_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("zn-post-bind-group"),
+            layout: &self.post_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.post_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.hdr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.post_sampler),
+                },
+            ],
+        });
     }
 
     // --- кэши -------------------------------------------------------------
@@ -1033,6 +1249,35 @@ impl Renderer {
         self.shadow_bounds = (min, max);
     }
 
+    /// Текущие настройки постобработки (M4g-G3).
+    pub fn post_settings(&self) -> PostSettings {
+        self.post_settings
+    }
+
+    /// Обновляет настройки постобработки и пересылает их в пост-пасс.
+    pub fn set_post_settings(&mut self, settings: PostSettings) {
+        self.post_settings = settings;
+        self.write_post_uniform();
+    }
+
+    fn write_post_uniform(&self) {
+        let output_srgb = if self.config.format.is_srgb() {
+            0.0
+        } else {
+            1.0
+        };
+        let uniform = PostUniform {
+            vignette: self.post_settings.vignette,
+            output_srgb,
+            _padding: [0.0; 2],
+        };
+        self.queue.write_buffer(
+            &self.post_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniform]),
+        );
+    }
+
     /// Загружает кадровый DrawList: плоский буфер инстансов + диапазоны
     /// батчей. Триггерит LRU-обновление использованных ресурсов.
     pub fn update_draw_list(&mut self, list: &DrawList) {
@@ -1163,7 +1408,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("zn-main-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.hdr_view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -1250,6 +1495,29 @@ impl Renderer {
             }
         }
 
+        // Пост-пасс (M4g-G3): HDR-кадр → ACES, виньетка, sRGB — в поверхность.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("zn-post-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.post_pipeline);
+            pass.set_bind_group(0, &self.post_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
         // Оверлей (UI): отдельный проход без depth attach — конвейер
         // egui-wgpu создаётся без depth-состояния.
         {
@@ -1274,5 +1542,33 @@ impl Renderer {
 
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(texture);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_defaults_are_mild() {
+        let settings = PostSettings::default();
+        assert!((0.0..=1.0).contains(&settings.vignette));
+        // Центр кадра не затемняется, углы — на силу виньетки.
+        assert_eq!(settings.vignette_factor(0.0), 1.0);
+        assert!(
+            (settings.vignette_factor(1.0) - (1.0 - settings.vignette)).abs() < 1e-6,
+            "в углу ожидалось 1 - сила виньетки"
+        );
+        // До порога затемнения нет (0.2 и 0.4 ниже 0.45), дальше — темнее.
+        assert_eq!(settings.vignette_factor(0.2), settings.vignette_factor(0.4));
+        assert!(settings.vignette_factor(0.9) < settings.vignette_factor(0.6));
+    }
+
+    #[test]
+    fn vignette_disabled_leaves_frame_untouched() {
+        let settings = PostSettings { vignette: 0.0 };
+        for d in [0.0, 0.3, 0.7, 0.9, 1.0] {
+            assert_eq!(settings.vignette_factor(d), 1.0);
+        }
     }
 }
