@@ -6,5 +6,7 @@
 pub mod error;
 pub mod install;
 pub mod manifest;
+pub mod run;
+pub mod update;
 
 pub use error::{Error, Result};
