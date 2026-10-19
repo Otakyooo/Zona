@@ -15,6 +15,7 @@ use zn_render::{Camera, DrawList, InstanceRaw, MaterialId, MaterialSpec, MeshId,
 use zn_scene::{ColliderShape, Scene, SceneObject};
 
 use crate::gizmo::{self, GizmoDelta, GizmoMode, GizmoState};
+use crate::history::{object_edit_label, EditCommand, History, HISTORY_LIMIT};
 use crate::orbit::OrbitCamera;
 use crate::picking::{cursor_ray, pick_object, placement_point};
 
@@ -58,11 +59,15 @@ pub struct EditorApp {
     camera: Camera,
     orbit: OrbitCamera,
     scene: Scene,
+    /// История правок (M4g‑G4a): undo/redo объектов.
+    history: History,
     content_root: PathBuf,
     current_path: Option<PathBuf>,
     path_buffer: String,
     selected: Option<usize>,
     gizmo: GizmoState,
+    /// Объект до начала drag gizmo — команда истории на отпускании ЛКМ.
+    gizmo_before: Option<(usize, SceneObject)>,
     drag: Option<CameraDrag>,
     cursor_px: Option<Vec2>,
     last_click: Option<(Instant, Vec2)>,
@@ -98,11 +103,13 @@ impl EditorApp {
             camera,
             orbit,
             scene,
+            history: History::new(HISTORY_LIMIT),
             content_root,
             current_path,
             path_buffer: String::new(),
             selected: None,
             gizmo: GizmoState::new(GizmoMode::Translate),
+            gizmo_before: None,
             drag: None,
             cursor_px: None,
             last_click: None,
@@ -264,6 +271,8 @@ impl EditorApp {
         self.selected = None;
         self.current_path = None;
         self.assets.clear();
+        self.history.clear();
+        self.gizmo_before = None;
         self.status = "новая сцена".into();
     }
 
@@ -275,6 +284,8 @@ impl EditorApp {
                 self.current_path = Some(path.to_path_buf());
                 self.assets.clear();
                 self.ensure_scene_assets();
+                self.history.clear();
+                self.gizmo_before = None;
                 self.status = format!("открыто: {}", path.display());
             }
             Err(error) => {
@@ -333,19 +344,73 @@ impl EditorApp {
             .with_asset(key.clone())
             .with_yaw(0.0);
         let index = self.scene.objects.len();
-        self.scene.add(object);
+        self.scene.add(object.clone());
+        self.history
+            .push(EditCommand::add(index, &object), Instant::now());
         self.selected = Some(index);
         self.status = format!("размещён объект {index} ({key})");
     }
 
     fn delete_selected(&mut self) {
         if let Some(index) = self.selected {
-            if index < self.scene.objects.len() {
+            if let Some(object) = self.scene.objects.get(index) {
+                let removed = object.clone();
                 self.scene.objects.remove(index);
+                self.history
+                    .push(EditCommand::remove(index, &removed), Instant::now());
                 self.status = format!("объект {index} удалён");
             }
         }
         self.selected = None;
+        self.gizmo.end_drag();
+        self.gizmo_before = None;
+    }
+
+    /// Отменяет последнюю правку сцены.
+    fn undo_last(&mut self) {
+        match self.history.undo(&mut self.scene, Instant::now()) {
+            Some(label) => {
+                if self
+                    .selected
+                    .is_some_and(|index| index >= self.scene.objects.len())
+                {
+                    self.selected = None;
+                }
+                self.status = format!("отменено: {label}");
+            }
+            None => self.status = "нечего отменять".into(),
+        }
+    }
+
+    /// Повторяет отменённую правку сцены.
+    fn redo_last(&mut self) {
+        match self.history.redo(&mut self.scene, Instant::now()) {
+            Some(label) => {
+                if self
+                    .selected
+                    .is_some_and(|index| index >= self.scene.objects.len())
+                {
+                    self.selected = None;
+                }
+                self.status = format!("повтор: {label}");
+            }
+            None => self.status = "нечего повторять".into(),
+        }
+    }
+
+    /// Завершает drag gizmo: сдвиг/поворот объекта — команда истории.
+    fn finish_gizmo_drag(&mut self) {
+        if let Some((index, before)) = self.gizmo_before.take() {
+            if let Some(after) = self.scene.objects.get(index) {
+                if &before != after {
+                    let label = object_edit_label(&before, after);
+                    self.history.push(
+                        EditCommand::change(label, index, &before, after),
+                        Instant::now(),
+                    );
+                }
+            }
+        }
         self.gizmo.end_drag();
     }
 
@@ -497,6 +562,33 @@ impl EditorApp {
                         }
                     }
                     ui.separator();
+                    let undo_label = match self.history.undo_label() {
+                        Some(label) => format!("↶ Отменить: {label}"),
+                        None => "↶ Отменить".to_string(),
+                    };
+                    if ui
+                        .add_enabled(
+                            self.history.can_undo(),
+                            egui::Button::new(RichText::new(undo_label)),
+                        )
+                        .clicked()
+                    {
+                        self.undo_last();
+                    }
+                    let redo_label = match self.history.redo_label() {
+                        Some(label) => format!("↷ Повторить: {label}"),
+                        None => "↷ Повторить".to_string(),
+                    };
+                    if ui
+                        .add_enabled(
+                            self.history.can_redo(),
+                            egui::Button::new(RichText::new(redo_label)),
+                        )
+                        .clicked()
+                    {
+                        self.redo_last();
+                    }
+                    ui.separator();
                     let mode_label = format!("Gizmo: {}", self.gizmo.mode.label());
                     if ui.button(mode_label).clicked() {
                         self.gizmo.toggle_mode();
@@ -515,10 +607,17 @@ impl EditorApp {
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
+                    let history = self.history.depth();
+                    let history_note = if history > 0 {
+                        format!(" · история: {history}")
+                    } else {
+                        String::new()
+                    };
                     ui.label(format!(
-                        "сцена: {} ({} объектов) — {}",
+                        "сцена: {} ({} объектов){} — {}",
                         self.scene.name,
                         self.scene.len(),
+                        history_note,
                         self.status
                     ));
                 });
@@ -633,6 +732,9 @@ impl EditorApp {
                 let Some(object) = self.scene.objects.get_mut(index) else {
                     return;
                 };
+                // Снимок «до» — правки за кадр сравниваются с ним и уходят
+                // в историю одной командой (серии DragValue склеиваются).
+                let before = object.clone();
                 ui.label(format!("Объект #{index}"));
 
                 ui.horizontal(|ui| {
@@ -858,11 +960,22 @@ impl EditorApp {
                 if ui.checkbox(&mut solid, "solid").changed() {
                     object.solid = solid;
                 }
+
+                // Итог правок за кадр — команда истории (склейка по окну).
+                if let Some(after) = self.scene.objects.get(index) {
+                    if before != *after {
+                        let label = object_edit_label(&before, after);
+                        self.history.push(
+                            EditCommand::change(label, index, &before, after),
+                            Instant::now(),
+                        );
+                    }
+                }
             });
 
         egui::Panel::bottom("hints").resizable(false).show(&mut root, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("ЛКМ-драг: орбита · ЛКМ-клик: выделить · ПКМ-драг: панорама · Space+WASD: полёт · колесо: зум · G: gizmo · Del: удалить · Ctrl+S: сохранить");
+                ui.label("ЛКМ-драг: орбита · ЛКМ-клик: выделить · ПКМ-драг: панорама · Space+WASD: полёт · колесо: зум · G: gizmo · Del: удалить · Ctrl+Z/Ctrl+Y: отменить/повторить · Ctrl+S: сохранить");
             });
         });
 
@@ -1053,6 +1166,13 @@ impl ApplicationHandler for EditorApp {
                                 cursor,
                             )
                         {
+                            // Снимок «до» — команда истории на отпускании ЛКМ.
+                            self.gizmo_before = self.selected.and_then(|index| {
+                                self.scene
+                                    .objects
+                                    .get(index)
+                                    .map(|object| (index, object.clone()))
+                            });
                             self.drag = Some(CameraDrag::Gizmo);
                         } else {
                             self.drag = Some(CameraDrag::Orbit { last: cursor });
@@ -1066,7 +1186,7 @@ impl ApplicationHandler for EditorApp {
                                 })
                             }
                             Some(CameraDrag::Gizmo) => {
-                                self.gizmo.end_drag();
+                                self.finish_gizmo_drag();
                                 true
                             }
                             _ => false,
@@ -1133,6 +1253,8 @@ impl ApplicationHandler for EditorApp {
                             self.gizmo.toggle_mode();
                             self.status = format!("режим gizmo: {}", self.gizmo.mode.label());
                         }
+                        KeyCode::KeyZ if self.ctrl_down => self.undo_last(),
+                        KeyCode::KeyY if self.ctrl_down => self.redo_last(),
                         KeyCode::Delete | KeyCode::Backspace => self.delete_selected(),
                         KeyCode::Escape => {
                             self.selected = None;

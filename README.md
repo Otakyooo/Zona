@@ -87,7 +87,9 @@ New/Open/Save `.scene.ron`, орбитальная камера, пикинг о
 (перемещение/вращение), браузер ассетов с размещением (клик пересекает луч с
 землёй y=0 или ближайшим боксом коллайдера), панель свойств (position, scale,
 yaw, tint, asset, material, collider, solid + «Материал поверхности»: текстура,
-uv scale, мировые UV, roughness/metallic/emissive). Одноразовая выгрузка демо-уровня:
+uv scale, мировые UV, roughness/metallic/emissive), undo/redo правок
+(Ctrl+Z/Ctrl+Y и кнопки в меню — снимки «до/после» со склейкой серий драгов в
+одну команду, глубина 200). Одноразовая выгрузка демо-уровня:
 
 ```powershell
 cargo run -p zn-tools-editor --bin zn-editor -- --emit-demo game/content/levels/demo_zone.scene.ron

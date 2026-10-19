@@ -1,5 +1,6 @@
 mod app;
 mod gizmo;
+mod history;
 mod orbit;
 mod picking;
 
