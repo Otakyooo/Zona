@@ -1,0 +1,18 @@
+[Unit]
+Description=playit.gg agent for ZONA tunnel (вход для игроков)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Секрет агента (Secret Key из дашборда playit.gg) — в файле root-only:
+#   /opt/zona/playit/secret   (одна строка, без переноса смысла)
+# Туннель настраивается в дашборде: Custom, UDP, local 127.0.0.1:7700.
+# Публичный адрес туннеля → manifest.server_addr (см. README, bootstrap).
+ExecStart=/opt/zona/playit/playit --secret-path /opt/zona/playit/secret
+Restart=always
+RestartSec=5
+# Ограничений ресурсов нет — второй жилец рядом с anicast.
+
+[Install]
+WantedBy=multi-user.target
