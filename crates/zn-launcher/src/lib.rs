@@ -8,6 +8,7 @@ pub mod gui;
 pub mod install;
 pub mod manifest;
 pub mod run;
+pub mod selfupdate;
 pub mod update;
 
 pub use error::{Error, Result};

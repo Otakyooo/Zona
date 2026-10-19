@@ -29,6 +29,12 @@ pub const CLIENT_EXE: &str = if cfg!(windows) {
 } else {
     "zn-client"
 };
+/// Имя exe лаунчера по платформе (его же несёт клиентский zip).
+pub const LAUNCHER_EXE: &str = if cfg!(windows) {
+    "zn-launcher.exe"
+} else {
+    "zn-launcher"
+};
 
 /// Пользовательский конфиг лаунчера.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +175,12 @@ impl Layout {
     /// Exe клиента: `<root>/game/zn-client.exe`.
     pub fn client_exe(&self) -> PathBuf {
         self.game_dir().join(CLIENT_EXE)
+    }
+
+    /// Лаунчер, приехавший вместе с клиентским zip: `<root>/game/zn-launcher.exe`.
+    /// Источник для самообновления (M6-7).
+    pub fn bundled_launcher(&self) -> PathBuf {
+        self.game_dir().join(LAUNCHER_EXE)
     }
 
     /// Контент: `<root>/game/content`.

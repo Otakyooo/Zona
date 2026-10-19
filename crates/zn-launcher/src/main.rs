@@ -149,6 +149,10 @@ fn run(cli: Cli) -> Result<()> {
             Err(error) => return Err(error),
         };
     let layout = Layout::new(install_dir);
+    // Самообновление: уборка .old от прошлой подмены (лучше усилия).
+    if let Ok(exe) = std::env::current_exe() {
+        zn_launcher::selfupdate::cleanup_old(&exe);
+    }
     println!(
         "ZONA launcher {VERSION} (канал: {}, папка: {})",
         config.channel,
@@ -168,6 +172,21 @@ fn run(cli: Cli) -> Result<()> {
         update::check_and_update_with(&layout, &config.channel, &manifest, &mut print_progress)?;
     println!();
     print_report(&report);
+
+    // Самообновление лаунчера (M6-7): zip несёт и свежий zn-launcher.exe.
+    match zn_launcher::selfupdate::update_from_layout(&layout, &std::env::current_exe()?) {
+        Ok(zn_launcher::selfupdate::SelfUpdate::Updated) => {
+            println!("Лаунчер обновлён — перезапуск");
+            zn_launcher::selfupdate::relaunch(&std::env::current_exe()?)?;
+            return Ok(());
+        }
+        Ok(zn_launcher::selfupdate::SelfUpdate::Deferred) => eprintln!(
+            "предупреждение: не удалось заменить запущенный лаунчер — \
+             замените zn-launcher.exe вручную (файл .new рядом)"
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!("предупреждение: самообновление лаунчера: {error}"),
+    }
 
     if cli.check_only {
         return Ok(());

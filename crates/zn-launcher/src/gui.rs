@@ -106,6 +106,10 @@ impl LauncherApp {
         let (messages, work_rx) = channel();
         thread::spawn(move || worker(commands, messages));
         let dev_mode = run::is_dev_mode(&std::env::current_exe().unwrap_or_default());
+        // Самообновление (M6-7): уборка .old от прошлой подмены.
+        if let Ok(exe) = std::env::current_exe() {
+            crate::selfupdate::cleanup_old(&exe);
+        }
         Self {
             config_home,
             config_path,
@@ -294,6 +298,28 @@ impl LauncherApp {
                         }
                     }
                     self.game_ready = playable;
+                    // Самообновление лаунчера (M6-7): zip несёт свежий exe.
+                    if let Ok(current) = std::env::current_exe() {
+                        if let Some(layout) = self.layout.clone() {
+                            match crate::selfupdate::update_from_layout(&layout, &current) {
+                                Ok(crate::selfupdate::SelfUpdate::Updated) => {
+                                    self.status = "Лаунчер обновлён — перезапуск…".to_string();
+                                    let _ = crate::selfupdate::relaunch(&current);
+                                    std::process::exit(0);
+                                }
+                                Ok(crate::selfupdate::SelfUpdate::Deferred) => {
+                                    self.error = Some(
+                                        "лаунчер не заменен (занят) — замените zn-launcher.exe вручную (файл .new рядом)"
+                                            .to_string(),
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    self.error = Some(format!("самообновление лаунчера: {error}"));
+                                }
+                            }
+                        }
+                    }
                     if self.play_after_install && playable {
                         self.play_after_install = false;
                         self.play();
