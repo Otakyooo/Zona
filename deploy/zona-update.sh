@@ -34,17 +34,39 @@ for tool in curl python3 tar sha256sum; do
   command -v "$tool" >/dev/null || die "нужен ${tool}"
 done
 
-BASE="https://github.com/${REPO}/releases/download/${TAG}"
+BASE="https://api.github.com/repos/${REPO}"
 auth=(-H "Authorization: Bearer ${ZONA_PAT}" -H "User-Agent: zona-update")
 
-log "качаем ${BASE}/${MANIFEST_ASSET}"
-manifest_json="$(curl -fsSL "${auth[@]}" "${BASE}/${MANIFEST_ASSET}")" \
-  || die "не удалось скачать manifest.json (проверьте ZONA_PAT и релиз '${TAG}')"
+log "качаем ${BASE}/releases/tags/${TAG} → ассет ${MANIFEST_ASSET}"
+# Web-URL github.com/.../releases/download/... для приватного репо отдаёт 404,
+# поэтому манифест и tar берём через API-URL ассетов с Accept: octet-stream.
+release_json="$(curl -fsSL "${auth[@]}" "${BASE}/releases/tags/${TAG}")" \
+  || die "не удалось получить релиз '${TAG}' (проверьте ZONA_PAT и репозиторий)"
+manifest_url="$(printf '%s' "$release_json" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print(next((a["url"] for a in d["assets"] if a["name"] == "manifest.json"), ""))')" \
+  || die "release JSON не разобран"
+[ -n "$manifest_url" ] || die "ассет ${MANIFEST_ASSET} не найден в релизе '${TAG}'"
+
+manifest_json="$(curl -fsSL "${auth[@]}" -H "Accept: application/octet-stream" "$manifest_url")" \
+  || die "не удалось скачать ${MANIFEST_ASSET}"
 
 fields="$(printf '%s' "$manifest_json" | python3 -c 'import json,sys; m=json.load(sys.stdin); print(m["version"], m["server"]["url"], m["server"]["sha256"])')" \
   || die "manifest.json не разобран"
 read -r m_version m_url m_sha <<<"$fields"
 [ -n "$m_version" ] && [ -n "$m_url" ] && [ -n "$m_sha" ] || die "в манифесте пустые version/server.url/server.sha256"
+
+# Манифест мог собраться старой версией публикатора с web-URL — резолвим
+# API-URL ассета по имени из того же JSON релиза.
+if [ "${m_url#https://api.github.com/}" = "$m_url" ]; then
+  asset_name="${m_url##*/}"
+  resolved="$(printf '%s' "$release_json" | python3 -c "import json,sys
+d = json.load(sys.stdin)
+print(next((a['url'] for a in d['assets'] if a['name'] == '$asset_name'), ''))")"
+  [ -n "$resolved" ] || die "не удалось определить API-URL ассета ${asset_name}"
+  log "web-URL в манифесте → API-URL (${asset_name})"
+  m_url="$resolved"
+fi
 
 installed=""
 [ -f "$INSTALLED_FILE" ] && installed="$(tr -d '[:space:]' < "$INSTALLED_FILE")"

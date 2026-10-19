@@ -29,8 +29,11 @@ function Invoke-Checked {
 }
 
 function Get-AssetApiUrl([string]$Name) {
-  $url = gh release view $ReleaseTag --json assets --jq ".assets[] | select(.name==`"$Name`") | .url"
-  if ($LASTEXITCODE -ne 0) { throw "gh release view failed ($LASTEXITCODE)" }
+  # Именно API-URL ассета (api.github.com/.../assets/ID): web-URL вида
+  # github.com/.../releases/download/... для ПРИВАТНОГО репо отдаёт 404
+  # при любой схеме авторизации — по ним качают лаунчер и zona-update.sh.
+  $url = gh api "repos/{owner}/{repo}/releases/tags/$ReleaseTag" --jq ".assets[] | select(.name==`"$Name`") | .url"
+  if ($LASTEXITCODE -ne 0) { throw "gh api releases/tags failed ($LASTEXITCODE)" }
   if (-not $url) { throw "asset '$Name' not found in release '$ReleaseTag' after upload" }
   return $url.Trim()
 }
