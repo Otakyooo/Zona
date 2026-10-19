@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use zn_content::ItemCatalog;
 use zn_net::{MAX_PLAYERS_PER_SESSION, PROTOCOL_VERSION, SIMULATION_HZ, SNAPSHOT_HZ};
 use zn_scene::{LocationId, LocationRegistry, Scene};
-use zn_server::{Session, SessionConfig, DEFAULT_PORT};
+use zn_server::{Session, SessionConfig, DEFAULT_PORT, STASH_FILE_DEFAULT};
 
 const USAGE: &str = "usage: zn-server [--bind <addr>] [--port <port>] [--max-players <n>] \
-[--content-root <dir>] [--level <name>] [--sim-latency-ms <ms>] [--sim-loss-pct <0..100>]\n\
+[--content-root <dir>] [--level <name>] [--sim-latency-ms <ms>] [--sim-loss-pct <0..100>] \
+[--stash-file <path>|--no-stash]\n\
 без --level поднимается мир локаций из <content-root>/locations.ron";
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,8 @@ struct ServerArgs {
     level: Option<String>,
     sim_latency_ms: u64,
     sim_loss_pct: f32,
+    /// Файл персиста стэшей профилей (M4d-2). `None` — персист выключен.
+    stash_file: Option<PathBuf>,
 }
 
 impl Default for ServerArgs {
@@ -35,6 +38,7 @@ impl Default for ServerArgs {
             level: None,
             sim_latency_ms: 0,
             sim_loss_pct: 0.0,
+            stash_file: Some(PathBuf::from(STASH_FILE_DEFAULT)),
         }
     }
 }
@@ -43,34 +47,42 @@ fn parse_args() -> Result<ServerArgs, String> {
     let mut args = ServerArgs::default();
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
-        let value = iter
-            .next()
-            .ok_or_else(|| format!("missing value for {flag}"))?;
         match flag.as_str() {
-            "--bind" => args.bind = value,
-            "--port" => {
-                args.port = value
-                    .parse()
-                    .map_err(|_| format!("invalid port: {value}"))?
+            // Флаги без значения.
+            "--no-stash" => args.stash_file = None,
+            // Флаги со значением.
+            _ => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("missing value for {flag}"))?;
+                match flag.as_str() {
+                    "--bind" => args.bind = value,
+                    "--port" => {
+                        args.port = value
+                            .parse()
+                            .map_err(|_| format!("invalid port: {value}"))?
+                    }
+                    "--max-players" => {
+                        args.max_players = value
+                            .parse()
+                            .map_err(|_| format!("invalid max players: {value}"))?
+                    }
+                    "--content-root" => args.content_root = PathBuf::from(value),
+                    "--level" => args.level = Some(value),
+                    "--sim-latency-ms" => {
+                        args.sim_latency_ms = value
+                            .parse()
+                            .map_err(|_| format!("invalid sim latency: {value}"))?
+                    }
+                    "--sim-loss-pct" => {
+                        args.sim_loss_pct = value
+                            .parse()
+                            .map_err(|_| format!("invalid sim loss pct: {value}"))?
+                    }
+                    "--stash-file" => args.stash_file = Some(PathBuf::from(value)),
+                    other => return Err(format!("unknown flag: {other}")),
+                }
             }
-            "--max-players" => {
-                args.max_players = value
-                    .parse()
-                    .map_err(|_| format!("invalid max players: {value}"))?
-            }
-            "--content-root" => args.content_root = PathBuf::from(value),
-            "--level" => args.level = Some(value),
-            "--sim-latency-ms" => {
-                args.sim_latency_ms = value
-                    .parse()
-                    .map_err(|_| format!("invalid sim latency: {value}"))?
-            }
-            "--sim-loss-pct" => {
-                args.sim_loss_pct = value
-                    .parse()
-                    .map_err(|_| format!("invalid sim loss pct: {value}"))?
-            }
-            other => return Err(format!("unknown flag: {other}")),
         }
     }
     args.max_players = args.max_players.clamp(1, MAX_PLAYERS_PER_SESSION);
@@ -95,6 +107,7 @@ fn main() {
         max_players: args.max_players,
         out_latency: Duration::from_millis(args.sim_latency_ms),
         out_loss_pct: args.sim_loss_pct,
+        stash_file: args.stash_file.clone(),
         ..SessionConfig::default()
     };
 
@@ -197,6 +210,8 @@ loot <id> <item> <count>, tp <id> <location>, bubbles [<location>], quit)"
     }
 
     println!("server stopped after {} ticks", session.tick());
+    // Персист стэшей (M4d-2): склад профилей переживает остановку сервера.
+    session.flush_stashes();
     let _ = std::io::stdout().flush();
 }
 

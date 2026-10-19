@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 /// предметов в Hello, обыск и действия инвентаря, предметы/трупы в снапшотах;
 /// v5 — аномалии (M4c): броски болтов, снаряды в снапшотах, событие
 /// обнаружения аномалии; v6 — локации и база (M4d): локация в Welcome, смена
-/// локации (переходы/пузыри), склад базы. Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// локации (переходы/пузыри), склад базы; v7 — экстракция (M4d-2): профиль
+/// игрока в Hello, событие эвакуации. Несовпадение версий отвергается.
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -191,6 +192,14 @@ pub enum GameEvent {
     /// секунд и рисуют вспышку. `anomaly` — индекс в `Scene::anomalies`,
     /// `position` — точка срабатывания болта (место вспышки).
     AnomalyRevealed { anomaly: u32, position: [f32; 3] },
+    /// Игрок эвакуировался кругом экстракции (M4d-2): `percent` — доля
+    /// сохранённой добычи, остаток остался на месте круга. Экстрактор видит
+    /// панель результата, остальные — строку в килл-фиде.
+    Extracted {
+        player: u64,
+        player_name: String,
+        percent: f32,
+    },
 }
 
 /// Причина отказа в подключении (`ServerReject`).
@@ -217,6 +226,9 @@ pub enum Message {
         /// Хэш каталога предметов (`ItemCatalog::content_hash`).
         items_hash: u64,
         name: String,
+        /// Профиль игрока (M4d-2): ключ персонального склада при персисте.
+        /// `None` — профиль не задан (склад сессии живёт до отключения).
+        profile: Option<String>,
     },
     /// Последние инпуты (не более `INPUT_REDUNDANCY`, по возрастанию tick).
     InputPacket {

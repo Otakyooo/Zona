@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use zn_content::ItemCatalog;
 use zn_net::{
     check_client_hello, decode_message, encode_message, BoltNet, ClientInput, CorpseNet, GameEvent,
@@ -30,6 +32,13 @@ const BUBBLE_COUNT_MAX: usize = 3;
 /// Использованный пузырь возвращается в мир через 90 с.
 const BUBBLE_RESPAWN_TICKS: u64 = 90 * SIMULATION_HZ as u64;
 
+/// Имя файла персиста стэшей по умолчанию (в рабочей директории сервера).
+pub const STASH_FILE_DEFAULT: &str = "stashes.ron";
+/// Версия схемы файла стэшей (M4d-2): рост ломает совместимость молча.
+const STASH_FILE_VERSION: u32 = 1;
+/// Период автосохранения стэшей профилей (30 с виртуального времени сессии).
+const STASH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Параметры сессии. Всё, что влияет на детерминизм тестов (латентность/потери
 /// исходящих), по умолчанию выключено.
 #[derive(Clone, Debug)]
@@ -41,6 +50,9 @@ pub struct SessionConfig {
     pub out_loss_pct: f32,
     /// Seed детерминированного генератора потерь (воспроизводимость).
     pub rng_seed: u32,
+    /// Файл персиста стэшей профилей (M4d-2). `None` — склад живёт только в
+    /// памяти сессии (поведение M4d, режим тестов).
+    pub stash_file: Option<PathBuf>,
 }
 
 impl Default for SessionConfig {
@@ -50,6 +62,7 @@ impl Default for SessionConfig {
             out_latency: Duration::ZERO,
             out_loss_pct: 0.0,
             rng_seed: 0x9E37_79B9,
+            stash_file: None,
         }
     }
 }
@@ -99,8 +112,19 @@ struct LocationChange {
     from: LocationId,
     to: LocationId,
     /// Точка появления в целевой локации (ступни).
+    pub position: Vec3,
+    pub yaw: f32,
+}
+
+/// Сработавшая экстракция (M4d-2): игрок в круге `Scene::extractions`.
+#[derive(Clone, Copy, Debug)]
+struct Extraction {
+    player_id: u64,
+    from: LocationId,
+    /// Доля сохраняемой добычи из круга сцены.
+    percent: f32,
+    /// Якорь круга — сюда падает остаток добычи.
     position: Vec3,
-    yaw: f32,
 }
 
 /// Мир сессии (M4d): симуляция на локацию, переходы, пузыри и склад.
@@ -420,6 +444,65 @@ impl World {
         moves
     }
 
+    /// Круги экстракции (M4d-2): живой игрок в круге эвакуируется. Возвращает
+    /// сработавшие круги для применения (депозит + перенос на базу).
+    fn check_extractions(&mut self) -> Vec<Extraction> {
+        let mut found = Vec::new();
+        let ids: Vec<LocationId> = self.locations.keys().copied().collect();
+        for &id in &ids {
+            let Some(runtime) = self.locations.get_mut(&id) else {
+                continue;
+            };
+            if runtime.scene.extractions.is_empty() {
+                continue;
+            }
+            let LocationRuntime {
+                scene, simulation, ..
+            } = runtime;
+            for (player_id, position) in player_positions(simulation) {
+                if let Some(extraction) = scene
+                    .extractions
+                    .iter()
+                    .find(|extraction| extraction.contains(position))
+                {
+                    found.push(Extraction {
+                        player_id,
+                        from: id,
+                        percent: extraction.percent,
+                        position: extraction.position,
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// Выполняет эвакуацию: делит инвентарь по проценту круга, сохраняемую
+    /// часть кладёт в склад сессии, остаток роняет на землю в круге.
+    /// Возвращает (сохранено стопок, потеряно стопок).
+    fn extract_player(&mut self, extraction: Extraction) -> (usize, usize) {
+        let Some(runtime) = self.locations.get_mut(&extraction.from) else {
+            return (0, 0);
+        };
+        let (saved, lost) = runtime
+            .simulation
+            .extract_inventory(extraction.player_id, extraction.percent);
+        for stack in &lost {
+            runtime
+                .simulation
+                .drop_stack_at(*stack, extraction.position);
+        }
+        let saved_count = saved.len();
+        let lost_count = lost.len();
+        if !saved.is_empty() {
+            self.stashes
+                .entry(extraction.player_id)
+                .or_default()
+                .extend(saved);
+        }
+        (saved_count, lost_count)
+    }
+
     /// Куда уносит пузырь из `from`: локация строго ближе к базе, кроме самой
     /// базы (в неё ведёт сигнал — M4d-5); если такой нет — свои точки прибытия
     /// («почти под базу»).
@@ -648,6 +731,9 @@ struct ClientState {
     last_interact_tick: u64,
     /// Последний обработанный `InventoryAction`/`StashAction`/`ThrowBolt`.
     last_action_tick: u64,
+    /// Профиль игрока (M4d-2): ключ персистентного склада. `None` — склад
+    /// живёт только в памяти сессии.
+    profile: Option<String>,
 }
 
 /// Состояние локации для рассылки (двухфазный сбор — снапшоты шлются уже
@@ -681,6 +767,14 @@ pub struct Session {
     outbox: VecDeque<(Duration, SocketAddr, Vec<u8>)>,
     rng: u32,
     stats: SessionStats,
+    /// Персист стэшей (M4d-2): склад профилей, загруженный из файла (без
+    /// живой сессии) и ожидающий записи. `None` — персист выключен.
+    stash_path: Option<PathBuf>,
+    /// Склады профилей, загруженные из файла, но не занятые сессией.
+    stashes_disk: HashMap<String, Vec<Stack>>,
+    /// Есть несохранённые изменения склада.
+    stash_dirty: bool,
+    last_stash_flush: Duration,
 }
 
 impl Session {
@@ -769,6 +863,20 @@ impl Session {
             );
         }
         let rng = config.rng_seed | 1;
+        let (stash_path, stashes_disk) = match config.stash_file.clone() {
+            Some(path) => {
+                let loaded = load_stash_file(&path);
+                if !loaded.is_empty() {
+                    log::info!(
+                        "стэши: загружено профилей из {}: {}",
+                        path.display(),
+                        loaded.len()
+                    );
+                }
+                (Some(path), loaded)
+            }
+            None => (None, HashMap::new()),
+        };
         Ok(Self {
             socket,
             world,
@@ -783,6 +891,10 @@ impl Session {
             outbox: VecDeque::new(),
             rng,
             stats: SessionStats::default(),
+            stash_path,
+            stashes_disk,
+            stash_dirty: false,
+            last_stash_flush: Duration::ZERO,
         })
     }
 
@@ -971,7 +1083,8 @@ impl Session {
     }
 
     /// Один шаг цикла: приём → фиксированные шаги всех локаций одним `dt` →
-    /// переходы и пузыри → снапшоты (30 Гц) → таймауты → отправка отложенных.
+    /// переходы и пузыри → экстракции → снапшоты (30 Гц) → таймауты → отправка
+    /// отложенных.
     pub fn poll(&mut self, dt: Duration) {
         self.now += dt;
         self.receive_all();
@@ -981,13 +1094,104 @@ impl Session {
             let mut changes = self.world.check_transfers();
             changes.extend(self.world.check_bubbles(tick));
             self.apply_location_changes(changes);
+            let extractions = self.world.check_extractions();
+            if !extractions.is_empty() {
+                self.apply_extractions(extractions);
+            }
         }
+        self.flush_stashes_if_dirty();
         if self.world.tick() - self.last_snapshot_tick >= SNAPSHOT_EVERY_TICKS {
             self.last_snapshot_tick = self.world.tick();
             self.send_snapshots();
         }
         self.check_timeouts();
         self.flush_outbox();
+    }
+
+    /// Пишет стэши профилей на диск, если есть изменения и включён персист.
+    fn flush_stashes_if_dirty(&mut self) {
+        if !self.stash_dirty || self.now < self.last_stash_flush + STASH_FLUSH_INTERVAL {
+            return;
+        }
+        self.flush_stashes();
+    }
+
+    /// Принудительно пишет стэши профилей (quit консоли, отключение игрока).
+    pub fn flush_stashes(&mut self) {
+        self.stash_dirty = false;
+        self.last_stash_flush = self.now;
+        let Some(path) = self.stash_path.clone() else {
+            return;
+        };
+        // Живые сессии профилей перекрывают дисковые: склад — у игрока.
+        let mut merged = self.stashes_disk.clone();
+        for (player_id, items) in &self.world.stashes {
+            if let Some(profile) = self.profile_of(*player_id) {
+                merged.insert(profile, items.clone());
+            }
+        }
+        if merged.is_empty() && !path.exists() {
+            return;
+        }
+        match save_stash_file(&path, &merged) {
+            Ok(()) => log::info!(
+                "стэши: сохранено {} профилей в {}",
+                merged.len(),
+                path.display()
+            ),
+            Err(error) => log::error!("стэши: не удалось сохранить {}: {error}", path.display()),
+        }
+    }
+
+    /// Профиль игрока по id (если клиент подключился с профилем).
+    fn profile_of(&self, player_id: u64) -> Option<String> {
+        self.clients
+            .values()
+            .find(|client| client.player_id == player_id)
+            .and_then(|client| client.profile.clone())
+    }
+
+    /// Экстракция (M4d-2): депозит доли добычи, событие в снапшот локации,
+    /// перенос на базу. Круги сцены читает клиент локально — рендер без сети.
+    fn apply_extractions(&mut self, extractions: Vec<Extraction>) {
+        for extraction in extractions {
+            let name = self
+                .names
+                .get(&extraction.player_id)
+                .cloned()
+                .unwrap_or_default();
+            let (saved, lost) = self.world.extract_player(extraction);
+            // Событие уходит всем в локации: остальные видят эвакуацию.
+            if let Some(runtime) = self.world.locations.get_mut(&extraction.from) {
+                runtime.simulation.push_event(GameEvent::Extracted {
+                    player: extraction.player_id,
+                    player_name: name.clone(),
+                    percent: extraction.percent,
+                });
+            }
+            // Перенос на базу: спавн базовой сцены, инвентарь уже разделён.
+            let base = self.world.base;
+            let (spawn, spawn_yaw) = self
+                .world
+                .locations
+                .get(&base)
+                .map(|runtime| (runtime.scene.spawn, runtime.scene.spawn_yaw))
+                .unwrap_or((Vec3::ZERO, 0.0));
+            let change = LocationChange {
+                player_id: extraction.player_id,
+                from: extraction.from,
+                to: base,
+                position: spawn,
+                yaw: spawn_yaw,
+            };
+            self.apply_location_changes(vec![change]);
+            self.stash_dirty = true;
+            log::info!(
+                "эвакуация: игрок {name} из '{}' сохранил {saved} стопок ({}%), потеряно {lost}",
+                self.world.location_name(extraction.from),
+                (extraction.percent * 100.0).round()
+            );
+        }
     }
 
     /// Применяет переносы мира: состояние игрока едет в симуляцию цели,
@@ -1054,7 +1258,15 @@ impl Session {
                 content_hash,
                 items_hash,
                 name,
-            } => self.handle_hello(addr, protocol_version, content_hash, items_hash, name),
+                profile,
+            } => self.handle_hello(
+                addr,
+                protocol_version,
+                content_hash,
+                items_hash,
+                name,
+                profile,
+            ),
             Message::InputPacket { inputs } => self.handle_inputs(addr, inputs),
             Message::Interact { tick } => self.handle_interact(addr, tick),
             Message::InventoryAction { tick, action } => {
@@ -1085,6 +1297,7 @@ impl Session {
         content_hash: u64,
         items_hash: u64,
         name: String,
+        profile: Option<String>,
     ) {
         // Повтор Hello (Welcome мог потеряться) — повторяем Welcome.
         if let Some(client) = self.clients.get_mut(&addr) {
@@ -1119,8 +1332,19 @@ impl Session {
 
         let name = clamp_name(&name);
         let (player_id, _) = self.world.spawn_on_base();
+        // Профиль (M4d-2): склад с прошлых сессий едет с игроком.
+        if let Some(profile) = &profile {
+            if let Some(items) = self.stashes_disk.remove(profile) {
+                self.world.stashes.insert(player_id, items);
+                log::info!("стэши: профиль '{profile}' восстановил склад игрока {player_id}");
+            }
+        }
         log::info!(
-            "игрок '{name}' (id {player_id}) подключился с {addr} в '{}' [{} игроков]",
+            "игрок '{name}' (id {player_id}{}) подключился с {addr} в '{}' [{} игроков]",
+            profile
+                .as_ref()
+                .map(|profile| format!(", профиль '{profile}'"))
+                .unwrap_or_default(),
             self.world.location_name(self.world.base),
             self.clients.len() + 1
         );
@@ -1134,6 +1358,7 @@ impl Session {
                 last_seen: self.now,
                 last_interact_tick: 0,
                 last_action_tick: 0,
+                profile,
             },
         );
         self.send_welcome(addr, player_id);
@@ -1170,6 +1395,11 @@ impl Session {
             .locations
             .get_mut(&location)
             .map(|runtime| &mut runtime.simulation)
+    }
+
+    /// Сцена локации мира (круги экстракции, переходы — для клиента и тестов).
+    pub fn world_scene(&self, location: LocationId) -> &Scene {
+        &self.world.locations[&location].scene
     }
 
     fn handle_inputs(&mut self, addr: SocketAddr, inputs: Vec<ClientInput>) {
@@ -1460,6 +1690,13 @@ impl Session {
 
     fn remove_client(&mut self, addr: SocketAddr, reason: &str) {
         if let Some(client) = self.clients.remove(&addr) {
+            // Персист (M4d-2): склад профиля переезжает из сессии на диск.
+            if let Some(profile) = &client.profile {
+                if let Some(items) = self.world.stashes.remove(&client.player_id) {
+                    self.stashes_disk.insert(profile.clone(), items);
+                    self.stash_dirty = true;
+                }
+            }
             self.world.remove_player(client.player_id);
             log::info!(
                 "игрок '{}' (id {}) удалён: {reason}, в сессии {}",
@@ -1559,6 +1796,83 @@ fn clamp_name(name: &str) -> String {
         end -= 1;
     }
     name[..end].to_string()
+}
+
+// ─── персист стэшей профилей (M4d-2) ───────────────────────────────────────
+
+/// Файл стэшей: версия схемы и записи по профилям. Профиль — ключ игрока
+/// (`ZN_PROFILE` клиента); без профиля склад живёт только в памяти сессии.
+#[derive(Serialize, Deserialize)]
+struct StashFile {
+    version: u32,
+    stashes: Vec<StashRecord>,
+}
+
+/// Склад одного профиля: стопки без слияния (порядок — как в панели).
+#[derive(Serialize, Deserialize)]
+struct StashRecord {
+    profile: String,
+    /// Пары (индекс предмета в каталоге, количество).
+    items: Vec<(u16, u32)>,
+}
+
+/// Читает файл стэшей. Отсутствие файла — не ошибка (первый запуск); битый
+/// файл — тоже не ошибка: предупреждение и пустой склад (fail-soft).
+fn load_stash_file(path: &Path) -> HashMap<String, Vec<Stack>> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    match ron::from_str::<StashFile>(&text) {
+        Ok(file) if file.version == STASH_FILE_VERSION => file
+            .stashes
+            .into_iter()
+            .map(|record| {
+                (
+                    record.profile,
+                    record
+                        .items
+                        .into_iter()
+                        .map(|(item, count)| Stack::new(item, count))
+                        .collect(),
+                )
+            })
+            .collect(),
+        Ok(file) => {
+            log::warn!(
+                "стэши: версия файла {} != {} — склад не загружен",
+                file.version,
+                STASH_FILE_VERSION
+            );
+            HashMap::new()
+        }
+        Err(error) => {
+            log::warn!("стэши: не удалось прочесть {}: {error}", path.display());
+            HashMap::new()
+        }
+    }
+}
+
+/// Пишет файл стэшей атомарно (временный файл + rename): битый файл после
+/// сбоя питания не потеряет всё.
+fn save_stash_file(path: &Path, stashes: &HashMap<String, Vec<Stack>>) -> io::Result<()> {
+    let file = StashFile {
+        version: STASH_FILE_VERSION,
+        stashes: stashes
+            .iter()
+            .map(|(profile, items)| StashRecord {
+                profile: profile.clone(),
+                items: items
+                    .iter()
+                    .map(|stack| (stack.item, stack.count))
+                    .collect(),
+            })
+            .collect(),
+    };
+    let pretty = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let temp = path.with_extension("ron.tmp");
+    std::fs::write(&temp, pretty)?;
+    std::fs::rename(&temp, path)
 }
 
 #[cfg(test)]
@@ -1678,5 +1992,117 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), field.active.len(), "без дублей точек");
         assert!(field.active.iter().all(|candidate| *candidate < candidates));
+    }
+
+    #[test]
+    fn world_extract_deposits_percent_and_drops_rest_in_circle() {
+        let registry = LocationRegistry::builtin();
+        let scenes = Scene::builtin_world();
+        let mut world = World::new(registry, scenes, &test_catalog(), 7).expect("мир");
+        let (player_id, _) = world.spawn_on_base();
+        let catalog = test_catalog();
+        let medkit = catalog.index_of("medkit").unwrap();
+        let canned = catalog.index_of("canned_food").unwrap();
+        let bolt = catalog.index_of("bolt").unwrap();
+        {
+            let runtime = world.locations.get_mut(&world.base).unwrap();
+            runtime
+                .simulation
+                .give_stack(player_id, Stack::new(medkit, 2));
+            runtime
+                .simulation
+                .give_stack(player_id, Stack::new(canned, 2));
+            runtime
+                .simulation
+                .give_stack(player_id, Stack::new(bolt, 4));
+        }
+
+        let extraction = Extraction {
+            player_id,
+            from: world.base,
+            percent: 0.75,
+            position: Vec3::new(2.0, 0.0, 3.0),
+        };
+        let (saved, lost) = world.extract_player(extraction);
+        // Бюджет 1.65 кг из 2.2: medkit целиком, canned 1/1, bolt 3/1.
+        assert_eq!((saved, lost), (3, 2));
+        assert_eq!(
+            world.stashes[&player_id],
+            vec![
+                Stack::new(medkit, 2),
+                Stack::new(canned, 1),
+                Stack::new(bolt, 3),
+            ]
+        );
+        let loot = world.locations[&world.base].simulation.snapshot_loot();
+        assert_eq!(loot.len(), 2, "остаток добычи лежит в круге");
+        assert!(loot
+            .iter()
+            .any(|item| item.item == canned && item.count == 1));
+        assert!(loot.iter().any(|item| item.item == bolt && item.count == 1));
+    }
+
+    #[test]
+    fn world_check_extractions_finds_player_in_circle() {
+        let registry = LocationRegistry::builtin();
+        let scenes = Scene::builtin_world();
+        let mut world = World::new(registry, scenes, &test_catalog(), 7).expect("мир");
+        let (player_id, _) = world.spawn_on_base();
+        let circle = world.locations[&zn_scene::LOCATION_KORDON]
+            .scene
+            .extractions[0]
+            .position;
+        // Переносим игрока на Кордон и ставим точно в круг экстракции.
+        let move_change = LocationChange {
+            player_id,
+            from: world.base,
+            to: zn_scene::LOCATION_KORDON,
+            position: Vec3::new(0.0, 0.0, 22.0),
+            yaw: 0.0,
+        };
+        assert!(world.apply_change(&move_change));
+        {
+            let runtime = world.locations.get_mut(&zn_scene::LOCATION_KORDON).unwrap();
+            let mut players = runtime.simulation.snapshot();
+            let state = players
+                .iter_mut()
+                .find(|player| player.player_id == player_id)
+                .expect("игрок на Кордоне");
+            state.position = circle.to_array();
+            runtime.simulation.restore_player(player_id, state);
+        }
+        let found = world.check_extractions();
+        assert_eq!(found.len(), 1, "круг экстракции сработал");
+        assert_eq!(found[0].player_id, player_id);
+        assert_eq!(found[0].from, zn_scene::LOCATION_KORDON);
+        assert!(found[0].percent > 0.0);
+    }
+
+    #[test]
+    fn stash_file_roundtrip_and_fail_soft() {
+        let dir = std::env::temp_dir().join(format!("zn_stash_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stashes.ron");
+
+        let mut stashes = HashMap::new();
+        stashes.insert("alpha".to_string(), vec![Stack::new(3, 30)]);
+        save_stash_file(&path, &stashes).unwrap();
+        let loaded = load_stash_file(&path);
+        assert_eq!(
+            loaded.get("alpha"),
+            Some(&vec![Stack::new(3, 30)]),
+            "round-trip сохраняет стопки"
+        );
+
+        // Битый файл — предупреждение и пустой склад, без паники.
+        std::fs::write(&path, "(((").unwrap();
+        assert!(load_stash_file(&path).is_empty());
+        // Несовпадение версии — отказ загрузки.
+        std::fs::write(&path, "(version: 99, stashes: [])").unwrap();
+        assert!(load_stash_file(&path).is_empty());
+        // Отсутствующий файл — не ошибка.
+        assert!(load_stash_file(&dir.join("nope.ron")).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

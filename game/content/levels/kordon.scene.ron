@@ -1389,6 +1389,14 @@
         (6.0, 0.0, 19.0),
         (-8.0, 0.0, 20.0),
     ],
+    extractions: [
+        (
+            position: (-24.0, 0.0, -24.0),
+            radius: 3.0,
+            percent: 0.75,
+            label: "Аварийная эвакуация",
+        ),
+    ],
     environment: (
         sun_direction: (0.4, 0.8, 0.3),
         sun_color: (1.0, 0.95, 0.85),

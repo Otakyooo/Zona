@@ -75,6 +75,7 @@ fn all_message_variants_roundtrip_through_bincode() {
             content_hash: 0xDEAD_BEEF_CAFE_F00D,
             items_hash: 0x0BAD_F00D_1234_5678,
             name: "Сталкер".to_string(),
+            profile: Some("stalker-1".to_string()),
         },
         Message::InputPacket {
             inputs: vec![ClientInput::new(1), ClientInput::new(2)],
@@ -317,7 +318,7 @@ fn position_and_yaw_quantization_roundtrip() {
 
 #[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(PROTOCOL_VERSION, 7);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);

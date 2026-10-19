@@ -5202,6 +5202,8 @@ version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
+ "ron",
+ "serde",
  "zn-content",
  "zn-net",
  "zn-scene",
