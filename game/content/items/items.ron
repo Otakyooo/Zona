@@ -5,6 +5,9 @@
             display_name: "Тягун",
             weight_kg: 0.5,
             stack_max: 1,
+            carry_effect: Some((
+                weight_cut: Some(0.2),
+            )),
             color: (0.55, 0.3, 0.95),
         ),
         (
@@ -12,6 +15,9 @@
             display_name: "Жар-камень",
             weight_kg: 0.4,
             stack_max: 1,
+            carry_effect: Some((
+                heat_resist: Some(0.5),
+            )),
             color: (1.0, 0.45, 0.15),
         ),
         (
@@ -44,6 +50,10 @@
             display_name: "Консервы",
             weight_kg: 0.5,
             stack_max: 5,
+            use_effect: Some((
+                heal: 10,
+                duration_secs: 4.0,
+            )),
             color: (0.35, 0.6, 0.3),
         ),
         (

@@ -27,7 +27,7 @@ use zn_scene::{AnomalyKind, LocationId, Scene, SceneObject, LOCATION_BASE};
 use zn_sim::{
     ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING,
     INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS, INVENTORY_SLOTS,
-    MAX_CARRY_WEIGHT_KG, MAX_HEALTH, RESPAWN_DELAY_TICKS, RIFLE_RANGE,
+    MAX_CARRY_WEIGHT_KG, MAX_HEALTH, RESPAWN_DELAY_TICKS, RIFLE_AMMO_KEY, RIFLE_RANGE,
 };
 
 use crate::assets::{AssetEvent, AssetLoader};
@@ -333,6 +333,10 @@ struct HudData {
     flash: Option<f32>,
     /// Своё уведомление об экстракции (M4d-2), пока свежее.
     extraction: Option<String>,
+    /// Патроны винтовки (M4d-3a); `None` — в каталоге нет патрона.
+    ammo: Option<u32>,
+    /// Эффект сильнейшего артефакта ношения (M4d-3a).
+    carry: Option<String>,
 }
 
 pub struct ClientApp {
@@ -1282,7 +1286,8 @@ impl ClientApp {
             self.simulation.step_once();
 
             // Локальный отклик своего выстрела (чужой приходит событием Shot).
-            if firing && self.client_tick >= self.next_local_fire_tick {
+            // Без патронов (M4d-3a) — «сухой» курок: отклика нет, как на сервере.
+            if firing && self.client_tick >= self.next_local_fire_tick && self.local_ammo_left() {
                 self.next_local_fire_tick = self.client_tick + FIRE_INTERVAL_TICKS;
                 self.spawn_local_shot(now);
             }
@@ -1344,6 +1349,89 @@ impl ClientApp {
             let _ = self.simulation.take_net_updates();
         }
         self.update_interact_hint();
+    }
+
+    /// Сильнейший эффект ношения в инвентаре (M4d-3a) — строка для HUD.
+    /// Сеть — персональные апдейты инвентаря, offline — локальная симуляция.
+    fn carry_effect_note(&mut self) -> Option<String> {
+        let items: Vec<u16> = if self.net.is_some() {
+            self.inventory
+                .iter()
+                .flatten()
+                .map(|stack| stack.item)
+                .collect()
+        } else {
+            self.simulation
+                .player_state(self.player_id)
+                .map(|state| {
+                    state
+                        .inventory
+                        .iter()
+                        .flatten()
+                        .map(|stack| stack.item)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut best: Option<(f32, String)> = None;
+        for item in items {
+            let Some(definition) = self.catalog.get(item) else {
+                continue;
+            };
+            let Some(effect) = definition.carry_effect.as_ref() else {
+                continue;
+            };
+            if let Some(cut) = effect.weight_cut.filter(|cut| *cut > 0.0) {
+                let text = format!(
+                    "{}: −{} % веса",
+                    definition.display_name,
+                    (cut * 100.0).round()
+                );
+                best = Some(match best {
+                    Some((power, old)) if power >= cut => (power, old),
+                    _ => (cut, text),
+                });
+            }
+            if let Some(resist) = effect.heat_resist.filter(|resist| *resist < 1.0) {
+                let text = format!(
+                    "{}: −{} % урона жгучих",
+                    definition.display_name,
+                    ((1.0 - resist) * 100.0).round()
+                );
+                let power = 1.0 - resist;
+                best = Some(match best {
+                    Some((power_current, old)) if power_current >= power => (power_current, old),
+                    _ => (power, text),
+                });
+            }
+        }
+        best.map(|(_, text)| text)
+    }
+
+    /// Патроны у локального игрока (M4d-3a): сеть — персональные апдейты
+    /// инвентаря, offline — локальная симуляция. Нет патрона в каталоге —
+    /// стрельба не ограничена (кастомные каталоги).
+    fn local_ammo_left(&mut self) -> bool {
+        let Some(ammo) = self.catalog.index_of(RIFLE_AMMO_KEY) else {
+            return true;
+        };
+        let has_ammo = |item: u16, count: u32| item == ammo && count > 0;
+        if self.net.is_some() {
+            return self
+                .inventory
+                .iter()
+                .flatten()
+                .any(|stack| has_ammo(stack.item, u32::from(stack.count)));
+        }
+        self.simulation
+            .player_state(self.player_id)
+            .is_none_or(|state| {
+                state
+                    .inventory
+                    .iter()
+                    .flatten()
+                    .any(|stack| has_ammo(stack.item, stack.count))
+            })
     }
 
     /// Локальный отклик своего выстрела: трейсер до первой стены и вспышка.
@@ -2260,6 +2348,34 @@ impl ClientApp {
             .as_ref()
             .map(|notice| notice.text.clone());
 
+        // Патроны и эффекты ношения (M4d-3a): сеть — персональные апдейты,
+        // offline — локальная симуляция; без патрона в каталоге — не показываем.
+        let ammo = self.catalog.index_of(RIFLE_AMMO_KEY).map(|ammo| {
+            if self.net.is_some() {
+                self.inventory
+                    .iter()
+                    .flatten()
+                    .filter(|stack| stack.item == ammo)
+                    .map(|stack| u32::from(stack.count))
+                    .sum()
+            } else {
+                self.simulation
+                    .player_state(self.player_id)
+                    .map(|state| {
+                        state
+                            .inventory
+                            .iter()
+                            .flatten()
+                            .filter(|stack| stack.item == ammo)
+                            .map(|stack| stack.count)
+                            .sum()
+                    })
+                    .unwrap_or(0)
+            }
+        });
+        // Самый сильный эффект ношения из инвентаря — одна строка у HP.
+        let carry = self.carry_effect_note();
+
         HudData {
             health,
             max_health: MAX_HEALTH,
@@ -2276,6 +2392,8 @@ impl ClientApp {
             feed,
             post_hint: self.post_hint.as_ref().map(|hint| hint.text.clone()),
             extraction,
+            ammo,
+            carry,
             time: self.started.elapsed().as_secs_f64(),
             hint,
             inventory,
@@ -2650,6 +2768,32 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         egui::FontId::proportional(16.0),
         egui::Color32::from_white_alpha(230),
     );
+
+    // Патроны винтовки (M4d-3a) — под HP; пустой магазин красный.
+    if let Some(ammo) = hud.ammo {
+        painter.text(
+            egui::pos2(bar_pos.x, bar_pos.y + bar_size.y + 6.0),
+            egui::Align2::LEFT_TOP,
+            format!("Патроны: {ammo}"),
+            egui::FontId::proportional(16.0),
+            if ammo > 0 {
+                egui::Color32::from_white_alpha(220)
+            } else {
+                egui::Color32::from_rgb(214, 78, 66)
+            },
+        );
+    }
+
+    // Эффект артефакта ношения (M4d-3a) — под патронами.
+    if let Some(carry) = &hud.carry {
+        painter.text(
+            egui::pos2(bar_pos.x, bar_pos.y + bar_size.y + 28.0),
+            egui::Align2::LEFT_TOP,
+            carry,
+            egui::FontId::proportional(14.0),
+            egui::Color32::from_rgb(150, 220, 255),
+        );
+    }
 
     // Полоска лечения — над HP, пока идёт эффект (доля оставшегося времени).
     if let Some(fraction) = hud.healing {
@@ -3186,8 +3330,12 @@ mod tests {
 
     #[test]
     fn offline_client_fires_with_local_echo() {
-        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
         app.cursor_grabbed = true;
+        // Патроны (M4d-3a): без них локальный отклик молчит.
+        let ammo = app.catalog.index_of(RIFLE_AMMO_KEY).unwrap();
+        assert_eq!(app.simulation.debug_give(app.player_id, ammo, 30), 30);
         app.input.press_button(MouseButton::Left);
         for _ in 0..30 {
             app.simulate(std::time::Duration::from_millis(17));
@@ -4020,6 +4168,55 @@ mod tests {
     }
 
     #[test]
+    fn dry_trigger_silences_local_echo_until_ammo_arrives() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        app.cursor_grabbed = true;
+
+        // Без патронов (M4d-3a): удержание ЛКМ не даёт ни трейсера, ни звука.
+        app.input.press_button(MouseButton::Left);
+        for _ in 0..30 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+        assert!(
+            app.tracers.is_empty(),
+            "сухой курок: трейсеров {}",
+            app.tracers.len()
+        );
+
+        // Патроны пришли — локальный отклик возобновляется.
+        let ammo = app.catalog.index_of(RIFLE_AMMO_KEY).unwrap();
+        assert_eq!(app.simulation.debug_give(app.player_id, ammo, 5), 5);
+        for _ in 0..30 {
+            app.simulate(std::time::Duration::from_millis(17));
+        }
+        assert!(
+            !app.tracers.is_empty(),
+            "с патронами выстрел снова виден: {}",
+            app.tracers.len()
+        );
+    }
+
+    #[test]
+    fn hud_shows_ammo_and_artifact_carry_effect() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        let ammo = app.catalog.index_of(RIFLE_AMMO_KEY).unwrap();
+        let gravity = app.catalog.index_of("artifact_gravity").unwrap();
+
+        let hud = app.collect_hud_data();
+        assert_eq!(hud.ammo, Some(0), "магазин пуст — счётчик на нуле");
+        assert!(hud.carry.is_none(), "без артефактов подсказки нет");
+
+        assert_eq!(app.simulation.debug_give(app.player_id, ammo, 12), 12);
+        assert_eq!(app.simulation.debug_give(app.player_id, gravity, 1), 1);
+        let hud = app.collect_hud_data();
+        assert_eq!(hud.ammo, Some(12));
+        let carry = hud.carry.expect("подсказка эффекта Тягуна");
+        assert!(carry.contains("вес"), "{carry}");
+    }
+
+    #[test]
     fn artifact_ground_color_is_hdr_and_regular_loot_is_not() {
         let artifact = zn_content::Item {
             key: "artifact_heat".to_string(),
@@ -4027,6 +4224,7 @@ mod tests {
             weight_kg: 0.5,
             stack_max: 1,
             use_effect: None,
+            carry_effect: None,
             color: [0.95, 0.72, 0.15],
         };
         let ammo = zn_content::Item {

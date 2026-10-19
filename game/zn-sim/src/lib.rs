@@ -47,6 +47,9 @@ pub const RESPAWN_DELAY_TICKS: u64 = 180;
 pub const MAX_CARRY_WEIGHT_KG: f32 = 50.0;
 /// Тот же лимит в граммах — точные сравнения без плавающей точки.
 pub const MAX_CARRY_GRAMS: u32 = (MAX_CARRY_WEIGHT_KG * 1000.0) as u32;
+/// Ключ патрона винтовки (M4d-3a): выстрел расходует штуку из инвентаря.
+/// Нет такого предмета в каталоге — стрельба не ограничена.
+pub const RIFLE_AMMO_KEY: &str = "ammo_545";
 /// Сетка инвентаря 8×5: ячейка — одна стопка.
 pub const INVENTORY_COLS: usize = 8;
 pub const INVENTORY_ROWS: usize = 5;
@@ -1197,10 +1200,21 @@ fn player_combat(world: &mut World) {
         .unwrap_or(0);
 
     // Фаза 1: выстрелы и попадания (иммутабельные заимствования).
+    // Патроны (M4d-3a): выстрел расходует патрон из инвентаря; без патронов
+    // стрельба молчит (сервер авторитетен — клиент только предсказывает).
+    let ammo_item = catalog_of(world).index_of(RIFLE_AMMO_KEY);
     let shooters: Vec<(u64, Vec3, Vec3)> = world
         .query::<&PlayerState>()
         .iter()
         .filter(|state| state.health > 0 && state.firing && tick >= state.next_fire_tick)
+        .filter(|state| match ammo_item {
+            Some(item) => state
+                .inventory
+                .iter()
+                .flatten()
+                .any(|stack| stack.item == item && stack.count > 0),
+            None => true,
+        })
         .map(|state| {
             (
                 state.id,
@@ -1260,6 +1274,13 @@ fn player_combat(world: &mut World) {
                 let hit_point = *origin + *dir * t;
                 hits.push((victim, *shooter, zone_damage(hit_point.y - feet.y)));
             }
+        }
+    }
+
+    // Расход патронов (M4d-3a): по штуке за выстрел, пустые стопки убираем.
+    if let Some(item) = ammo_item {
+        for shooter in &fired {
+            consume_item(world, *shooter, item);
         }
     }
 
@@ -1330,6 +1351,8 @@ fn anomaly_effects(world: &mut World) {
     if anomalies.is_empty() {
         return;
     }
+    // Артефакты в инвентаре гасят урон (M4d-3a).
+    let catalog = catalog_of(world);
 
     let mut deaths: Vec<(u64, Vec<Stack>, Vec3, f32)> = Vec::new();
     {
@@ -1352,6 +1375,7 @@ fn anomaly_effects(world: &mut World) {
                                 + (f32::from(ANOMALY_DAMAGE_CENTER)
                                     - f32::from(ANOMALY_DAMAGE_EDGE))
                                     * closeness;
+                            let damage = damage * heat_resist_factor(&catalog, &state.inventory);
                             state.health = state.health.saturating_sub(damage.round() as u16);
                         }
                         if state.health == 0 {
@@ -2037,6 +2061,64 @@ pub fn inventory_weight_grams(
     grams
 }
 
+/// Лимит переноски с учётом артефактов (M4d-3a): самый сильный `weight_cut`
+/// в инвентаре поднимает потолок (без суммирования).
+pub fn carry_limit_grams(
+    catalog: &ItemCatalog,
+    inventory: &[Option<Stack>; INVENTORY_SLOTS],
+) -> u32 {
+    let cut = inventory
+        .iter()
+        .flatten()
+        .filter_map(|stack| catalog.get(stack.item))
+        .filter_map(|item| item.carry_effect.as_ref())
+        .filter_map(|effect| effect.weight_cut)
+        .fold(0.0f32, f32::max)
+        .clamp(0.0, 1.0);
+    (MAX_CARRY_GRAMS as f32 * (1.0 + cut)) as u32
+}
+
+/// Множитель урона жгучих аномалий по инвентарю (M4d-3a): самый сильный
+/// `heat_resist` среди артефактов (0.5 — половина урона).
+pub fn heat_resist_factor(
+    catalog: &ItemCatalog,
+    inventory: &[Option<Stack>; INVENTORY_SLOTS],
+) -> f32 {
+    inventory
+        .iter()
+        .flatten()
+        .filter_map(|stack| catalog.get(stack.item))
+        .filter_map(|item| item.carry_effect.as_ref())
+        .filter_map(|effect| effect.heat_resist)
+        .fold(1.0f32, f32::min)
+        .clamp(0.0, 1.0)
+}
+
+/// Расходует одну единицу предмета (M4d-3a: патрон за выстрел): пустые стопки
+/// убираются, сеть получает обновление инвентаря.
+fn consume_item(world: &mut World, player_id: u64, item: u16) {
+    let spent = with_player(world, player_id, |state| {
+        let mut spent = false;
+        for slot in state.inventory.iter_mut().flatten() {
+            if slot.item == item && slot.count > 0 {
+                slot.count -= 1;
+                spent = true;
+                break;
+            }
+        }
+        for slot in state.inventory.iter_mut() {
+            if slot.as_ref().is_some_and(|stack| stack.count == 0) {
+                *slot = None;
+            }
+        }
+        spent
+    })
+    .unwrap_or(false);
+    if spent {
+        push_inventory_update_of(world, player_id);
+    }
+}
+
 /// Кладёт стопку в инвентарь насколько влезает по весу и ячейкам: сначала
 /// доливает частичные стопки того же предмета, затем занимает пустые ячейки.
 /// Возвращает число перенесённых единиц (может быть меньше `stack.count`).
@@ -2050,8 +2132,9 @@ fn add_stack(
     };
     let stack_max = item.stack_max.max(1);
     let unit_grams = item_weight_grams(item);
-    let room_units =
-        MAX_CARRY_GRAMS.saturating_sub(inventory_weight_grams(catalog, inventory)) / unit_grams;
+    let room_units = carry_limit_grams(catalog, inventory)
+        .saturating_sub(inventory_weight_grams(catalog, inventory))
+        / unit_grams;
     if room_units == 0 {
         return 0;
     }

@@ -44,6 +44,10 @@ pub struct Item {
     /// Эффект использования; `None` — предмет в M4b только переносится.
     #[serde(default)]
     pub use_effect: Option<UseEffect>,
+    /// Эффект ношения (M4d-3a): работает, пока предмет в инвентаре.
+    /// `None` — артефакт без свойств (заготовка).
+    #[serde(default)]
+    pub carry_effect: Option<CarryEffect>,
     /// Цвет для рендера предметов на земле и ячеек инвентаря.
     #[serde(default = "default_item_color")]
     pub color: [f32; 3],
@@ -56,6 +60,18 @@ pub struct UseEffect {
     pub heal: u16,
     /// Длительность применения в секундах.
     pub duration_secs: f32,
+}
+
+/// Эффект ношения предмета (M4d-3a): свойства артефактов, действующие из
+/// инвентаря. Отсутствующие поля (§None) не влияют на игру.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CarryEffect {
+    /// Множитель урона жгучих аномалий (0.5 — половина урона).
+    #[serde(default)]
+    pub heat_resist: Option<f32>,
+    /// Доля снижения веса инвентаря (0.2 — на 20 % легче).
+    #[serde(default)]
+    pub weight_cut: Option<f32>,
 }
 
 fn default_item_color() -> [f32; 3] {
@@ -162,6 +178,22 @@ impl ItemCatalog {
                         "у предмета '{}' некорректная длительность применения {}",
                         item.key, use_effect.duration_secs
                     )));
+                }
+            }
+            // Эффекты ношения (M4d-3a): доли урона/веса — в разумных [0,1].
+            if let Some(effect) = &item.carry_effect {
+                for (name, value) in [
+                    ("heat_resist", effect.heat_resist),
+                    ("weight_cut", effect.weight_cut),
+                ] {
+                    if let Some(value) = value {
+                        if !(0.0..=1.0).contains(&value) {
+                            return Err(ContentError::Validation(format!(
+                                "у предмета '{}' эффект {name} = {value} вне [0,1]",
+                                item.key
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -389,9 +421,45 @@ mod tests {
         assert_eq!(artifact.stack_max, 1);
         assert!(
             artifact.use_effect.is_none(),
-            "артефакты пока не используются"
+            "артефакты не используются как consumables"
         );
         assert!(catalog.index_of("artifact_gravity").is_some());
+        // Эффекты ношения (M4d-3a): жар режет урон, тягун — вес.
+        let heat = artifact.carry_effect.as_ref().expect("эффект Жар-камня");
+        assert_eq!(heat.heat_resist, Some(0.5));
+        assert_eq!(heat.weight_cut, None);
+        let gravity = catalog
+            .get_by_key("artifact_gravity")
+            .unwrap()
+            .carry_effect
+            .clone()
+            .expect("эффект Тягуна");
+        assert_eq!(gravity.weight_cut, Some(0.2));
+        assert_eq!(gravity.heat_resist, None);
+        // Консервы — еда (M4d-3a): медленное лечение.
+        let canned = catalog.get_by_key("canned_food").unwrap();
+        let effect = canned.use_effect.as_ref().expect("консервы лечат");
+        assert_eq!((effect.heal, effect.duration_secs), (10, 4.0));
+    }
+
+    #[test]
+    fn carry_effect_out_of_range_is_rejected() {
+        expect_validation_error(
+            r#"(
+                items: [
+                    (key: "bracer", display_name: "Браслет", weight_kg: 0.5, stack_max: 1,
+                     carry_effect: Some((heat_resist: Some(1.5)))),
+                ],
+            )"#,
+        );
+        expect_validation_error(
+            r#"(
+                items: [
+                    (key: "belt", display_name: "Ремень", weight_kg: 0.5, stack_max: 1,
+                     carry_effect: Some((weight_cut: Some(-0.1)))),
+                ],
+            )"#,
+        );
     }
 
     fn expect_validation_error(text: &str) {
