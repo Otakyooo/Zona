@@ -33,6 +33,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build client
         run: cargo build --release -p zn-client -p zn-launcher
+        env:
+          # PAT вкомпиливается в лаунчер (option_env!) — иначе приватные
+          # ассеты Releases не скачать. Secrets недоступны в fork-PR.
+          ZONA_RELEASE_TOKEN: ${{ secrets.ZONA_RELEASE_TOKEN }}
       - name: Pack client zip
         run: |
           $stage = "dist/zona-dev-win-x64"
