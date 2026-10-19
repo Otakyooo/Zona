@@ -25,9 +25,10 @@ use zn_render::{
 };
 use zn_scene::{AnomalyKind, LocationId, Scene, SceneObject, LOCATION_BASE};
 use zn_sim::{
-    ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE, FLAG_SPRINTING,
-    INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS, INVENTORY_SLOTS,
-    MAX_CARRY_WEIGHT_KG, MAX_HEALTH, RESPAWN_DELAY_TICKS, RIFLE_AMMO_KEY, RIFLE_RANGE,
+    is_downed, ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE,
+    FLAG_SPRINTING, INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS,
+    INVENTORY_SLOTS, MAX_CARRY_WEIGHT_KG, MAX_HEALTH, RESPAWN_DELAY_TICKS, RIFLE_AMMO_KEY,
+    RIFLE_RANGE,
 };
 
 use crate::assets::{AssetEvent, AssetLoader};
@@ -337,6 +338,10 @@ struct HudData {
     ammo: Option<u32>,
     /// Эффект сильнейшего артефакта ношения (M4d-3a).
     carry: Option<String>,
+    /// Секунды до подъёма из нокдауна (M4d-3b), если игрок лежит.
+    knockdown: Option<f32>,
+    /// Выброс (M4d-3b): (активен, секунд до конца фазы).
+    blowout: Option<(bool, f32)>,
 }
 
 pub struct ClientApp {
@@ -417,6 +422,12 @@ pub struct ClientApp {
     anomaly_material: Option<MaterialId>,
     /// Уведомление о своей экстракции (M4d-2): панель результата.
     extraction_flash: Option<ExtractionNotice>,
+    /// Нокдаун (M4d-3b, сеть): до какого момента лежим. Offline берётся из
+    /// локальной симуляции.
+    knockdown_until: Option<Instant>,
+    /// Выброс (M4d-3b, сеть): (активен, секунд до конца фазы). Приходит в
+    /// каждом снапшоте; `None` — выброса нет.
+    blowout: Option<(bool, f32)>,
     /// Инвентарь локального игрока из персональных апдейтов.
     inventory: Vec<Option<ItemStackNet>>,
     /// Открытый контейнер обыска; `None` — панель закрыта.
@@ -619,6 +630,8 @@ impl ClientApp {
             anomaly_flashes: Vec::new(),
             anomaly_material: None,
             extraction_flash: None,
+            knockdown_until: None,
+            blowout: None,
             inventory: Vec::new(),
             open_container: None,
             inventory_open: false,
@@ -1322,6 +1335,17 @@ impl ClientApp {
                         self.reveal_anomaly(*anomaly, *position, now);
                         self.audio.play(SoundId::BoltAnomaly);
                     }
+                    // Нокдаун (M4d-3b): offline-истина в локальной симуляции,
+                    // событие только для звука и таймера оверлея.
+                    GameEvent::KnockedDown { player, ticks, .. } if *player == self.player_id => {
+                        self.knockdown_until =
+                            Some(now + Duration::from_secs_f32(*ticks as f32 / 60.0));
+                        self.audio.play(SoundId::Hit);
+                    }
+                    GameEvent::GotUp { player, .. } if *player == self.player_id => {
+                        self.knockdown_until = None;
+                        self.audio.play(SoundId::Heal);
+                    }
                     _ => {}
                 }
             }
@@ -1540,6 +1564,54 @@ impl ClientApp {
                         }
                     }
                     self.audio.play(SoundId::Extract);
+                }
+                // Нокдаун (M4d-3b): своё — оверлей с таймером, чужое — фид.
+                GameEvent::KnockedDown {
+                    player,
+                    player_name,
+                    ticks,
+                } => {
+                    if Some(*player) == self.net_player_id {
+                        self.knockdown_until =
+                            Some(now + Duration::from_secs_f32(*ticks as f32 / 60.0));
+                    } else {
+                        self.kill_feed.push(KillFeedEntry {
+                            text: format!("{player_name} в нокдауне"),
+                            until: now + KILL_FEED_TTL,
+                        });
+                        while self.kill_feed.len() > KILL_FEED_MAX {
+                            self.kill_feed.remove(0);
+                        }
+                    }
+                    self.audio.play(SoundId::Hit);
+                }
+                GameEvent::GotUp {
+                    player,
+                    player_name,
+                } => {
+                    if Some(*player) == self.net_player_id {
+                        self.knockdown_until = None;
+                    } else {
+                        self.kill_feed.push(KillFeedEntry {
+                            text: format!("{player_name} поднялся"),
+                            until: now + KILL_FEED_TTL,
+                        });
+                        while self.kill_feed.len() > KILL_FEED_MAX {
+                            self.kill_feed.remove(0);
+                        }
+                    }
+                    self.audio.play(SoundId::Heal);
+                }
+                // Выброс (M4d-3b): свежий таймер из каждого снапшота.
+                GameEvent::Blowout {
+                    active,
+                    seconds_left,
+                } => {
+                    self.blowout = if *seconds_left > 0.0 {
+                        Some((*active, *seconds_left))
+                    } else {
+                        None
+                    };
                 }
             }
         }
@@ -2376,6 +2448,25 @@ impl ClientApp {
         // Самый сильный эффект ношения из инвентаря — одна строка у HP.
         let carry = self.carry_effect_note();
 
+        // Нокдаун (M4d-3b): online — таймер события, offline — симуляция.
+        let mut knockdown = None;
+        if let Some(until) = self.knockdown_until {
+            if until > now {
+                knockdown = Some(until.duration_since(now).as_secs_f32());
+            } else {
+                self.knockdown_until = None;
+            }
+        }
+        if knockdown.is_none() && self.net.is_none() {
+            let tick = self.simulation.tick();
+            if let Some(state) = self.simulation.player_state(self.player_id) {
+                if is_downed(&state, tick) {
+                    knockdown = Some((state.downed_until_tick - tick) as f32 / 60.0);
+                }
+            }
+        }
+        let blowout = self.blowout;
+
         HudData {
             health,
             max_health: MAX_HEALTH,
@@ -2394,6 +2485,8 @@ impl ClientApp {
             extraction,
             ammo,
             carry,
+            knockdown,
+            blowout,
             time: self.started.elapsed().as_secs_f64(),
             hint,
             inventory,
@@ -2871,6 +2964,74 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
             center + egui::vec2(0.0, 34.0),
             egui::Align2::CENTER_CENTER,
             "добыча в складе базы — H",
+            egui::FontId::proportional(15.0),
+            egui::Color32::from_white_alpha(180),
+        );
+    }
+
+    // Выброс (M4d-3b): предупреждение сверху; активная фаза — пелена.
+    if let Some((active, seconds_left)) = hud.blowout {
+        let center = screen.center();
+        if active {
+            painter.rect_filled(
+                screen,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(140, 18, 10, 64),
+            );
+            painter.text(
+                center - egui::vec2(0.0, 96.0),
+                egui::Align2::CENTER_CENTER,
+                "ВЫБРОС!",
+                egui::FontId::proportional(34.0),
+                egui::Color32::from_rgb(255, 96, 70),
+            );
+            painter.text(
+                center - egui::vec2(0.0, 62.0),
+                egui::Align2::CENTER_CENTER,
+                format!("укрытие — только база ({:.0} с)", seconds_left.max(0.0)),
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_white_alpha(210),
+            );
+        } else {
+            painter.text(
+                center - egui::vec2(0.0, 96.0),
+                egui::Align2::CENTER_CENTER,
+                format!("ВЫБРОС ЧЕРЕЗ {:.0} с", seconds_left.max(0.0)),
+                egui::FontId::proportional(24.0),
+                egui::Color32::from_rgb(255, 170, 70),
+            );
+            painter.text(
+                center - egui::vec2(0.0, 66.0),
+                egui::Align2::CENTER_CENTER,
+                "уходите на базу — в поле накроет",
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_white_alpha(190),
+            );
+        }
+    }
+
+    // Нокдаун (M4d-3b): затемнение, таймер подъёма, предупреждение о добивании.
+    if let Some(seconds) = hud.knockdown {
+        let center = screen.center();
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+        painter.text(
+            center - egui::vec2(0.0, 30.0),
+            egui::Align2::CENTER_CENTER,
+            "ВЫ В НОКДАУНЕ",
+            egui::FontId::proportional(38.0),
+            egui::Color32::from_rgb(230, 150, 60),
+        );
+        painter.text(
+            center + egui::vec2(0.0, 8.0),
+            egui::Align2::CENTER_CENTER,
+            format!("встать через {:.1} с", seconds.max(0.0)),
+            egui::FontId::proportional(20.0),
+            egui::Color32::from_white_alpha(235),
+        );
+        painter.text(
+            center + egui::vec2(0.0, 36.0),
+            egui::Align2::CENTER_CENTER,
+            "любой следующий урон добьёт",
             egui::FontId::proportional(15.0),
             egui::Color32::from_white_alpha(180),
         );
@@ -4214,6 +4375,71 @@ mod tests {
         assert_eq!(hud.ammo, Some(12));
         let carry = hud.carry.expect("подсказка эффекта Тягуна");
         assert!(carry.contains("вес"), "{carry}");
+    }
+
+    #[test]
+    fn knockdown_and_blowout_events_drive_hud() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        app.net_player_id = Some(7);
+        let now = Instant::now();
+
+        // Свой нокдаун — оверлей с таймером (12 с по умолчанию).
+        app.handle_combat_events(
+            &[GameEvent::KnockedDown {
+                player: 7,
+                player_name: "Тестер".to_string(),
+                ticks: 720,
+            }],
+            now,
+        );
+        let seconds = app.collect_hud_data().knockdown.expect("оверлей нокдауна");
+        assert!(seconds > 11.0 && seconds <= 12.0, "{seconds}");
+
+        // Подъём снимает оверлей.
+        app.handle_combat_events(
+            &[GameEvent::GotUp {
+                player: 7,
+                player_name: "Тестер".to_string(),
+            }],
+            now,
+        );
+        assert!(app.collect_hud_data().knockdown.is_none());
+
+        // Выброс: предупреждение, активная фаза, конец — баннер гаснет.
+        app.handle_combat_events(
+            &[GameEvent::Blowout {
+                active: false,
+                seconds_left: 30.0,
+            }],
+            now,
+        );
+        assert_eq!(app.collect_hud_data().blowout, Some((false, 30.0)));
+        app.handle_combat_events(
+            &[GameEvent::Blowout {
+                active: true,
+                seconds_left: 12.0,
+            }],
+            now,
+        );
+        assert_eq!(app.collect_hud_data().blowout, Some((true, 12.0)));
+        app.handle_combat_events(
+            &[GameEvent::Blowout {
+                active: false,
+                seconds_left: 0.0,
+            }],
+            now,
+        );
+        assert!(app.collect_hud_data().blowout.is_none());
+
+        // Offline: нокдаун виден из локальной симуляции без событий.
+        let mut offline = ClientApp::with_content(content, "demo_zone");
+        offline.simulation.surge_damage(200);
+        let seconds = offline
+            .collect_hud_data()
+            .knockdown
+            .expect("offline-нокдаун из симуляции");
+        assert!(seconds > 11.0 && seconds <= 12.0, "{seconds}");
     }
 
     #[test]

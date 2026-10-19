@@ -32,12 +32,39 @@ const BUBBLE_COUNT_MAX: usize = 3;
 /// Использованный пузырь возвращается в мир через 90 с.
 const BUBBLE_RESPAWN_TICKS: u64 = 90 * SIMULATION_HZ as u64;
 
+/// Выброс (M4d-3b): цикл ожидание → предупреждение → активная фаза.
+/// Во время активной фазы игроки вне базы теряют HP (база безопасна).
+const BLOWOUT_WAIT_TICKS: u64 = 180 * SIMULATION_HZ as u64;
+const BLOWOUT_WARNING_TICKS: u64 = 30 * SIMULATION_HZ as u64;
+const BLOWOUT_ACTIVE_TICKS: u64 = 15 * SIMULATION_HZ as u64;
+/// Урон выброса: раз в полсекунды по 4 HP (8 HP/с на игрока).
+const BLOWOUT_DAMAGE_INTERVAL_TICKS: u64 = SIMULATION_HZ as u64 / 2;
+const BLOWOUT_DAMAGE_PER_HIT: u16 = 4;
+
 /// Имя файла персиста стэшей по умолчанию (в рабочей директории сервера).
 pub const STASH_FILE_DEFAULT: &str = "stashes.ron";
 /// Версия схемы файла стэшей (M4d-2): рост ломает совместимость молча.
 const STASH_FILE_VERSION: u32 = 1;
 /// Период автосохранения стэшей профилей (30 с виртуального времени сессии).
 const STASH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Период выбросов по умолчанию (M4d-3b): ожидание → предупреждение → актив.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlowoutTiming {
+    pub wait_ticks: u64,
+    pub warning_ticks: u64,
+    pub active_ticks: u64,
+}
+
+impl Default for BlowoutTiming {
+    fn default() -> Self {
+        Self {
+            wait_ticks: BLOWOUT_WAIT_TICKS,
+            warning_ticks: BLOWOUT_WARNING_TICKS,
+            active_ticks: BLOWOUT_ACTIVE_TICKS,
+        }
+    }
+}
 
 /// Параметры сессии. Всё, что влияет на детерминизм тестов (латентность/потери
 /// исходящих), по умолчанию выключено.
@@ -53,6 +80,8 @@ pub struct SessionConfig {
     /// Файл персиста стэшей профилей (M4d-2). `None` — склад живёт только в
     /// памяти сессии (поведение M4d, режим тестов).
     pub stash_file: Option<PathBuf>,
+    /// Тайминги выброса (M4d-3b); в тестах укорачиваются.
+    pub blowout: BlowoutTiming,
 }
 
 impl Default for SessionConfig {
@@ -63,6 +92,7 @@ impl Default for SessionConfig {
             out_loss_pct: 0.0,
             rng_seed: 0x9E37_79B9,
             stash_file: None,
+            blowout: BlowoutTiming::default(),
         }
     }
 }
@@ -141,6 +171,22 @@ struct World {
     stashes: HashMap<u64, Vec<Stack>>,
     /// xorshift32 для пузырей (детерминирован из seed конфигурации).
     rng: u32,
+    /// Фаза выброса (M4d-3b) и tick её окончания.
+    blowout_phase: BlowoutPhase,
+    blowout_until_tick: u64,
+    /// Длительности фаз выброса (тесты укорачивают через SessionConfig).
+    blowout_timing: BlowoutTiming,
+}
+
+/// Фазы выброса (M4d-3b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlowoutPhase {
+    /// Между выбросами.
+    Idle,
+    /// Предупреждение: клиенты видят таймер, урона нет.
+    Warning,
+    /// Активная фаза: игроки вне базы теряют HP.
+    Active,
 }
 
 impl World {
@@ -150,6 +196,7 @@ impl World {
         scenes: Vec<(LocationId, Scene)>,
         catalog: &ItemCatalog,
         rng_seed: u32,
+        timing: BlowoutTiming,
     ) -> Result<Self, String> {
         if scenes.is_empty() {
             return Err("мир без локаций".to_string());
@@ -182,6 +229,9 @@ impl World {
             placements: HashMap::new(),
             stashes: HashMap::new(),
             rng: rng_seed | 1,
+            blowout_phase: BlowoutPhase::Idle,
+            blowout_until_tick: timing.wait_ticks,
+            blowout_timing: timing,
         };
         world.seed_bubbles();
         Ok(world)
@@ -190,6 +240,7 @@ impl World {
     /// Одиночная сцена (тесты и `--level`): локация 0, мир без переходов,
     /// пузырей и сдачи на базу.
     fn single(scene: &Scene, catalog: ItemCatalog, rng_seed: u32) -> Self {
+        let timing = BlowoutTiming::default();
         let mut locations = BTreeMap::new();
         locations.insert(
             LOCATION_BASE,
@@ -216,6 +267,9 @@ impl World {
             placements: HashMap::new(),
             stashes: HashMap::new(),
             rng: rng_seed | 1,
+            blowout_phase: BlowoutPhase::Idle,
+            blowout_until_tick: timing.wait_ticks,
+            blowout_timing: timing,
         }
     }
 
@@ -503,6 +557,58 @@ impl World {
         (saved_count, lost_count)
     }
 
+    /// Фаза выброса (M4d-3b): ожидание → предупреждение → активная.
+    fn advance_blowout(&mut self) {
+        let tick = self.tick();
+        if tick < self.blowout_until_tick {
+            return;
+        }
+        let timing = self.blowout_timing;
+        let (next, duration) = match self.blowout_phase {
+            BlowoutPhase::Idle => (BlowoutPhase::Warning, timing.warning_ticks),
+            BlowoutPhase::Warning => (BlowoutPhase::Active, timing.active_ticks),
+            BlowoutPhase::Active => (BlowoutPhase::Idle, timing.wait_ticks),
+        };
+        self.blowout_phase = next;
+        self.blowout_until_tick = tick + duration;
+        log::info!(
+            "выброс: фаза {:?}, длительность {} с",
+            next,
+            duration / SIMULATION_HZ as u64
+        );
+    }
+
+    /// Текущее состояние выброса для снапшотов: `(активен, секунд до конца)`.
+    /// Между выбросами — `(false, 0.0)`: клиент гасит баннер.
+    fn blowout_state(&self) -> (bool, f32) {
+        let seconds_left =
+            self.blowout_until_tick.saturating_sub(self.tick()) as f32 / SIMULATION_HZ as f32;
+        match self.blowout_phase {
+            BlowoutPhase::Idle => (false, 0.0),
+            BlowoutPhase::Warning => (false, seconds_left),
+            BlowoutPhase::Active => (true, seconds_left),
+        }
+    }
+
+    /// Урон выброса (M4d-3b): каждые `BLOWOUT_DAMAGE_INTERVAL_TICKS` все живые
+    /// игроки вне базы теряют HP. База — безопасная зона.
+    fn apply_blowout_damage(&mut self) {
+        if self.blowout_phase != BlowoutPhase::Active {
+            return;
+        }
+        let tick = self.tick();
+        if !tick.is_multiple_of(BLOWOUT_DAMAGE_INTERVAL_TICKS) {
+            return;
+        }
+        let base = self.base;
+        for (id, runtime) in self.locations.iter_mut() {
+            if *id == base {
+                continue;
+            }
+            runtime.simulation.surge_damage(BLOWOUT_DAMAGE_PER_HIT);
+        }
+    }
+
     /// Куда уносит пузырь из `from`: локация строго ближе к базе, кроме самой
     /// базы (в неё ведёт сигнал — M4d-5); если такой нет — свои точки прибытия
     /// («почти под базу»).
@@ -700,8 +806,8 @@ fn player_positions(simulation: &mut Simulation) -> Vec<(u64, Vec3)> {
         .collect()
 }
 
-/// Подставляет имена в события смертей: симуляция знает только id, а
-/// клиентам нужен килл-фид.
+/// Подставляет имена в события смертей и нокдаунов: симуляция знает только
+/// id, а клиентам нужен килл-фид.
 fn enrich_events(events: Vec<GameEvent>, names: &HashMap<u64, String>) -> Vec<GameEvent> {
     events
         .into_iter()
@@ -715,6 +821,30 @@ fn enrich_events(events: Vec<GameEvent>, names: &HashMap<u64, String>) -> Vec<Ga
                     "Аномалия".to_string()
                 } else {
                     names.get(&killer).cloned().unwrap_or_default()
+                },
+            },
+            GameEvent::KnockedDown {
+                player,
+                ticks,
+                player_name,
+            } => GameEvent::KnockedDown {
+                player,
+                player_name: if player_name.is_empty() {
+                    names.get(&player).cloned().unwrap_or_default()
+                } else {
+                    player_name
+                },
+                ticks,
+            },
+            GameEvent::GotUp {
+                player,
+                player_name,
+            } => GameEvent::GotUp {
+                player,
+                player_name: if player_name.is_empty() {
+                    names.get(&player).cloned().unwrap_or_default()
+                } else {
+                    player_name
                 },
             },
             other => other,
@@ -829,8 +959,14 @@ impl Session {
         let refs: Vec<(LocationId, &Scene)> =
             scenes.iter().map(|(id, scene)| (*id, scene)).collect();
         let content_hash = world_content_hash(registry, &refs);
-        let world = World::new(registry.clone(), scenes, &catalog, config.rng_seed)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let world = World::new(
+            registry.clone(),
+            scenes,
+            &catalog,
+            config.rng_seed,
+            config.blowout,
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         Self::from_world(socket, world, content_hash, items_hash, true, config)
     }
 
@@ -1098,6 +1234,9 @@ impl Session {
             if !extractions.is_empty() {
                 self.apply_extractions(extractions);
             }
+            // Выброс (M4d-3b): смена фаз и поражение вне базы.
+            self.world.advance_blowout();
+            self.world.apply_blowout_damage();
         }
         self.flush_stashes_if_dirty();
         if self.world.tick() - self.last_snapshot_tick >= SNAPSHOT_EVERY_TICKS {
@@ -1568,6 +1707,7 @@ impl Session {
     /// рассылка — клиент видит только свою локацию и её события.
     fn send_snapshots(&mut self) {
         let server_tick = self.world.tick();
+        let blowout = self.world.blowout_state();
         let ids: Vec<LocationId> = self.world.locations.keys().copied().collect();
         let mut per_location: Vec<(LocationId, LocationSnapshot)> = Vec::with_capacity(ids.len());
         let mut net_updates: Vec<NetUpdates> = Vec::with_capacity(ids.len());
@@ -1582,6 +1722,13 @@ impl Session {
             let Some(runtime) = self.world.locations.get_mut(&id) else {
                 continue;
             };
+            // Выброс (M4d-3b): свежий таймер в каждом снапшоте — клиент не
+            // считает сам, только рисует.
+            let (active, seconds_left) = blowout;
+            runtime.simulation.push_event(GameEvent::Blowout {
+                active,
+                seconds_left,
+            });
             let players = runtime.simulation.snapshot();
             let loot = runtime.simulation.snapshot_loot();
             let mut corpses = runtime.simulation.snapshot_corpses();
@@ -1954,7 +2101,14 @@ mod tests {
     fn bubble_destination_prefers_closer_non_base_locations() {
         let registry = LocationRegistry::builtin();
         let scenes = Scene::builtin_world();
-        let mut world = World::new(registry, scenes, &test_catalog(), 7).expect("мир");
+        let mut world = World::new(
+            registry,
+            scenes,
+            &test_catalog(),
+            7,
+            BlowoutTiming::default(),
+        )
+        .expect("мир");
         // Из Свалки пузырь тянет в Кордон (ближе к базе), не на базу.
         let (target, position, _) = world.bubble_destination(zn_scene::LOCATION_SVALKA);
         assert_eq!(target, zn_scene::LOCATION_KORDON);
@@ -1971,7 +2125,14 @@ mod tests {
     fn bubble_respawn_returns_to_free_candidate() {
         let registry = LocationRegistry::builtin();
         let scenes = Scene::builtin_world();
-        let mut world = World::new(registry, scenes, &test_catalog(), 7).expect("мир");
+        let mut world = World::new(
+            registry,
+            scenes,
+            &test_catalog(),
+            7,
+            BlowoutTiming::default(),
+        )
+        .expect("мир");
         let location = zn_scene::LOCATION_SVALKA;
         let candidates = world.locations[&location].scene.bubbles.len();
         let before = world.locations[&location].bubbles.active.len();
@@ -1998,7 +2159,14 @@ mod tests {
     fn world_extract_deposits_percent_and_drops_rest_in_circle() {
         let registry = LocationRegistry::builtin();
         let scenes = Scene::builtin_world();
-        let mut world = World::new(registry, scenes, &test_catalog(), 7).expect("мир");
+        let mut world = World::new(
+            registry,
+            scenes,
+            &test_catalog(),
+            7,
+            BlowoutTiming::default(),
+        )
+        .expect("мир");
         let (player_id, _) = world.spawn_on_base();
         let catalog = test_catalog();
         let medkit = catalog.index_of("medkit").unwrap();
@@ -2046,7 +2214,14 @@ mod tests {
     fn world_check_extractions_finds_player_in_circle() {
         let registry = LocationRegistry::builtin();
         let scenes = Scene::builtin_world();
-        let mut world = World::new(registry, scenes, &test_catalog(), 7).expect("мир");
+        let mut world = World::new(
+            registry,
+            scenes,
+            &test_catalog(),
+            7,
+            BlowoutTiming::default(),
+        )
+        .expect("мир");
         let (player_id, _) = world.spawn_on_base();
         let circle = world.locations[&zn_scene::LOCATION_KORDON]
             .scene
