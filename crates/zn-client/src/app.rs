@@ -106,6 +106,15 @@ const BOLT_COLOR: Vec4 = Vec4::new(0.85, 0.86, 0.8, 1.0);
 
 /// Мир локаций (M4d): вспышка при смене локации и вид активных пузырей.
 const TP_FLASH_TTL: Duration = Duration::from_millis(260);
+/// Уведомление об экстракции (M4d-2): заголовок и подпись живут 4 с.
+const EXTRACTION_NOTICE_TTL: Duration = Duration::from_secs(4);
+/// Цвет круга экстракции (M4d-2): зеленоватый «маяк» эвакуации.
+const EXTRACTION_COLOR: [f32; 3] = [0.35, 0.95, 0.45];
+/// Альфа кольца и столба-маяка круга экстракции.
+const EXTRACTION_RING_ALPHA: f32 = 0.30;
+const EXTRACTION_BEACON_ALPHA: f32 = 0.08;
+/// Высота столба-маяка над кругом.
+const EXTRACTION_BEACON_HEIGHT: f32 = 6.0;
 /// Радиус пузыря, если якорь не совпал ни с одним кандидатом сцены.
 const BUBBLE_DEFAULT_RADIUS: f32 = 1.2;
 const BUBBLE_COLOR: [f32; 3] = [0.45, 0.75, 1.0];
@@ -258,6 +267,13 @@ struct HealingView {
     total_secs: f32,
 }
 
+/// Уведомление о своей экстракции (M4d-2): заголовок «ЭВАКУАЦИЯ» с процентом
+/// сейва — центром экрана, пока свежее.
+struct ExtractionNotice {
+    text: String,
+    until: Instant,
+}
+
 /// Стек предмета для панелей HUD: имя/количество/цвет из каталога.
 struct HudItemStack {
     name: String,
@@ -315,6 +331,8 @@ struct HudData {
     healing: Option<f32>,
     /// Вспышка смены локации: доля времени жизни (1.0 — только что перешёл).
     flash: Option<f32>,
+    /// Своё уведомление об экстракции (M4d-2), пока свежее.
+    extraction: Option<String>,
 }
 
 pub struct ClientApp {
@@ -393,6 +411,8 @@ pub struct ClientApp {
     anomaly_flashes: Vec<AnomalyFlash>,
     /// Полупрозрачный материал аномалий (blend); появляется с renderer.
     anomaly_material: Option<MaterialId>,
+    /// Уведомление о своей экстракции (M4d-2): панель результата.
+    extraction_flash: Option<ExtractionNotice>,
     /// Инвентарь локального игрока из персональных апдейтов.
     inventory: Vec<Option<ItemStackNet>>,
     /// Открытый контейнер обыска; `None` — панель закрыта.
@@ -504,7 +524,11 @@ impl ClientApp {
         );
 
         let net = server.and_then(|addr| {
-            match NetClient::connect(&addr, content_hash, items_hash, CLIENT_NAME) {
+            let profile = std::env::var("ZN_PROFILE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            match NetClient::connect(&addr, content_hash, items_hash, CLIENT_NAME, profile) {
                 Ok(net) => {
                     log::info!("подключаемся к серверу {addr}");
                     Some(net)
@@ -590,6 +614,7 @@ impl ClientApp {
             revealed: HashMap::new(),
             anomaly_flashes: Vec::new(),
             anomaly_material: None,
+            extraction_flash: None,
             inventory: Vec::new(),
             open_container: None,
             inventory_open: false,
@@ -1100,6 +1125,60 @@ impl ClientApp {
             );
         }
 
+        // Круги экстракции (M4d-2): плоское кольцо на полу и столб-маяк.
+        // Геометрия — из локальной сцены (сеть не нужна): вход в круг
+        // обрабатывает сервер.
+        let cylinder = self
+            .builtin_mesh_ids
+            .get("cylinder")
+            .copied()
+            .unwrap_or(cube);
+        let pulse = 0.75 + 0.25 * (time * 1.4).sin();
+        for extraction in &self.scene.extractions {
+            // Кольцо: тонкий диск на полу.
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::new(extraction.radius * 2.0, 0.05, extraction.radius * 2.0),
+                Quat::IDENTITY,
+                extraction.position + Vec3::Y * 0.03,
+            );
+            list.push(
+                cylinder,
+                anomaly_material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: [
+                        EXTRACTION_COLOR[0],
+                        EXTRACTION_COLOR[1],
+                        EXTRACTION_COLOR[2],
+                        EXTRACTION_RING_ALPHA * pulse,
+                    ],
+                },
+            );
+            // Маяк: полупрозрачный столб — виден издалека.
+            let beacon = Mat4::from_scale_rotation_translation(
+                Vec3::new(
+                    extraction.radius * 0.5,
+                    EXTRACTION_BEACON_HEIGHT,
+                    extraction.radius * 0.5,
+                ),
+                Quat::IDENTITY,
+                extraction.position + Vec3::Y * (EXTRACTION_BEACON_HEIGHT * 0.5),
+            );
+            list.push(
+                cylinder,
+                anomaly_material,
+                InstanceRaw {
+                    model: beacon.to_cols_array(),
+                    color: [
+                        EXTRACTION_COLOR[0],
+                        EXTRACTION_COLOR[1],
+                        EXTRACTION_COLOR[2],
+                        EXTRACTION_BEACON_ALPHA * pulse,
+                    ],
+                },
+            );
+        }
+
         // Болты в полёте (M4c): палочка по направлению движения, позиция —
         // интерполяция между снапшотами (offline — из локальной симуляции).
         for view in &self.world_bolts {
@@ -1350,6 +1429,29 @@ impl ClientApp {
                 GameEvent::AnomalyRevealed { anomaly, position } => {
                     self.reveal_anomaly(*anomaly, *position, now);
                     self.audio.play(SoundId::BoltAnomaly);
+                }
+                // Экстракция (M4d-2): своя — панель результата, чужая — фид.
+                GameEvent::Extracted {
+                    player,
+                    player_name,
+                    percent,
+                } => {
+                    let percent = (percent * 100.0).round() as u32;
+                    if Some(*player) == self.net_player_id {
+                        self.extraction_flash = Some(ExtractionNotice {
+                            text: format!("Сохранено {percent}% добычи"),
+                            until: now + EXTRACTION_NOTICE_TTL,
+                        });
+                    } else {
+                        self.kill_feed.push(KillFeedEntry {
+                            text: format!("{player_name} эвакуировался ({percent}%)"),
+                            until: now + KILL_FEED_TTL,
+                        });
+                        while self.kill_feed.len() > KILL_FEED_MAX {
+                            self.kill_feed.remove(0);
+                        }
+                    }
+                    self.audio.play(SoundId::Extract);
                 }
             }
         }
@@ -2145,6 +2247,19 @@ impl ClientApp {
                 .clamp(0.0, 1.0)
         });
 
+        // Уведомление своей экстракции (M4d-2) живёт EXTRACTION_NOTICE_TTL.
+        if self
+            .extraction_flash
+            .as_ref()
+            .is_some_and(|notice| notice.until <= now)
+        {
+            self.extraction_flash = None;
+        }
+        let extraction = self
+            .extraction_flash
+            .as_ref()
+            .map(|notice| notice.text.clone());
+
         HudData {
             health,
             max_health: MAX_HEALTH,
@@ -2160,6 +2275,7 @@ impl ClientApp {
             respawn_secs: if health == 0 { respawn_secs } else { None },
             feed,
             post_hint: self.post_hint.as_ref().map(|hint| hint.text.clone()),
+            extraction,
             time: self.started.elapsed().as_secs_f64(),
             hint,
             inventory,
@@ -2586,6 +2702,33 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
             screen,
             0.0,
             egui::Color32::from_white_alpha((flash.clamp(0.0, 1.0) * 230.0) as u8),
+        );
+    }
+
+    // Уведомление о своей экстракции (M4d-2): зелёный штамп центра экрана.
+    if let Some(text) = &hud.extraction {
+        let center = screen.center();
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
+        painter.text(
+            center - egui::vec2(0.0, 26.0),
+            egui::Align2::CENTER_CENTER,
+            "ЭВАКУАЦИЯ",
+            egui::FontId::proportional(40.0),
+            egui::Color32::from_rgb(96, 224, 122),
+        );
+        painter.text(
+            center + egui::vec2(0.0, 6.0),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(20.0),
+            egui::Color32::from_white_alpha(235),
+        );
+        painter.text(
+            center + egui::vec2(0.0, 34.0),
+            egui::Align2::CENTER_CENTER,
+            "добыча в складе базы — H",
+            egui::FontId::proportional(15.0),
+            egui::Color32::from_white_alpha(180),
         );
     }
 
@@ -3028,7 +3171,14 @@ mod tests {
         // UDP connect ничего не шлёт — состояние «подключение».
         let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         app.net = Some(
-            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap(),
+            NetClient::connect(
+                &server.local_addr().unwrap().to_string(),
+                0,
+                0,
+                "Тест",
+                None,
+            )
+            .unwrap(),
         );
         app.update_window_title();
         assert_eq!(app.window_title, "ZONA — подключение…");
@@ -3589,7 +3739,14 @@ mod tests {
         let mut app = world_app();
         let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         app.net = Some(
-            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap(),
+            NetClient::connect(
+                &server.local_addr().unwrap().to_string(),
+                0,
+                0,
+                "Тест",
+                None,
+            )
+            .unwrap(),
         );
 
         // На базе H открывает панель.
@@ -3651,7 +3808,14 @@ mod tests {
         let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         server.set_nonblocking(true).unwrap();
         app.net = Some(
-            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap(),
+            NetClient::connect(
+                &server.local_addr().unwrap().to_string(),
+                0,
+                0,
+                "Тест",
+                None,
+            )
+            .unwrap(),
         );
 
         // Доводим клиента до Connected (Hello → Welcome): без этого действия
@@ -3815,6 +3979,44 @@ mod tests {
         let hud = app.collect_hud_data();
         let hint = hud.post_hint.expect("подсказка настроек показана");
         assert!(hint.contains("выкл"), "{hint}");
+    }
+
+    #[test]
+    fn extraction_event_shows_own_panel_and_remote_feed() {
+        let now = Instant::now();
+        let event = |player: u64, name: &str| GameEvent::Extracted {
+            player,
+            player_name: name.to_string(),
+            percent: 0.75,
+        };
+
+        // Своя эвакуация — панель результата с процентом сейва.
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.net_player_id = Some(7);
+        app.handle_combat_events(&[event(7, "Тестер")], now);
+        let notice = app
+            .extraction_flash
+            .as_ref()
+            .expect("уведомление своей экстракции");
+        assert!(notice.text.contains("75"), "{}", notice.text);
+        assert!(notice.until > now);
+
+        // Чужая — строка килл-фида, панели нет.
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.net_player_id = Some(7);
+        app.handle_combat_events(&[event(8, "Охотник")], now);
+        assert!(app.extraction_flash.is_none(), "чужая эвакуация без панели");
+        assert_eq!(app.kill_feed.len(), 1);
+        assert!(
+            app.kill_feed[0].text.contains("Охотник"),
+            "{}",
+            app.kill_feed[0].text
+        );
+        assert!(
+            app.kill_feed[0].text.contains("75%"),
+            "{}",
+            app.kill_feed[0].text
+        );
     }
 
     #[test]

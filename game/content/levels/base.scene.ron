@@ -170,6 +170,7 @@
     ],
     bubbles: [],
     bubble_arrivals: [],
+    extractions: [],
     environment: (
         sun_direction: (-0.35, 0.75, 0.45),
         sun_color: (1.0, 0.95, 0.86),

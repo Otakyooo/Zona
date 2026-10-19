@@ -76,6 +76,9 @@ pub struct NetClient {
     content_hash: u64,
     items_hash: u64,
     name: String,
+    /// Профиль игрока (M4d-2): ключ персистентного склада. `None` — склад
+    /// живёт только в памяти сессии сервера.
+    profile: Option<String>,
     status: NetStatus,
     last_hello: Option<Instant>,
     last_ping: Option<Instant>,
@@ -95,6 +98,7 @@ impl NetClient {
         content_hash: u64,
         items_hash: u64,
         name: &str,
+        profile: Option<String>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_nonblocking(true)?;
@@ -109,6 +113,7 @@ impl NetClient {
             content_hash,
             items_hash,
             name: name.to_string(),
+            profile,
             status: NetStatus::Connecting,
             last_hello: None,
             last_ping: None,
@@ -226,6 +231,7 @@ impl NetClient {
                         content_hash: self.content_hash,
                         items_hash: self.items_hash,
                         name: self.name.clone(),
+                        profile: self.profile.clone(),
                     };
                     self.send(&hello);
                 }
@@ -458,6 +464,7 @@ mod tests {
             0xAB,
             0xCD,
             "Тест",
+            None,
         )
         .unwrap();
         client.poll(Instant::now());
@@ -493,6 +500,7 @@ mod tests {
             0x42,
             0x77,
             "Сталкер",
+            None,
         )
         .unwrap();
         let t0 = Instant::now();
@@ -505,11 +513,13 @@ mod tests {
                 content_hash,
                 items_hash,
                 name,
+                profile,
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(content_hash, 0x42);
                 assert_eq!(items_hash, 0x77);
                 assert_eq!(name, "Сталкер");
+                assert_eq!(profile, None);
             }
             other => panic!("ожидался ClientHello, получили {}", other.kind()),
         }
@@ -709,8 +719,14 @@ mod tests {
     #[test]
     fn reject_stops_outgoing_traffic() {
         let server = loopback_server();
-        let mut client =
-            NetClient::connect(&server.local_addr().unwrap().to_string(), 0, 0, "Тест").unwrap();
+        let mut client = NetClient::connect(
+            &server.local_addr().unwrap().to_string(),
+            0,
+            0,
+            "Тест",
+            None,
+        )
+        .unwrap();
         let t0 = Instant::now();
         client.poll(t0);
         let (_, addr) = expect_message(&server);

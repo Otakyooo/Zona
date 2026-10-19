@@ -3,9 +3,9 @@ mod tests {
     use glam::Vec3;
     use zn_scene::{
         distances_to_base, world_content_hash, AnomalyKind, ColliderShape, LocationRegistry,
-        LootEntry, Scene, SceneAnomaly, SceneBubble, SceneEnvironment, SceneObject,
-        SceneTransition, BUILTIN_CUBE, LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA,
-        LOCATION_SVALKA,
+        LootEntry, Scene, SceneAnomaly, SceneBubble, SceneEnvironment, SceneExtraction,
+        SceneObject, SceneTransition, BUILTIN_CUBE, LOCATION_BASE, LOCATION_KORDON,
+        LOCATION_PODZEMKA, LOCATION_SVALKA,
     };
 
     #[test]
@@ -546,5 +546,52 @@ mod tests {
         assert_eq!(bubble.center(), Vec3::new(0.0, 1.2, 0.0));
         assert!(bubble.contains(Vec3::new(0.0, 1.2, 0.5)));
         assert!(!bubble.contains(Vec3::new(2.0, 1.2, 0.0)));
+    }
+
+    #[test]
+    fn extraction_circle_containment_and_lookup() {
+        let mut scene = Scene::new("test");
+        let circle = SceneExtraction::new(Vec3::new(-24.0, 0.0, -24.0), 3.0, 0.75)
+            .with_label("Аварийная эвакуация");
+        scene.add_extraction(circle.clone());
+
+        // Горизонтальный цилиндр: высота не мешает, дальность по XZ решает.
+        assert!(scene.extraction_at(Vec3::new(-24.0, 1.6, -22.0)).is_some());
+        assert!(scene.extraction_at(Vec3::new(-24.5, 0.0, -25.5)).is_some());
+        assert!(scene.extraction_at(Vec3::new(-20.0, 0.0, -24.0)).is_none());
+        assert_eq!(
+            scene
+                .extraction_at(Vec3::new(-24.0, 0.0, -24.0))
+                .map(|c| c.percent),
+            Some(0.75)
+        );
+        assert_eq!(circle.label, "Аварийная эвакуация");
+    }
+
+    #[test]
+    fn scene_without_extractions_field_still_loads() {
+        // Обратная совместимость RON (M1): поле `extractions` необязательное.
+        let ron = r#"(
+            name: "legacy",
+            objects: [],
+        )"#;
+        let scene: Scene = ron::from_str(ron).expect("сцена без extractions");
+        assert!(scene.extractions.is_empty());
+        assert!(scene.extraction_at(Vec3::ZERO).is_none());
+    }
+
+    #[test]
+    fn builtin_world_has_extraction_on_every_raid_location() {
+        let world = Scene::builtin_world();
+        for (id, scene) in &world {
+            if *id == LOCATION_BASE {
+                assert!(scene.extractions.is_empty(), "база безопасна — кругов нет");
+                continue;
+            }
+            assert_eq!(scene.extractions.len(), 1, "локация {id} без круга");
+            let extraction = &scene.extractions[0];
+            assert!(extraction.percent > 0.0 && extraction.percent < 1.0);
+            assert!(!extraction.label.is_empty());
+        }
     }
 }

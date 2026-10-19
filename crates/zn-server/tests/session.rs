@@ -35,11 +35,17 @@ impl TestClient {
     }
 
     fn hello(&self, content_hash: u64) {
+        self.hello_profile(content_hash, None);
+    }
+
+    /// Hello с профилем (M4d-2): ключ персистентного склада.
+    fn hello_profile(&self, content_hash: u64, profile: Option<&str>) {
         self.send(&Message::ClientHello {
             protocol_version: PROTOCOL_VERSION,
             content_hash,
             items_hash: test_items_hash(),
             name: "Тестер".to_string(),
+            profile: profile.map(str::to_string),
         });
     }
 
@@ -234,6 +240,7 @@ fn wrong_protocol_version_is_rejected() {
         content_hash: Scene::demo_zone().content_hash(),
         items_hash: test_items_hash(),
         name: "Чужак".to_string(),
+        profile: None,
     });
     let reply = expect_message(&mut session, &client, |message| {
         matches!(message, Message::ServerReject { .. })
@@ -279,6 +286,7 @@ fn wrong_items_hash_is_rejected() {
         content_hash: Scene::demo_zone().content_hash(),
         items_hash: test_items_hash() ^ 0xFFFF,
         name: "Чужак".to_string(),
+        profile: None,
     });
     let reply = expect_message(&mut session, &client, |message| {
         matches!(message, Message::ServerReject { .. })
@@ -1389,4 +1397,183 @@ fn stash_actions_require_base_location() {
     }
     assert!(!saw_stash, "вне базы склад молчит");
     assert!(session.stash_items(player_id).is_empty());
+}
+
+#[test]
+fn extraction_saves_percent_and_returns_player_to_base() {
+    let (mut session, addr) = test_world_session(10);
+    // Второй клиент остаётся на Кордоне — ему приходит событие эвакуации.
+    let watcher = TestClient::connect(addr);
+    watcher.hello(test_world_hash());
+    let watcher_id = expect_welcome(&mut session, &watcher);
+
+    let player_id = session.debug_spawn();
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let canned = catalog.index_of("canned_food").unwrap();
+    let bolt = catalog.index_of("bolt").unwrap();
+    assert_eq!(session.debug_give(player_id, "medkit", 2).unwrap(), 2);
+    assert_eq!(session.debug_give(player_id, "canned_food", 2).unwrap(), 2);
+    assert_eq!(session.debug_give(player_id, "bolt", 4).unwrap(), 4);
+
+    // Ведём наблюдателя на Кордон (через ворота базы).
+    walk_to(
+        session.simulation(),
+        watcher_id,
+        Vec3::new(0.0, 0.0, -20.0),
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 40, |session| {
+            session.player_location(watcher_id) == Some(LOCATION_KORDON)
+        }),
+        "наблюдатель не дошёл до Кордона"
+    );
+
+    // Игрок: база → Кордон → круг аварийной эвакуации в дальнем углу.
+    walk_to(
+        session.simulation(),
+        player_id,
+        Vec3::new(0.0, 0.0, -20.0),
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 40, |session| {
+            session.player_location(player_id) == Some(LOCATION_KORDON)
+        }),
+        "игрок не перешёл на Кордон"
+    );
+    let circle = session.world_scene(LOCATION_KORDON).extractions[0].position;
+    walk_to(
+        session.simulation_at(LOCATION_KORDON).unwrap(),
+        player_id,
+        circle,
+        0.5,
+    );
+
+    // Событие эвакуации приходит наблюдателю в снапшоте Кордона.
+    let extracted = expect_message(&mut session, &watcher, |message| {
+        matches!(
+            message,
+            Message::Snapshot { events, .. }
+                if events.iter().any(|event| matches!(
+                    event,
+                    GameEvent::Extracted { player, percent, .. }
+                        if *player == player_id && (*percent - 0.75).abs() < 1e-6
+                ))
+        )
+    });
+    assert!(
+        matches!(extracted, Message::Snapshot { .. }),
+        "ожидался снапшот с событием Extracted"
+    );
+
+    // Игрок — на базе с пустым инвантарём и урезанным складом.
+    assert!(
+        poll_until(&mut session, 20, |session| {
+            session.player_location(player_id) == Some(LOCATION_BASE)
+        }),
+        "экстракция не вернула игрока на базу"
+    );
+    let state = session.simulation().player_state(player_id).unwrap();
+    assert!(
+        state.inventory.iter().all(Option::is_none),
+        "инвентарь после экстракции пуст"
+    );
+    assert_eq!(
+        session.stash_items(player_id),
+        &[
+            Stack::new(medkit, 2),
+            Stack::new(canned, 1),
+            Stack::new(bolt, 3),
+        ][..],
+        "75 % добычи по весу ушли в склад"
+    );
+    // Остаток лежит в круге на Кордоне — его может подобрать кто угодно.
+    let loot = session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .snapshot_loot();
+    assert!(
+        loot.iter()
+            .any(|item| item.item == canned && item.count == 1)
+            && loot.iter().any(|item| item.item == bolt && item.count == 1),
+        "потерянная часть добычи на земле в круге: {loot:?}"
+    );
+}
+
+#[test]
+fn profile_restores_stash_after_reconnect() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello_profile(test_world_hash(), Some("stalker-1"));
+    let player_id = expect_welcome(&mut session, &client);
+    assert_eq!(session.debug_give(player_id, "bolt", 5).unwrap(), 5);
+
+    // Экстракция кругом Кордона: склад профиля наполняется.
+    walk_to(
+        session.simulation(),
+        player_id,
+        Vec3::new(0.0, 0.0, -20.0),
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 40, |session| {
+            session.player_location(player_id) == Some(LOCATION_KORDON)
+        }),
+        "игрок не перешёл на Кордон"
+    );
+    let circle = session.world_scene(LOCATION_KORDON).extractions[0].position;
+    walk_to(
+        session.simulation_at(LOCATION_KORDON).unwrap(),
+        player_id,
+        circle,
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 20, |session| {
+            session.player_location(player_id) == Some(LOCATION_BASE)
+        }),
+        "экстракция не сработала"
+    );
+    let stashed = session.stash_items(player_id).to_vec();
+    // bolt×5 = 0.25 кг; бюджет 75 % = 0.1875 кг → 3 болта в склад, 2 падают.
+    assert_eq!(stashed, vec![Stack::new(catalog_index("bolt"), 3)]);
+
+    // Отключение и реконнект с тем же профилем: склад на месте.
+    client.send(&Message::ClientBye);
+    poll_until(&mut session, 10, |session| session.clients().is_empty());
+    let again = TestClient::connect(addr);
+    again.hello_profile(test_world_hash(), Some("stalker-1"));
+    let new_id = expect_welcome(&mut session, &again);
+    assert_ne!(new_id, player_id, "реконнект — новый player_id");
+    assert_eq!(
+        session.stash_items(new_id),
+        &stashed[..],
+        "склад профиля восстановлен"
+    );
+
+    // Без профиля склад не переживает сессию.
+    let other = TestClient::connect(addr);
+    other.hello(test_world_hash());
+    let other_id = expect_welcome(&mut session, &other);
+    assert!(
+        session.stash_items(other_id).is_empty(),
+        "беспрофильный игрок начинает с пустым складом"
+    );
+    other.send(&Message::ClientBye);
+    poll_until(&mut session, 10, |session| session.clients().len() == 1);
+    let third = TestClient::connect(addr);
+    third.hello(test_world_hash());
+    let third_id = expect_welcome(&mut session, &third);
+    assert_ne!(third_id, other_id);
+    assert!(
+        session.stash_items(third_id).is_empty(),
+        "склад беспрофильного игрока умер с сессией"
+    );
+}
+
+/// Индекс предмета в каталоге контента (тесты e2e читают тот же каталог).
+fn catalog_index(key: &str) -> u16 {
+    test_catalog().index_of(key).expect("предмет в каталоге")
 }

@@ -1225,3 +1225,108 @@ fn bolt_dies_in_anomaly_and_reveals_it() {
         "сам игрок снаружи сферы — невредим"
     );
 }
+
+// ── Экстракция (M4d-2) ──────────────────────────────────────────────────
+
+#[test]
+fn extract_inventory_keeps_stacks_until_weight_budget() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    let medkit = catalog.index_of("medkit").unwrap();
+    let canned = catalog.index_of("canned_food").unwrap();
+    let bolt = catalog.index_of("bolt").unwrap();
+    // medkit×2 = 1.0 кг, canned×2 = 1.0 кг, bolt×4 = 0.2 кг; всего 2.2 кг.
+    assert_eq!(sim.give_stack(id, Stack::new(medkit, 2)), 2);
+    assert_eq!(sim.give_stack(id, Stack::new(canned, 2)), 2);
+    assert_eq!(sim.give_stack(id, Stack::new(bolt, 4)), 4);
+
+    let (kept, lost) = sim.extract_inventory(id, 0.75);
+    // Бюджет 1.65 кг: medkit влезает целиком, canned режется 1/1, bolt — 3/1.
+    assert_eq!(
+        kept,
+        vec![
+            Stack::new(medkit, 2),
+            Stack::new(canned, 1),
+            Stack::new(bolt, 3),
+        ]
+    );
+    assert_eq!(lost, vec![Stack::new(canned, 1), Stack::new(bolt, 1)]);
+    assert!(
+        sim.player_state(id)
+            .unwrap()
+            .inventory
+            .iter()
+            .all(Option::is_none),
+        "инвентарь пуст после экстракции"
+    );
+}
+
+#[test]
+fn extract_inventory_keeps_everything_at_full_percent_and_drops_at_zero() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    assert_eq!(
+        sim.give_stack(id, Stack::new(catalog.index_of("bolt").unwrap(), 3)),
+        3
+    );
+
+    let (kept, lost) = sim.extract_inventory(id, 1.0);
+    assert_eq!(kept.len(), 1);
+    assert!(lost.is_empty());
+
+    // Одна стопка при 0 %: бюджет нулевой — всё падает на землю.
+    assert_eq!(
+        sim.give_stack(id, Stack::new(catalog.index_of("bolt").unwrap(), 3)),
+        3
+    );
+    let (kept, lost) = sim.extract_inventory(id, 0.0);
+    assert!(kept.is_empty());
+    assert_eq!(lost.len(), 1);
+}
+
+#[test]
+fn extract_inventory_splits_boundary_stack_by_units() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    let bolt = catalog.index_of("bolt").unwrap();
+    // bolt×5 = 0.25 кг; бюджет 75 % = 0.1875 кг → 3 болта в склад, 2 падают.
+    assert_eq!(sim.give_stack(id, Stack::new(bolt, 5)), 5);
+    let (kept, lost) = sim.extract_inventory(id, 0.75);
+    assert_eq!(kept, vec![Stack::new(bolt, 3)]);
+    assert_eq!(lost, vec![Stack::new(bolt, 2)]);
+}
+
+#[test]
+fn push_event_reaches_next_snapshot_events() {
+    let mut sim = Simulation::new();
+    assert!(sim.take_events().is_empty());
+    sim.push_event(GameEvent::Extracted {
+        player: 7,
+        player_name: "Сталкер".to_string(),
+        percent: 0.75,
+    });
+    let events = sim.take_events();
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(&events[0], GameEvent::Extracted { player, percent, .. } if *player == 7 && (*percent - 0.75).abs() < 1e-6),
+        "событие экстракции доехало: {events:?}"
+    );
+    assert!(sim.take_events().is_empty(), "очередь опустошена");
+}
+
+#[test]
+fn drop_stack_at_lands_on_ground() {
+    let mut sim = Simulation::new();
+    sim.drop_stack_at(Stack::new(3, 2), Vec3::new(1.0, 0.0, -2.0));
+    let loot = sim.snapshot_loot();
+    assert_eq!(loot.len(), 1);
+    assert_eq!((loot[0].item, loot[0].count), (3, 2));
+    let pos = zn_net::dequantize_pos(loot[0].pos);
+    assert!(
+        (pos[0] - 1.0).abs() < 0.1 && (pos[2] + 2.0).abs() < 0.1,
+        "{pos:?}"
+    );
+}

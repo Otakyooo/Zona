@@ -752,6 +752,70 @@ impl Simulation {
             .unwrap_or_default()
     }
 
+    /// Внешнее событие мира (M4d-2, экстракция): уходит в следующий снапшот
+    /// локации вместе с событиями симуляции.
+    pub fn push_event(&mut self, event: GameEvent) {
+        if let Some(events) = self.world.get_resource_mut::<CombatEvents>() {
+            events.0.push(event);
+        }
+    }
+
+    /// Экстракция (M4d-2): забирает весь инвентарь и делит его на
+    /// сохраняемую часть (`percent` по весу) и остаток. Граничная стопка
+    /// режется по единицам веса — патроны/болты делятся, артефакты либо
+    /// влезают, либо остаются. `percent` ∈ [0, 1]; 1 — сохраняется всё.
+    pub fn extract_inventory(&mut self, id: u64, percent: f32) -> (Vec<Stack>, Vec<Stack>) {
+        let items = self.take_inventory_all(id);
+        let percent = percent.clamp(0.0, 1.0);
+        if items.is_empty() || percent >= 1.0 {
+            return (items, Vec::new());
+        }
+        let catalog = catalog_of(&self.world);
+        let unit_weight = |item: u16| -> u64 {
+            catalog
+                .get(item)
+                .map(|item| u64::from(item_weight_grams(item)))
+                .unwrap_or(0)
+        };
+        let stack_weight =
+            |stack: &Stack| unit_weight(stack.item).saturating_mul(u64::from(stack.count));
+        let total: u64 = items.iter().map(&stack_weight).sum();
+        let mut budget = (total as f32 * percent) as u64;
+        let mut kept = Vec::new();
+        let mut lost = Vec::new();
+        for stack in items {
+            let weight = stack_weight(&stack);
+            if weight <= budget {
+                budget -= weight;
+                kept.push(stack);
+                continue;
+            }
+            // Граничная стопка: режем по единицам веса, что не влезло — падает.
+            let unit = unit_weight(stack.item);
+            let keep_count = budget
+                .checked_div(unit)
+                .unwrap_or(0)
+                .min(u64::from(stack.count));
+            if keep_count > 0 {
+                budget -= unit * keep_count;
+                kept.push(Stack::new(stack.item, keep_count as u32));
+                let rest = stack.count - keep_count as u32;
+                if rest > 0 {
+                    lost.push(Stack::new(stack.item, rest));
+                }
+            } else {
+                lost.push(stack);
+            }
+        }
+        (kept, lost)
+    }
+
+    /// Выбрасывает стопку на землю в точке (M4d-2: остаток экстракции
+    /// остаётся в круге — его может подобрать любой игрок).
+    pub fn drop_stack_at(&mut self, stack: Stack, position: Vec3) {
+        spawn_ground_item(&mut self.world, stack, position);
+    }
+
     /// Очередь действия клиента (обыск/инвентарь); сервер уже отфильтровал
     /// дубли по tick.
     pub fn queue_action(&mut self, id: u64, action: PlayerAction) {

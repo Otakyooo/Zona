@@ -257,6 +257,42 @@ impl SceneTransition {
     }
 }
 
+/// Круг экстракции (M4d-2): вход со добычей сохраняет `percent` инвентаря
+/// в персональный стэш базы (смерть или конец сессии — потеря всего, 0 %).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneExtraction {
+    /// Якорь круга на полу.
+    pub position: Vec3,
+    pub radius: f32,
+    /// Доля сохраняемого инвентаря, 0..=1 (1 — сохраняется всё).
+    pub percent: f32,
+    /// Подпись для рендера/UI (например, «Эвакуация»).
+    #[serde(default)]
+    pub label: String,
+}
+
+impl SceneExtraction {
+    pub fn new(position: Vec3, radius: f32, percent: f32) -> Self {
+        Self {
+            position,
+            radius,
+            percent,
+            label: String::new(),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Точка в зоне экстракции? Расстояние по горизонтали: зона — цилиндр.
+    pub fn contains(&self, point: Vec3) -> bool {
+        let delta = Vec3::new(point.x - self.position.x, 0.0, point.z - self.position.z);
+        delta.length_squared() <= self.radius * self.radius
+    }
+}
+
 /// Запись реестра локаций: название для UI и файл сцены без расширения
 /// (`levels/<scene>.scene.ron`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -659,6 +695,9 @@ pub struct Scene {
     /// Точки прибытия пузырей (M4d): сюда сервер высаживает игрока после ТП.
     #[serde(default)]
     pub bubble_arrivals: Vec<Vec3>,
+    /// Круги экстракции (M4d-2): вход сохраняет `percent` добычи в стэш.
+    #[serde(default)]
+    pub extractions: Vec<SceneExtraction>,
     /// Атмосфера локации (M4g): солнце, ambient, туман, небо.
     #[serde(default)]
     pub environment: SceneEnvironment,
@@ -675,6 +714,7 @@ impl Scene {
             transitions: Vec::new(),
             bubbles: Vec::new(),
             bubble_arrivals: Vec::new(),
+            extractions: Vec::new(),
             environment: SceneEnvironment::default(),
         }
     }
@@ -708,6 +748,18 @@ impl Scene {
     pub fn add_bubble_arrival(&mut self, position: Vec3) -> &mut Self {
         self.bubble_arrivals.push(position);
         self
+    }
+
+    pub fn add_extraction(&mut self, extraction: SceneExtraction) -> &mut Self {
+        self.extractions.push(extraction);
+        self
+    }
+
+    /// Круг экстракции, накрывающий точку (ступни игрока), если есть.
+    pub fn extraction_at(&self, point: Vec3) -> Option<&SceneExtraction> {
+        self.extractions
+            .iter()
+            .find(|extraction| extraction.contains(point))
     }
 
     pub fn len(&self) -> usize {
@@ -1035,6 +1087,13 @@ impl Scene {
         scene.add_bubble_arrival(Vec3::new(6.0, 0.0, 19.0));
         scene.add_bubble_arrival(Vec3::new(-8.0, 0.0, 20.0));
 
+        // Аварийная эвакуация (M4d-2): дальний угол карты, сейв 75 % добычи
+        // (остаток падает в круге). Ворота базы — бесплатный выход на 100 %.
+        scene.add_extraction(
+            SceneExtraction::new(Vec3::new(-24.0, 0.0, -24.0), 3.0, 0.75)
+                .with_label("Аварийная эвакуация"),
+        );
+
         scene
     }
 
@@ -1156,6 +1215,12 @@ impl Scene {
         scene.add_bubble(SceneBubble::new(Vec3::new(-34.0, 0.0, -4.0), 1.2));
         scene.add_bubble(SceneBubble::new(Vec3::new(26.0, 0.0, -34.0), 1.2));
 
+        // Аварийная эвакуация (M4d-2): юго-западный угол за свальными башнями.
+        scene.add_extraction(
+            SceneExtraction::new(Vec3::new(-30.0, 0.0, -38.0), 3.0, 0.75)
+                .with_label("Аварийная эвакуация"),
+        );
+
         scene
     }
 
@@ -1257,6 +1322,12 @@ impl Scene {
         scene.add_bubble(SceneBubble::new(Vec3::new(12.0, 0.0, -12.0), 1.2));
         scene.add_bubble(SceneBubble::new(Vec3::new(-12.0, 0.0, 12.0), 1.2));
         scene.add_bubble(SceneBubble::new(Vec3::new(0.0, 0.0, 20.0), 1.2));
+
+        // Аварийная эвакуация (M4d-2): юго-восточный угол коридоров.
+        scene.add_extraction(
+            SceneExtraction::new(Vec3::new(18.0, 0.0, -18.0), 2.5, 0.75)
+                .with_label("Аварийная эвакуация"),
+        );
 
         scene
     }
