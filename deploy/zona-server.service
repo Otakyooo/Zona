@@ -1,0 +1,20 @@
+[Unit]
+Description=ZONA dedicated game server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/zona
+# Вход для игроков — playit-туннель на 127.0.0.1:7700 (см. deploy/playit.env),
+# поэтому слушаем только локалхост: снаружи бокс напрямую не виден.
+# Контент и стэши — в /opt/zona (свои каталоги, anicast не трогаем).
+ExecStart=/opt/zona/zn-server --bind 127.0.0.1 --port 7700 --content-root /opt/zona/content --stash-file /opt/zona/data/stashes.ron
+Restart=always
+RestartSec=5
+# Ограничений ресурсов намеренно НЕТ: ZONA — второй жилец рядом с anicast.
+# cgroup-лимиты (MemoryMax/CPUQuota) добавим, только если ZONA реально
+# начнёт мешать соседям.
+
+[Install]
+WantedBy=multi-user.target

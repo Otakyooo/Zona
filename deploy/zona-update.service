@@ -1,0 +1,9 @@
+[Unit]
+Description=ZONA server pull-update from GitHub Releases
+
+[Service]
+Type=oneshot
+# PAT лежит в /etc/zona/update.env (root-only) — скрипт читает его сам.
+# bash явно: exec-бит в git не сохраняется (Windows), на боксе = страховка.
+ExecStart=/bin/bash /opt/zona/zona-update.sh
+# Логи — в journald: journalctl -u zona-update -n 50
