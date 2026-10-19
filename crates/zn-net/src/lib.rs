@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 /// v5 — аномалии (M4c): броски болтов, снаряды в снапшотах, событие
 /// обнаружения аномалии; v6 — локации и база (M4d): локация в Welcome, смена
 /// локации (переходы/пузыри), склад базы; v7 — экстракция (M4d-2): профиль
-/// игрока в Hello, событие эвакуации. Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// игрока в Hello, событие эвакуации; v8 — выживание (M4d-3b): нокдаун и
+/// выброс (события в снапшоте). Несовпадение версий отвергается.
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -200,6 +201,19 @@ pub enum GameEvent {
         player_name: String,
         percent: f32,
     },
+    /// Игрок в нокдауне (M4d-3b): лежит `ticks` тиков, затем встаёт сам.
+    /// Повторный урон в нокдауне убивает.
+    KnockedDown {
+        player: u64,
+        player_name: String,
+        ticks: u16,
+    },
+    /// Игрок поднялся после нокдауна (M4d-3b).
+    GotUp { player: u64, player_name: String },
+    /// Состояние выброса (M4d-3b): приходит в каждом снапшоте локации.
+    /// `active` — идёт поражение; `seconds_left` — до конца фазы (для
+    /// предупреждения — до начала выброса).
+    Blowout { active: bool, seconds_left: f32 },
 }
 
 /// Причина отказа в подключении (`ServerReject`).

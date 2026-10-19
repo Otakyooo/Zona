@@ -56,6 +56,12 @@ pub const INVENTORY_ROWS: usize = 5;
 pub const INVENTORY_SLOTS: usize = INVENTORY_COLS * INVENTORY_ROWS;
 /// Радиус наведения при обыске/подборе (м, по горизонтали).
 pub const INTERACT_RANGE_M: f32 = 2.0;
+/// Нокдаун (M4d-3b): смертельный удар с здоровья выше `KNOCKDOWN_HP` валит
+/// игрока — здоровье 1, таймер `KNOCKDOWN_DURATION_SECS`; повторный урон в
+/// нокдауне убивает, по истечении таймера игрок встаёт с `KNOCKDOWN_HP`.
+pub const KNOCKDOWN_HP: u16 = 25;
+pub const KNOCKDOWN_DURATION_SECS: f32 = 12.0;
+pub const KNOCKDOWN_TICKS: u64 = (KNOCKDOWN_DURATION_SECS * 60.0) as u64;
 /// Минимальный косинус угла между прицелом и целью (~53°).
 pub const INTERACT_MIN_DOT: f32 = 0.6;
 /// На этой дистанции открытый контейнер закрывается сам (м).
@@ -138,6 +144,9 @@ pub struct PlayerState {
     pub firing: bool,
     /// Tick респавна после смерти; 0 — игрок жив.
     pub respawn_at: u64,
+    /// Tick окончания нокдауна (M4d-3b); 0 — игрок не в нокдауне. В нокдауне
+    /// игрок жив (health = 1), но не двигается и не стреляет.
+    pub downed_until_tick: u64,
     /// Раньше этого tick стрелять нельзя (кулдаун оружия).
     pub next_fire_tick: u64,
     /// Раньше этого tick бросать болт нельзя (кулдаун броска).
@@ -163,6 +172,7 @@ impl PlayerState {
             health: MAX_HEALTH,
             firing: false,
             respawn_at: 0,
+            downed_until_tick: 0,
             next_fire_tick: 0,
             next_throw_tick: 0,
             inventory: [None; INVENTORY_SLOTS],
@@ -755,6 +765,45 @@ impl Simulation {
             .unwrap_or_default()
     }
 
+    /// Выброс (M4d-3b): урон всем живым игрокам локации. Смерти и нокдауны
+    /// идут штатными путями — трупы с лутом, события в снапшот.
+    pub fn surge_damage(&mut self, amount: u16) {
+        let tick = self.tick;
+        let mut deaths: Vec<(u64, Vec<Stack>, Vec3, f32)> = Vec::new();
+        let mut downed: Vec<u64> = Vec::new();
+        {
+            let mut query = self.world.query::<&mut PlayerState>();
+            for state in query.iter() {
+                if state.health == 0 {
+                    continue;
+                }
+                let was_downed = is_downed(state, tick);
+                if damage_player(state, tick, amount) {
+                    let items = kill_player(state, tick);
+                    deaths.push((state.id, items, state.position, state.yaw));
+                } else if !was_downed && is_downed(state, tick) {
+                    downed.push(state.id);
+                }
+            }
+        }
+        for player in downed {
+            self.push_event(GameEvent::KnockedDown {
+                player,
+                player_name: String::new(),
+                ticks: KNOCKDOWN_TICKS as u16,
+            });
+        }
+        for (victim, items, position, yaw) in deaths {
+            self.push_event(GameEvent::Death {
+                victim,
+                victim_name: String::new(),
+                killer: 0,
+                killer_name: String::new(),
+            });
+            spawn_corpse(&mut self.world, victim, position, yaw, items, tick);
+        }
+    }
+
     /// Внешнее событие мира (M4d-2, экстракция): уходит в следующий снапшот
     /// локации вместе с событиями симуляции.
     pub fn push_event(&mut self, event: GameEvent) {
@@ -991,6 +1040,7 @@ fn build_schedule() -> Schedule {
     schedule.add("player_actions", player_actions);
     schedule.add("player_bolts", bolts_update);
     schedule.add("player_healing", player_healing);
+    schedule.add("knockdown_recovery", knockdown_recovery);
     schedule.add("corpse_decay", corpse_decay);
     schedule.add("player_respawn", player_respawn);
     schedule
@@ -1012,6 +1062,7 @@ fn tick_now(world: &World) -> u64 {
 
 fn apply_input(world: &mut World) {
     let dt = tick_dt(world);
+    let tick = tick_now(world);
 
     let ids: Vec<u64> = world
         .query::<&PlayerState>()
@@ -1034,8 +1085,9 @@ fn apply_input(world: &mut World) {
             state.yaw = (state.yaw + command.yaw_delta).rem_euclid(std::f32::consts::TAU);
             state.pitch = (state.pitch + command.pitch_delta).clamp(-MAX_PITCH, MAX_PITCH);
 
-            if state.health == 0 {
-                // Мёртвый может осматриваться, но не двигаться и не стрелять.
+            // Мёртвый осматривается, но не действует; в нокдауне (M4d-3b) —
+            // то же самое: игрок лежит до таймера.
+            if state.health == 0 || is_downed(state, tick) {
                 state.firing = false;
                 state.sprinting = false;
                 continue;
@@ -1073,12 +1125,13 @@ fn apply_input(world: &mut World) {
 
 fn move_players(world: &mut World) {
     let dt = tick_dt(world);
+    let tick = tick_now(world);
 
     let requests: Vec<(Entity, Vec3, Vec3)> = {
         let mut query = world.query::<(Entity, &PlayerState)>();
         query
             .iter()
-            .filter(|(_, state)| state.health > 0)
+            .filter(|(_, state)| state.health > 0 && !is_downed(state, tick))
             .map(|(entity, state)| (entity, state.position, state.velocity * dt))
             .collect()
     };
@@ -1202,11 +1255,17 @@ fn player_combat(world: &mut World) {
     // Фаза 1: выстрелы и попадания (иммутабельные заимствования).
     // Патроны (M4d-3a): выстрел расходует патрон из инвентаря; без патронов
     // стрельба молчит (сервер авторитетен — клиент только предсказывает).
+    // В нокдауне (M4d-3b) игрок тоже не стреляет.
     let ammo_item = catalog_of(world).index_of(RIFLE_AMMO_KEY);
     let shooters: Vec<(u64, Vec3, Vec3)> = world
         .query::<&PlayerState>()
         .iter()
-        .filter(|state| state.health > 0 && state.firing && tick >= state.next_fire_tick)
+        .filter(|state| {
+            state.health > 0
+                && state.firing
+                && tick >= state.next_fire_tick
+                && !is_downed(state, tick)
+        })
         .filter(|state| match ammo_item {
             Some(item) => state
                 .inventory
@@ -1284,9 +1343,10 @@ fn player_combat(world: &mut World) {
         }
     }
 
-    // Фаза 2: кулдаун, урон, смерти (мутабельные заимствования).
+    // Фаза 2: кулдаун, урон, смерти и нокдауны (мутабельные заимствования).
     // Лут снимается с трупа: (жертва, убийца, предметы, ступни, yaw).
     let mut deaths: Vec<(u64, u64, Vec<Stack>, Vec3, f32)> = Vec::new();
+    let mut downed: Vec<u64> = Vec::new();
     {
         let mut query = world.query::<&mut PlayerState>();
         for state in query.iter() {
@@ -1301,13 +1361,23 @@ fn player_combat(world: &mut World) {
                     // Добивание в том же тике смертью не считается.
                     continue;
                 }
-                state.health = state.health.saturating_sub(*damage);
-                if state.health == 0 {
+                let was_downed = is_downed(state, tick);
+                if damage_player(state, tick, *damage) {
                     let items = kill_player(state, tick);
                     deaths.push((state.id, *killer, items, state.position, state.yaw));
+                } else if !was_downed && is_downed(state, tick) {
+                    downed.push(id);
                 }
             }
         }
+    }
+
+    for victim in downed {
+        events.push(GameEvent::KnockedDown {
+            player: victim,
+            player_name: String::new(),
+            ticks: KNOCKDOWN_TICKS as u16,
+        });
     }
 
     for (victim, killer, items, position, yaw) in deaths {
@@ -1335,7 +1405,32 @@ fn kill_player(state: &mut PlayerState, tick: u64) -> Vec<Stack> {
     state.respawn_at = tick + RESPAWN_DELAY_TICKS;
     state.healing = None;
     state.open_container = None;
+    state.downed_until_tick = 0;
     drain_inventory(&mut state.inventory)
+}
+
+/// Урон с нокдауном (M4d-3b): первый смертельный удар с здоровья выше
+/// `KNOCKDOWN_HP` валит в нокдаун (health = 1, таймер); в нокдауне любой
+/// следующий урон убивает, как и удар с «низкого» здоровья. `true` — игрок
+/// мёртв (вызывающий снимает лут и шлёт Death).
+fn damage_player(state: &mut PlayerState, tick: u64, amount: u16) -> bool {
+    let left = state.health.saturating_sub(amount);
+    if left > 0 {
+        state.health = left;
+        return false;
+    }
+    if state.downed_until_tick > tick || state.health <= KNOCKDOWN_HP {
+        state.health = 0;
+        return true;
+    }
+    state.health = 1;
+    state.downed_until_tick = tick + KNOCKDOWN_TICKS;
+    false
+}
+
+/// Игрок в нокдауне? Живой, но обездвижен до `downed_until_tick`.
+pub fn is_downed(state: &PlayerState, tick: u64) -> bool {
+    state.health > 0 && state.downed_until_tick > tick
 }
 
 /// Аномалии (M4c): жгучая наносит урон «сердцу» игрока в радиусе сферы
@@ -1355,6 +1450,7 @@ fn anomaly_effects(world: &mut World) {
     let catalog = catalog_of(world);
 
     let mut deaths: Vec<(u64, Vec<Stack>, Vec3, f32)> = Vec::new();
+    let mut downed: Vec<u64> = Vec::new();
     {
         let mut query = world.query::<&mut PlayerState>();
         for state in query.iter() {
@@ -1375,12 +1471,15 @@ fn anomaly_effects(world: &mut World) {
                                 + (f32::from(ANOMALY_DAMAGE_CENTER)
                                     - f32::from(ANOMALY_DAMAGE_EDGE))
                                     * closeness;
-                            let damage = damage * heat_resist_factor(&catalog, &state.inventory);
-                            state.health = state.health.saturating_sub(damage.round() as u16);
-                        }
-                        if state.health == 0 {
-                            let items = kill_player(state, tick);
-                            deaths.push((state.id, items, state.position, state.yaw));
+                            let damage = (damage * heat_resist_factor(&catalog, &state.inventory))
+                                .round() as u16;
+                            let was_downed = is_downed(state, tick);
+                            if damage_player(state, tick, damage) {
+                                let items = kill_player(state, tick);
+                                deaths.push((state.id, items, state.position, state.yaw));
+                            } else if !was_downed && is_downed(state, tick) {
+                                downed.push(state.id);
+                            }
                         }
                     }
                     AnomalyKind::Gravity => {
@@ -1401,6 +1500,16 @@ fn anomaly_effects(world: &mut World) {
                 }
                 break;
             }
+        }
+    }
+
+    for victim in downed {
+        if let Some(events) = world.get_resource_mut::<CombatEvents>() {
+            events.0.push(GameEvent::KnockedDown {
+                player: victim,
+                player_name: String::new(),
+                ticks: KNOCKDOWN_TICKS as u16,
+            });
         }
     }
 
@@ -1857,6 +1966,34 @@ fn corpse_decay(world: &mut World) {
     let tick = tick_now(world);
     if let Some(corpses) = world.get_resource_mut::<Corpses>() {
         corpses.entries.retain(|corpse| corpse.despawn_tick > tick);
+    }
+}
+
+/// Нокдаун (M4d-3b): таймер истёк — игрок встаёт с `KNOCKDOWN_HP`; событие
+/// `GotUp` уходит в снапшот (клиенты снимают оверлей).
+fn knockdown_recovery(world: &mut World) {
+    let tick = tick_now(world);
+    let mut stood_up: Vec<u64> = Vec::new();
+    {
+        let mut query = world.query::<&mut PlayerState>();
+        for state in query.iter() {
+            if state.health > 0 && state.downed_until_tick > 0 && state.downed_until_tick <= tick {
+                state.downed_until_tick = 0;
+                state.health = KNOCKDOWN_HP;
+                stood_up.push(state.id);
+            }
+        }
+    }
+    if stood_up.is_empty() {
+        return;
+    }
+    if let Some(events) = world.get_resource_mut::<CombatEvents>() {
+        for player in stood_up {
+            events.0.push(GameEvent::GotUp {
+                player,
+                player_name: String::new(),
+            });
+        }
     }
 }
 

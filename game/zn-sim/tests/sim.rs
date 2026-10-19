@@ -5,10 +5,10 @@ use zn_net::{ClientInput, GameEvent, InventoryAction, ItemStackNet};
 use zn_scene::{AnomalyKind, Scene, SceneAnomaly, SceneObject};
 use zn_sim::{
     aim_forward, carry_limit_grams, crate_container_id, inventory_weight_grams,
-    is_corpse_container, zone_damage, PlayerAction, Simulation, Stack,
+    is_corpse_container, is_downed, zone_damage, PlayerAction, Simulation, Stack,
     ANOMALY_DAMAGE_INTERVAL_TICKS, BOLT_THROW_COOLDOWN_TICKS, CORPSE_LIFETIME_TICKS, EYE_HEIGHT,
-    FLAG_FIRE, FLAG_SPRINTING, MAX_CARRY_GRAMS, MAX_HEALTH, RESPAWN_DELAY_TICKS, ZONE_HEAD_MIN,
-    ZONE_TORSO_MIN,
+    FLAG_FIRE, FLAG_SPRINTING, KNOCKDOWN_HP, KNOCKDOWN_TICKS, MAX_CARRY_GRAMS, MAX_HEALTH,
+    RESPAWN_DELAY_TICKS, ZONE_HEAD_MIN, ZONE_TORSO_MIN,
 };
 
 const SIM_STEPS: u64 = 60;
@@ -1443,4 +1443,100 @@ fn canned_food_heals_slowly() {
     assert_eq!(state.health, 40, "30 + 10 консервов");
     assert_eq!(state.healing, None);
     assert_eq!(state.inventory[0], None, "консервы съедены");
+}
+
+// ── Нокдаун и выброс (M4d-3b) ────────────────────────────────────────────
+
+#[test]
+fn lethal_hit_from_health_above_threshold_downs_then_heals_up() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    // Ставим 60 HP и наносим 70 урона — смертельный удар с «здоровья».
+    let mut state = sim.player_state(id).unwrap().net_state();
+    state.health = 60;
+    assert!(sim.restore_player(id, &state));
+    sim.surge_damage(70);
+
+    let state = sim.player_state(id).unwrap();
+    assert_eq!(state.health, 1, "нокдаун вместо смерти");
+    assert!(state.downed_until_tick > 0, "таймер нокдауна выставлен");
+    assert!(
+        sim.take_events().iter().any(|event| matches!(
+            event,
+            GameEvent::KnockedDown { player, ticks, .. }
+                if *player == id && u64::from(*ticks) == KNOCKDOWN_TICKS
+        )),
+        "событие нокдауна ушло в снапшот"
+    );
+
+    // Лежачий не двигается: инпут вперёд не сдвигает.
+    let start = sim.player_state(id).unwrap().position;
+    for tick in 0..30u64 {
+        sim.queue_input(id, input(tick, 1.0, 0.0, false));
+        sim.step_once();
+    }
+    let moved = (sim.player_state(id).unwrap().position - start).length();
+    assert!(moved < 0.01, "в нокдауне не двигается: {moved}");
+
+    // Досчитываем таймер — встаёт с KNOCKDOWN_HP.
+    while sim.tick() <= KNOCKDOWN_TICKS + 2 {
+        sim.step_once();
+    }
+    let state = sim.player_state(id).unwrap();
+    assert_eq!(state.health, KNOCKDOWN_HP, "поднялся с порога нокдауна");
+    assert_eq!(state.downed_until_tick, 0);
+    assert!(
+        sim.take_events()
+            .iter()
+            .any(|event| matches!(event, GameEvent::GotUp { player, .. } if *player == id)),
+        "событие подъёма ушло в снапшот"
+    );
+}
+
+#[test]
+fn damage_while_downed_kills_and_low_health_hit_does_not_down() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    let mut state = sim.player_state(id).unwrap().net_state();
+    state.health = 60;
+    assert!(sim.restore_player(id, &state));
+    sim.surge_damage(70);
+    assert_eq!(sim.player_state(id).unwrap().health, 1);
+    // Добивание в нокдауне — смерть без второго нокдауна.
+    sim.surge_damage(1);
+    assert_eq!(sim.player_state(id).unwrap().health, 0);
+    assert!(
+        sim.take_events()
+            .iter()
+            .any(|event| matches!(event, GameEvent::Death { victim, killer, .. } if *victim == id && *killer == 0)),
+        "добивание даёт Death"
+    );
+
+    // Удар с «низкого» здоровья (≤ KNOCKDOWN_HP) сразу убивает.
+    let second = sim.spawn_player(Vec3::new(2.0, 0.0, 0.0));
+    let mut state = sim.player_state(second).unwrap().net_state();
+    state.health = KNOCKDOWN_HP;
+    assert!(sim.restore_player(second, &state));
+    sim.surge_damage(30);
+    assert_eq!(
+        sim.player_state(second).unwrap().health,
+        0,
+        "порог — смерть"
+    );
+}
+
+#[test]
+fn surge_damage_downs_full_health_player_once_then_kills() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    // Полный игрок (100 HP) под выбросом: первый смертельный удар — нокдаун.
+    sim.surge_damage(100);
+    assert_eq!(sim.player_state(id).unwrap().health, 1);
+    assert!(is_downed(&sim.player_state(id).unwrap(), sim.tick()));
+    // Второй удар добивает.
+    sim.surge_damage(4);
+    assert_eq!(sim.player_state(id).unwrap().health, 0);
 }

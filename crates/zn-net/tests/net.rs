@@ -318,7 +318,7 @@ fn position_and_yaw_quantization_roundtrip() {
 
 #[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 7);
+    assert_eq!(PROTOCOL_VERSION, 8);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);

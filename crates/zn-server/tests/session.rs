@@ -1588,3 +1588,78 @@ fn profile_restores_stash_after_reconnect() {
 fn catalog_index(key: &str) -> u16 {
     test_catalog().index_of(key).expect("предмет в каталоге")
 }
+
+#[test]
+fn blowout_warns_then_damages_raid_locations_only() {
+    let registry = LocationRegistry::builtin();
+    let scenes = Scene::builtin_world();
+    let config = SessionConfig {
+        max_players: 10,
+        // Короткий цикл: 1 с ожидание, 1 с предупреждение, 10 с активная фаза.
+        blowout: zn_server::BlowoutTiming {
+            wait_ticks: 60,
+            warning_ticks: 60,
+            active_ticks: 600,
+        },
+        ..SessionConfig::default()
+    };
+    let mut session =
+        Session::bind_world("127.0.0.1:0", &registry, scenes, test_catalog(), config).unwrap();
+    let addr = session.local_addr().unwrap();
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let base_id = expect_welcome(&mut session, &client);
+
+    // Игрок в рейде: база → Кордон (через ворота).
+    let raider = session.debug_spawn();
+    walk_to(
+        session.simulation(),
+        raider,
+        Vec3::new(0.0, 0.0, -20.0),
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 40, |session| {
+            session.player_location(raider) == Some(LOCATION_KORDON)
+        }),
+        "рейдер не дошёл до Кордона"
+    );
+
+    // Предупреждение: событие Blowout с положительным таймером, урона нет.
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::Snapshot { events, .. }
+                if events.iter().any(|event| matches!(
+                    event,
+                    GameEvent::Blowout { active: false, seconds_left } if *seconds_left > 0.0
+                ))
+        )
+    });
+
+    // Активная фаза: событие active=true, рейдер получает урон, база — нет.
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::Snapshot { events, .. }
+                if events.iter().any(|event| matches!(event, GameEvent::Blowout { active: true, .. }))
+        )
+    });
+    let mut hurt = false;
+    for _ in 0..1000 {
+        session.poll(Duration::from_millis(1));
+        let state = session
+            .simulation_at(LOCATION_KORDON)
+            .unwrap()
+            .player_state(raider)
+            .unwrap();
+        if state.health < 100 {
+            hurt = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(hurt, "выброс не ранил игрока в поле");
+    let base_health = session.simulation().player_state(base_id).unwrap().health;
+    assert_eq!(base_health, 100, "база — безопасная зона");
+}
