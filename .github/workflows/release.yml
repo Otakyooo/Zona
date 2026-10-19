@@ -1,0 +1,88 @@
+name: release
+
+# Dev-сборки: push в main → клиент (Windows) + сервер (Linux) → релиз «dev»
+# с manifest.json. Обновление сервера на боксе — pull-моделью (deploy/zona-update.sh),
+# deploy-job здесь намеренно нет: CI не заходит в LAN.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_override:
+        description: "Форс patch-версии (hotfix-пересборка; пусто = GITHUB_RUN_NUMBER)"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-dev
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build client
+        run: cargo build --release -p zn-client -p zn-launcher
+      - name: Pack client zip
+        run: |
+          $stage = "dist/zona-dev-win-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/zn-client.exe $stage/
+          Copy-Item target/release/zn-launcher.exe $stage/
+          Copy-Item game/content $stage/content -Recurse
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $stage -DestinationPath dist/zona-dev-win-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zona-client
+          path: dist/zona-dev-win-x64.zip
+          if-no-files-found: error
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build server (linux, нативно — заодно верифицирует кросс-платформенность)
+        run: cargo build --release -p zn-server
+      - name: Pack server tar.gz
+        run: |
+          mkdir -p dist/zona-server-linux
+          cp target/release/zn-server dist/zona-server-linux/
+          cp -r game/content dist/zona-server-linux/content
+          tar -czf dist/zona-server-linux-x64.tar.gz -C dist zona-server-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zona-server
+          path: dist/zona-server-linux-x64.tar.gz
+          if-no-files-found: error
+
+  publish:
+    runs-on: windows-latest
+    needs: [client, server]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: zona-client
+          path: dist/client
+      - uses: actions/download-artifact@v4
+        with:
+          name: zona-server
+          path: dist/server
+      - name: Publish release
+        run: pwsh -File scripts/publish-dev-build.ps1 -ClientZip dist/client/zona-dev-win-x64.zip -ServerTar dist/server/zona-server-linux-x64.tar.gz -BuildOverride "${{ inputs.build_override }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZONA_SERVER_ADDR: ${{ vars.ZONA_SERVER_ADDR }}
