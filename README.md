@@ -10,8 +10,8 @@
 - **Игра**: 3D FPS, extraction-рейды (заход со своим снаряжением, добыча выносится,
   смерть = потеря лута), между рейдами — база. PvP + PvE, лут, выживание, прокачка,
   квесты, отрядные сессии 5–10 игроков.
-- **Лаунчер**: свой Rust-лаунчер, обновления по `manifest.json` с GitHub Releases
-  (zstd-архивы + SHA-256).
+- **Лаунчер**: свой Rust-лаунчер (GUI + CLI), обновления по `manifest.json`
+  с GitHub Releases (zip-архивы + SHA-256), выбор папки установки игроком.
 
 ## Стек
 
@@ -26,7 +26,7 @@
 | Сеть | `zn-net` | serde, bincode |
 | Клиент | `zn-client` | все движковые крейты |
 | Сервер | `zn-server` | zn-sim, zn-net |
-| Лаунчер | `zn-launcher` | — |
+| Лаунчер | `zn-launcher` | eframe/egui, ureq, zip, sha2, semver, rfd |
 | Ассеты | `zn-assets` | gltf, image, ktx2, basisu |
 | Редактор | `zn-tools-editor` | egui, egui-wgpu, zn-render, zn-assets |
 | Аудио | `zn-audio` | kira |
@@ -43,7 +43,8 @@ cargo run -p zn-client -- --server 127.0.0.1:7700 # мир локаций (M4d)
 cargo run -p zn-server -- --port 7700 --max-players 10   # мир локаций
 cargo run -p zn-server -- --level demo_zone               # одиночная сцена
 cargo run -p zn-server -- --sim-latency-ms 120 --sim-loss-pct 10
-cargo run -p zn-launcher -- --channel dev
+cargo run -p zn-launcher                            # dev-режим: клиент из рабочего дерева (GUI)
+cargo run -p zn-launcher -- --cli                   # то же, но консольным режимом
 cargo run -p zn-tools-editor --bin zn-editor
 ```
 
@@ -414,6 +415,103 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
   текстуры поверхностей, тени от солнца, виньетка; лампы Подземки светятся
   (emissive + bloom).
 
+## Тестовые сборки: лаунчер, сервер и сессии (M6)
+
+Автоматический контур тестирования: пуш в `main` → CI собирает клиент и сервер
+→ релиз «dev» → тестеры получают обновления через лаунчер, бокс `192.168.0.255`
+тянет сервер сам. Репозиторий приватный, хостинг бесплатный (квота Releases).
+
+### Карта хранения
+
+| Что | Где | Кто пишет |
+|---|---|---|
+| Исходники, контент, история | git-репо `Otakyooo/ai_games` (диск `E:\ai_games`) | dev |
+| Сборки: `zona-dev-win-x64.zip` + `zona-server-linux-x64.tar.gz` + `manifest.json` | GitHub Releases, rolling prerelease «dev» (2 последних zip + 2 tar + 1 manifest) | CI (`release.yml`) |
+| Игровой сервер | `192.168.0.255`: `/opt/zona/zn-server`, данные `/opt/zona/data/` | скрипт обновления на боксе |
+| Стэши профилей игроков | `192.168.0.255:/opt/zona/data/stashes.ron` (`--stash-file`; переживают редеплой и рестарт) | сервер |
+| Лаунчер | куда распакует тестер bootstrap-zip (рекомендуем `%LOCALAPPDATA%\ZONA\launcher`) | тестер (1 раз) |
+| Конфиг лаунчера (канал, **выбранная игроком папка**, «свой сервер») | `%LOCALAPPDATA%\ZONA\launcher-config.json` | лаунчер |
+| Игра: `zn-client.exe` + `content/` | **папку выбирает игрок** при первом запуске (дефолт `%LOCALAPPDATA%\ZONA\channels\dev`) | лаунчер |
+| Версия установленной сборки | `<папка-игры>\..\installed.json` (tmp+rename) | лаунчер |
+| Временные файлы обновления | `<папка-игры>\..\staging-<pid>\` (удаляются), бэкап `game.old\` — до успешного свапа | лаунчер |
+| Версия сборки на боксе | `/opt/zona/installed` (простой текст) | `deploy/zona-update.sh` |
+
+### CI и релизы (`.github/workflows/release.yml`)
+
+- Пуш в `main` (или `workflow_dispatch` с `build_override` для hotfix-пересборки:
+  `run_number` при re-run не меняется) → job `client` (windows-latest) + job
+  `server` (ubuntu-latest; нативная Linux-сборка заодно верифицирует
+  кросс-платформенность) → publish: rolling prerelease «dev» + `manifest.json`.
+  Deploy-job'а нет — обновление на боксе pull-моделью (CI в LAN не заходит).
+- Предусловия (делает dev один раз): secret `ZONA_RELEASE_TOKEN` — fine-grained
+  PAT `Contents: read` на этот репо (вкомпилируется в лаунчер через
+  `option_env!`, иначе приватные ассеты не скачать); repo variable
+  `ZONA_SERVER_ADDR` — адрес туннеля (уходит в `manifest.server_addr`).
+- Прунинг в релизе: 2 свежих zip + 2 tar + 1 manifest; `strip = true` в
+  release-профиле — иначе квота Releases кончится.
+
+### Лаунчер и обновления
+
+- `manifest.json` в релизе «dev»: `version` (`0.1.<run_number>`),
+  `url`/`sha256`/`size` клиентского zip, `server` (tar для бокса), `server_addr`
+  (куда коннектиться), `build`/`commit`/`created_at`.
+- Обновление: скачивание (3 попытки, бэкофф, прогресс) → SHA-256 → распаковка
+  (zip-slip guard) → атомарный свап `game` → `game.old` → новая (сбой → откат)
+  → `installed.json`. Если клиент запущен — «закройте ZONA» (exe захвачен с
+  share=0), установка не трогается.
+- Папку установки выбирает игрок: первый запуск — диалог (GUI) или вопрос
+  (CLI, `Enter` = дефолт); флаг `--install-dir <путь>`; «Папка…» в GUI
+  переносит с подтверждением удаления старой.
+- GUI (режим по умолчанию): «Играть» (ensure update → запуск), «Обновить»,
+  «Папка…», «Свой сервер» (`host:port`, приоритетнее манифеста — для отладки),
+  прогресс и статусы. `--cli` — консольный режим: `--channel`, `--check`
+  (только проверить), `--console`, `--version`. Флаги `--install-dir`/`--channel`
+  работают и в GUI-режиме (засеивают конфиг).
+- `ZN_PROFILE`: не задан — лаунчер подставляет `%USERNAME%`, стэши не теряются.
+- dev-режим: `ZN_LAUNCHER_DEV=1` или `Cargo.toml` рабочего дерева рядом с exe —
+  лаунчер запускает `target/<profile>/zn-client.exe` без скачиваний.
+- SmartScreen: у тестеров будет предупреждение на неподписанный exe —
+  «Подробнее» → «Выполнить»; код-подпись — когда появится бюджет.
+- PAT в бинарнике теоретически извлекаем: он read-only и только на этот репо,
+  тестеры доверенные. Ротация: перегенерить PAT → обновить secret
+  `ZONA_RELEASE_TOKEN` (и `/etc/zona/update.env` на боксе) → пуш в main
+  (лаунчер пересобирается).
+
+### Сервер (192.168.0.255)
+
+- `/opt/zona/zn-server --bind 127.0.0.1 --port 7700 --content-root /opt/zona/content
+  --stash-file /opt/zona/data/stashes.ron` под systemd
+  (`deploy/zona-server.service`, `Restart=always`). **Второй жилец рядом с
+  anicast: ограничений ресурсов намеренно нет** — cgroup-лимиты добавим, только
+  если ZONA реально начнёт мешать; anicast-сервисы, каталоги и MCP не трогаем.
+- Обновление — pull-моделью (`deploy/zona-update.sh`, таймер раз в 5 минут):
+  `manifest.json` → сверка версии с `/opt/zona/installed` → tar.gz → SHA-256 →
+  подмена с `.bak` → рестарт → health-check (порт слушается; промах → откат
+  бинарника и контента). Логи — `journalctl -u zona-update -n 50`.
+- Вход для игроков — **playit.gg** (бокс за NAT): агент на боксе, туннель
+  `7700/udp → 127.0.0.1:7700`, публичный адрес `xxx.playit.gg:7700` уходит в
+  `manifest.server_addr` — тестер жмёт «Играть» и коннектится сразу, **ноль
+  сторонних программ**. Смена адреса — `scripts/update-server-addr.ps1
+  -ServerAddr xxx.playit.gg:7700` с машины dev'а (пустой адрес = offline для
+  всех). Фолбэки: проброс UDP 7700 на роутере; WireGuard до финского VPS —
+  только крайний вариант, он слабый.
+- Bootstrap (один раз): SSH на `.255` → `/opt/zona`, `/etc/zona/update.env`
+  (`ZONA_PAT`, root-only) → `cp deploy/zona-*.service deploy/zona-update.timer
+  /etc/systemd/system/` → `systemctl enable --now zona-server
+  zona-update.timer` → агент playit (`deploy/playit.env`) → адрес туннеля в
+  `ZONA_SERVER_ADDR`.
+
+### Тестовые сессии
+
+- Один раз: тестер получает bootstrap-zip с `zn-launcher.exe`, распаковывает
+  куда угодно, запускает, выбирает папку — дальше всё автоматически.
+- «Играть» = ensure-update → запуск с `--server` из манифеста (или поля «Свой
+  сервер» для отладки конкретного адреса).
+- Пустой или битый `server_addr` → оффлайн с предупреждением (игра стартует в
+  одиночном уровне).
+- Локальная отладка без релиза: `ZN_LAUNCHER_DEV=1` + `cargo run -p zn-launcher`
+  из рабочего дерева.
+
 ## Дорожная карта
 
 - **M0**: каркас workspace + CI (готово)
@@ -450,7 +548,11 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
   F9/F10 — готово, валидация: тесты/clippy/fmt зелёные; слышимость — ручной
   smoke (сервер + 2 клиента)
 - **M5**: аккаунты, БД, база между рейдами
-- **M6**: лаунчер, обновления, инсталлятор
+- **M6**: лаунчер (GUI + CLI, выбор папки установки, канал dev, манифестные
+  обновления с SHA-256 и атомарным свапом), авто-dev-сборки в GitHub Releases
+  (`release.yml`) и сервер тестовых сессий на `192.168.0.255` (pull-обновление
+  с откатом, playit-вход) — готово, валидация: тесты/clippy/fmt зелёные;
+  инсталлятор и самообновление лаунчера — позже
 
 ## Звук (A1)
 
