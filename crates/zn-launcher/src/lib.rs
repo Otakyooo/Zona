@@ -4,6 +4,7 @@
 //! этим крейтом: вся логика здесь и покрыта headless-тестами.
 
 pub mod error;
+pub mod gui;
 pub mod install;
 pub mod manifest;
 pub mod run;
