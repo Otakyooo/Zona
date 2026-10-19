@@ -206,6 +206,10 @@ fn download_once(
     progress: &mut dyn FnMut(f32),
 ) -> Result<()> {
     let mut request = ureq::get(url)
+        .config()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        .build()
         .header("Accept", "application/octet-stream")
         .header("User-Agent", "zn-launcher");
     if let Some(token) = token {

@@ -135,19 +135,16 @@ fn run(cli: Cli) -> Result<()> {
     let config_path = Config::path_in(&config_home);
     let mut config = Config::load(&config_path)?;
 
-    // Первый запуск без папки в конфиге — спрашиваем.
-    let install_dir =
-        match install::resolve_install_dir(cli.install_dir.as_deref(), &config, &config_home) {
-            Ok(dir) => dir,
-            Err(_) if config.install_dir.is_none() && cli.install_dir.is_none() => {
-                let default = install::default_install_dir(&config_home, &config.channel);
-                let chosen = prompt_install_dir(&default)?;
-                config.install_dir = Some(chosen.clone());
-                config.save(&config_path)?;
-                chosen
-            }
-            Err(error) => return Err(error),
-        };
+    // Первый запуск без папки в конфиге — спрашиваем (Enter = дефолт).
+    let resolved = install::resolve_install_dir(cli.install_dir.as_deref(), &config, &config_home)?;
+    let install_dir = if config.install_dir.is_none() && cli.install_dir.is_none() {
+        let chosen = prompt_install_dir(&resolved)?;
+        config.install_dir = Some(chosen.clone());
+        config.save(&config_path)?;
+        chosen
+    } else {
+        resolved
+    };
     let layout = Layout::new(install_dir);
     // Самообновление: уборка .old от прошлой подмены (лучше усилия).
     if let Ok(exe) = std::env::current_exe() {

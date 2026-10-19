@@ -9,6 +9,7 @@
 use crate::error::{Error, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// Тег rolling-релиза dev-сборок в GitHub Releases.
 pub const RELEASE_TAG: &str = "dev";
@@ -138,6 +139,12 @@ pub fn repo_slug() -> String {
         .to_string()
 }
 
+/// Базовый URL API: рантайм-оверрide `ZONA_API_BASE` (зеркала, тесты),
+/// иначе дефолт. Компиляционный `ZONA_REPO`/`GITHUB_REPOSITORY` — про репо.
+pub fn api_base() -> String {
+    std::env::var("ZONA_API_BASE").unwrap_or_else(|_| API_BASE.to_string())
+}
+
 /// PAT (`Contents: read`), вкомпилированный в бинарник на сборке CI.
 /// `None` — собрано без токена (локальная/dev-сборка): приватные ассеты
 /// не скачаются, лаунчер честно скажет об этом.
@@ -145,9 +152,9 @@ pub fn release_token() -> Option<&'static str> {
     option_env!("ZONA_RELEASE_TOKEN")
 }
 
-/// Качает и разбирает манифест тега [`RELEASE_TAG`].
+/// Качает и разбирает манифест тега [`RELEASE_TAG`] (API-база — [`api_base`]).
 pub fn fetch_manifest(token: Option<&str>) -> Result<Manifest> {
-    fetch_manifest_from(API_BASE, token)
+    fetch_manifest_from(&api_base(), token)
 }
 
 /// То же, но с произвольным базовым URL API (тесты, зеркала).
@@ -183,6 +190,10 @@ fn manifest_asset_url(release_json: &str, release_url: &str) -> Result<String> {
 /// GET с опциональным Bearer-токеном; не-2xx — ошибка.
 fn http_get(url: &str, token: Option<&str>, accept: &str) -> Result<String> {
     let mut request = ureq::get(url)
+        .config()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        .build()
         .header("Accept", accept)
         .header("User-Agent", "zn-launcher");
     if let Some(token) = token {
