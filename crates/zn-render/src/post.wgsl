@@ -5,13 +5,14 @@
 struct Post {
     vignette: f32,
     output_srgb: f32,
+    bloom_intensity: f32,
     _pad0: f32,
-    _pad1: f32,
 };
 
 @group(0) @binding(0) var<uniform> post: Post;
 @group(0) @binding(1) var hdr_tex: texture_2d<f32>;
 @group(0) @binding(2) var hdr_sampler: sampler;
+@group(0) @binding(3) var bloom_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -54,6 +55,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = in.clip_position.xy / dims;
 
     var color = textureSample(hdr_tex, hdr_sampler, uv).rgb;
+
+    // Bloom (M4g-G3b): размытые яркие пиксели (в ¼ разрешения, билинейно
+    // растянутые) добавляются до тонмаппинга — свечение остаётся мягким.
+    color = color + textureSample(bloom_tex, hdr_sampler, uv).rgb * post.bloom_intensity;
 
     // Виньетка: мягкое затемнение к краям (0 — выключена). Дистанция
     // нормирована так, что в углах кадра даёт 1.0.

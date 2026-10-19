@@ -68,6 +68,24 @@ pub(crate) struct PostUniform {
     pub vignette: f32,
     /// 1.0 — поверхность не-sRGB, пост-пасс кодирует линейный цвет вручную.
     pub output_srgb: f32,
+    /// Интенсивность подмешивания bloom (0 — выключен).
+    pub bloom_intensity: f32,
+    pub _padding: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub(crate) struct BloomBrightUniform {
+    /// Порог яркости bloom по максимальному каналу HDR.
+    pub threshold: f32,
+    pub _padding: [f32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub(crate) struct BloomBlurUniform {
+    /// Шаг выборки размытия в UV: (1/ширина, 0) или (0, 1/высота).
+    pub step: [f32; 2],
     pub _padding: [f32; 2],
 }
 
@@ -132,6 +150,8 @@ mod tests {
     #[test]
     fn post_uniform_is_16_bytes() {
         assert_eq!(std::mem::size_of::<PostUniform>(), 16);
+        assert_eq!(std::mem::size_of::<BloomBrightUniform>(), 16);
+        assert_eq!(std::mem::size_of::<BloomBlurUniform>(), 16);
     }
 
     #[test]
