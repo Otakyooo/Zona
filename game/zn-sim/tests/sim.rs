@@ -4,10 +4,11 @@ use glam::Vec3;
 use zn_net::{ClientInput, GameEvent, InventoryAction, ItemStackNet};
 use zn_scene::{AnomalyKind, Scene, SceneAnomaly, SceneObject};
 use zn_sim::{
-    aim_forward, crate_container_id, inventory_weight_grams, is_corpse_container, zone_damage,
-    PlayerAction, Simulation, Stack, ANOMALY_DAMAGE_INTERVAL_TICKS, BOLT_THROW_COOLDOWN_TICKS,
-    CORPSE_LIFETIME_TICKS, EYE_HEIGHT, FLAG_FIRE, FLAG_SPRINTING, MAX_CARRY_GRAMS, MAX_HEALTH,
-    RESPAWN_DELAY_TICKS, ZONE_HEAD_MIN, ZONE_TORSO_MIN,
+    aim_forward, carry_limit_grams, crate_container_id, inventory_weight_grams,
+    is_corpse_container, zone_damage, PlayerAction, Simulation, Stack,
+    ANOMALY_DAMAGE_INTERVAL_TICKS, BOLT_THROW_COOLDOWN_TICKS, CORPSE_LIFETIME_TICKS, EYE_HEIGHT,
+    FLAG_FIRE, FLAG_SPRINTING, MAX_CARRY_GRAMS, MAX_HEALTH, RESPAWN_DELAY_TICKS, ZONE_HEAD_MIN,
+    ZONE_TORSO_MIN,
 };
 
 const SIM_STEPS: u64 = 60;
@@ -908,11 +909,14 @@ fn healing_capped_at_max_health() {
 fn death_moves_inventory_into_corpse_that_decays() {
     let catalog = test_catalog();
     let medkit = catalog.index_of("medkit").unwrap();
+    let ammo = catalog.index_of("ammo_545").unwrap();
     let scene = loot_scene(Vec3::new(100.0, 0.4, 0.0), &[("bolt", 1)]);
     let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
     let shooter = sim.spawn_player(Vec3::new(-5.0, 0.0, 0.0));
     let target = sim.spawn_player(Vec3::new(5.0, 0.0, 0.0));
     assert_eq!(sim.debug_give(target, medkit, 2), 2);
+    // Патроны стрелку (M4d-3a): без них выстрелы не происходит.
+    assert_eq!(sim.debug_give(shooter, ammo, 30), 30);
 
     // Четыре торс-попадания подряд убивают цель.
     let mut command = fire_input(0);
@@ -1329,4 +1333,114 @@ fn drop_stack_at_lands_on_ground() {
         (pos[0] - 1.0).abs() < 0.1 && (pos[2] + 2.0).abs() < 0.1,
         "{pos:?}"
     );
+}
+
+// ── Выживание, данные (M4d-3a) ───────────────────────────────────────────
+
+#[test]
+fn firing_consumes_ammo_and_goes_dry() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let shooter = sim.spawn_player(Vec3::ZERO);
+    let ammo = catalog.index_of("ammo_545").unwrap();
+    assert_eq!(sim.debug_give(shooter, ammo, 3), 3);
+
+    // Три патрона — три выстрела, дальше «сухой» курок (48 тиков при 8-тике).
+    let mut shots = 0;
+    for tick in 0..48u64 {
+        sim.queue_input(shooter, fire_input(tick));
+        sim.step_once();
+        shots += sim
+            .take_events()
+            .iter()
+            .filter(|event| matches!(event, GameEvent::Shot { .. }))
+            .count();
+    }
+    assert_eq!(shots, 3, "три патрона — три выстрела, потом тишина");
+    let state = sim.player_state(shooter).unwrap();
+    assert!(
+        state
+            .inventory
+            .iter()
+            .flatten()
+            .all(|stack| stack.item != ammo),
+        "магазин пуст"
+    );
+}
+
+#[test]
+fn weight_cut_artifact_raises_carry_limit() {
+    let catalog = test_catalog();
+    let mut sim = Simulation::with_scene_and_catalog(&Scene::base(), catalog.clone());
+    let id = sim.spawn_player(Vec3::ZERO);
+    let limit = carry_limit_grams(&catalog, &sim.player_state(id).unwrap().inventory);
+    assert_eq!(limit, MAX_CARRY_GRAMS, "без артефактов — стандартный лимит");
+
+    let gravity = catalog.index_of("artifact_gravity").unwrap();
+    sim.debug_give(id, gravity, 1);
+    let lifted = carry_limit_grams(&catalog, &sim.player_state(id).unwrap().inventory);
+    assert_eq!(
+        lifted,
+        (MAX_CARRY_GRAMS as f32 * 1.2) as u32,
+        "Тягун: +20 % к весу"
+    );
+    assert!(lifted > limit);
+}
+
+#[test]
+fn heat_resist_artifact_halves_burn_damage() {
+    let catalog = test_catalog();
+    let scene = anomaly_scene(Some((AnomalyKind::Heat, Vec3::ZERO, 3.0, None)));
+    let mut plain = Simulation::with_scene_and_catalog(&scene, catalog.clone());
+    let plain_id = plain.spawn_player(Vec3::ZERO);
+    let mut protected = Simulation::with_scene_and_catalog(&scene, catalog.clone());
+    let protected_id = protected.spawn_player(Vec3::ZERO);
+    protected.debug_give(protected_id, catalog.index_of("artifact_heat").unwrap(), 1);
+
+    // Крутим ровно до первого тика урона (tick 0 — кратен интервалу), но не
+    // дальше: иначе второе срабатывание внесёт ошибки округления в сравнение.
+    for _ in 0..ANOMALY_DAMAGE_INTERVAL_TICKS {
+        plain.step_once();
+        protected.step_once();
+    }
+    let plain_damage = MAX_HEALTH - plain.player_state(plain_id).unwrap().health;
+    let protected_damage = MAX_HEALTH - protected.player_state(protected_id).unwrap().health;
+    assert!(plain_damage > 0, "жгучая аномалия жжёт: {plain_damage}");
+    assert_eq!(
+        protected_damage,
+        (plain_damage as f32 * 0.5).round() as u16,
+        "Жар-камень вдвое режет урон: {plain_damage} → {protected_damage}"
+    );
+}
+
+#[test]
+fn canned_food_heals_slowly() {
+    let catalog = test_catalog();
+    let canned = catalog.index_of("canned_food").unwrap();
+    let scene = loot_scene(Vec3::new(1.5, 0.4, 0.0), &[("bolt", 1)]);
+    let mut sim = Simulation::with_scene_and_catalog(&scene, catalog);
+    let id = sim.spawn_player(Vec3::ZERO);
+    assert_eq!(sim.debug_give(id, canned, 1), 1);
+    let mut hurt = sim.player_state(id).unwrap().net_state();
+    hurt.health = 30;
+    assert!(sim.restore_player(id, &hurt));
+
+    sim.queue_action(
+        id,
+        PlayerAction::Inventory(InventoryAction::Use { slot: 0 }),
+    );
+    sim.step_once();
+    let until = sim
+        .player_state(id)
+        .unwrap()
+        .healing
+        .expect("консервы начали лечение")
+        .until_tick;
+    while sim.tick() <= until {
+        sim.step_once();
+    }
+    let state = sim.player_state(id).unwrap();
+    assert_eq!(state.health, 40, "30 + 10 консервов");
+    assert_eq!(state.healing, None);
+    assert_eq!(state.inventory[0], None, "консервы съедены");
 }

@@ -527,6 +527,8 @@ fn shooting_replicates_events_and_named_death() {
     victim.hello(hash);
     let victim_id = expect_welcome(&mut session, &victim);
     assert_ne!(shooter_id, victim_id);
+    // Патроны стрелку (M4d-3a): без них выстрелов не будет.
+    assert_eq!(session.debug_give(shooter_id, "ammo_545", 60).unwrap(), 60);
 
     // Оба стоят на спавне уровня (капсулы в одной точке), стрелок удерживает
     // огонь. Выстрел из глаз проходит «сквозь» капсулу жертвы и попадает в
@@ -711,8 +713,16 @@ fn corpse_carries_victim_name_and_loot() {
     victim.hello(scene.content_hash());
     let victim_id = expect_welcome(&mut session, &victim);
 
-    // Лут жертвы переезжает в труп.
+    // Лут жертвы переезжает в труп; патроны стрелку (M4d-3a).
     assert_eq!(session.debug_give(victim_id, "bolt", 2).unwrap(), 2);
+    for client in session.clients() {
+        assert_eq!(
+            session
+                .debug_give(client.player_id, "ammo_545", 40)
+                .unwrap(),
+            40
+        );
+    }
 
     // Упорный огонь стрелка: два хедшота убивают (капсулы в одной точке).
     let mut corpses = Vec::new();
@@ -755,6 +765,7 @@ fn medkit_heals_over_udp() {
 
     // Отладочный стрелок в той же точке: выстрел в упор — хедшот (50 урона).
     let shooter = session.debug_spawn();
+    assert_eq!(session.debug_give(shooter, "ammo_545", 30).unwrap(), 30);
     let mut fire = ClientInput::new(0);
     fire.buttons = FLAG_FIRE;
     session.simulation().queue_input(shooter, fire);
