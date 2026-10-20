@@ -21,7 +21,11 @@ semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-ureq = { workspace = true }
+# TLS — системный (SChannel на Windows / OpenSSL на Linux), НЕ rustls:
+# на сетях с DPI (ТСПУ) отпечаток ClientHello у rustls режется, и ответ
+# приходит битый («failed to parse header value») — системный стек имеет
+# такой же отпечаток, как браузеры, и проходит.
+ureq = { workspace = true, default-features = false, features = ["gzip", "native-tls"] }
 zip = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
