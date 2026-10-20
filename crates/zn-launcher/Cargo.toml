@@ -25,7 +25,9 @@ sha2 = { workspace = true }
 # на сетях с DPI (ТСПУ) отпечаток ClientHello у rustls режется, и ответ
 # приходит битый («failed to parse header value») — системный стек имеет
 # такой же отпечаток, как браузеры, и проходит.
-ureq = { workspace = true, default-features = false, features = ["gzip", "native-tls"] }
+# win-system-proxy: без переменных окружения читает системный прокси
+# Windows (Параметры → Сеть → Прокси), если он включён.
+ureq = { workspace = true, default-features = false, features = ["gzip", "native-tls", "win-system-proxy"] }
 zip = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
