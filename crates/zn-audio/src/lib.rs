@@ -6,11 +6,18 @@
 mod procedural;
 
 use std::io::Cursor;
+use std::sync::Mutex;
 
 use kira::{
     sound::static_sound::{StaticSoundData, StaticSoundSettings},
     AudioManager, AudioManagerSettings, Decibels, DefaultBackend, Value,
 };
+
+/// Сериализует создание `AudioManager`: kira/cpal-WASAPI на машинах без
+/// аудио-устройства при повторных/параллельных init-ах валит процесс
+/// (STATUS_ACCESS_VIOLATION на CI-раннерах). Один init на процесс —
+/// детерминированно и в headless.
+static AUDIO_INIT: Mutex<()> = Mutex::new(());
 
 /// Звуки игры. `Extract` заведён под круги экстракции (M4d-2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,7 +111,12 @@ impl AudioEngine {
     }
 
     /// Пытается поднять устройство звука; при неудаче — молчаливый режим.
+    /// Создание сериализовано (см. [`AUDIO_INIT`]): на headless-машинах
+    /// повторный init kira роняет процесс целиком.
     pub fn initialized(mut self) -> Self {
+        let guard = AUDIO_INIT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()) {
             Ok(manager) => {
                 log::info!("audio engine initialized");
@@ -114,6 +126,7 @@ impl AudioEngine {
                 log::warn!("audio device unavailable ({error}); running muted");
             }
         }
+        drop(guard);
         self
     }
 
@@ -186,6 +199,13 @@ impl std::fmt::Debug for AudioEngine {
 mod tests {
     use super::*;
 
+    // ВАЖНО: реальный init (AudioEngine::new) пытается делать ТОЛЬКО тест
+    // ниже. На машинах без аудио-устройства (CI-раннеры) kira в повторных
+    // инициализациях валит весь процесс (STATUS_ACCESS_VIOLATION), а
+    // одиночный fail-soft init проходит чисто. Остальные тесты работают
+    // на «молчаливом» движке (manager: None) — этого достаточно для
+    // проверки логики громкости/мьюта/play.
+
     #[test]
     fn engine_initializes_or_fails_softly() {
         let engine = AudioEngine::new();
@@ -200,7 +220,7 @@ mod tests {
 
     #[test]
     fn volume_cycles_and_clamps() {
-        let mut engine = AudioEngine::new();
+        let mut engine = AudioEngine::default();
         engine.set_volume(0.7);
         assert_eq!(engine.cycle_volume(), 0.75);
         assert_eq!(engine.cycle_volume(), 1.0);
@@ -213,17 +233,16 @@ mod tests {
 
     #[test]
     fn muted_or_silent_engine_is_noop() {
-        let engine = AudioEngine::new();
-        let mut muted = engine;
-        muted.set_muted(true);
+        let mut engine = AudioEngine::default();
+        engine.set_muted(true);
         // Мьют и громкость 0 не должны паниковать даже с живым устройством.
         for sound in SoundId::ALL {
-            muted.play(sound);
+            engine.play(sound);
         }
-        muted.set_muted(false);
-        muted.set_volume(0.0);
+        engine.set_muted(false);
+        engine.set_volume(0.0);
         for sound in SoundId::ALL {
-            muted.play(sound);
+            engine.play(sound);
         }
     }
 
