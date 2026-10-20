@@ -132,5 +132,6 @@ if [ "$ok" != 1 ]; then
   die "откатились; смотрите journalctl -u zona-server"
 fi
 
-rm -f "${ZONA_DIR}/zn-server.bak" "${ZONA_DIR}/content.bak"
+# content.bak — каталог, поэтому -rf для обоих бэкапов.
+rm -rf "${ZONA_DIR}/zn-server.bak" "${ZONA_DIR}/content.bak"
 log "обновлено до ${m_version}"
