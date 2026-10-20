@@ -37,6 +37,10 @@ jobs:
           # PAT вкомпиливается в лаунчер (option_env!) — иначе приватные
           # ассеты Releases не скачать. Secrets недоступны в fork-PR.
           ZONA_RELEASE_TOKEN: ${{ secrets.ZONA_RELEASE_TOKEN }}
+          # Версия лаунчера = версия релиза (формула — как в
+          # publish-dev-build.ps1: 0.1.<run_number> или build_override).
+          # Уходит в LAUNCHER_VERSION лаунчера (option_env!).
+          ZONA_LAUNCHER_VERSION: "0.1.${{ inputs.build_override || github.run_number }}"
       - name: Pack client zip
         run: |
           $stage = "dist/zona-dev-win-x64"
@@ -46,10 +50,21 @@ jobs:
           Copy-Item game/content $stage/content -Recurse
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path $stage -DestinationPath dist/zona-dev-win-x64.zip -Force
+      - name: Pack launcher zip (M6-8: отдельный артефакт лаунчера)
+        run: |
+          $stage = "dist/zona-launcher"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/zn-launcher.exe $stage/
+          Compress-Archive -Path $stage -DestinationPath dist/zona-launcher-x64.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: zona-client
           path: dist/zona-dev-win-x64.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zona-launcher
+          path: dist/zona-launcher-x64.zip
           if-no-files-found: error
 
   server:
@@ -83,10 +98,14 @@ jobs:
           path: dist/client
       - uses: actions/download-artifact@v4
         with:
+          name: zona-launcher
+          path: dist/launcher
+      - uses: actions/download-artifact@v4
+        with:
           name: zona-server
           path: dist/server
       - name: Publish release
-        run: pwsh -File scripts/publish-dev-build.ps1 -ClientZip dist/client/zona-dev-win-x64.zip -ServerTar dist/server/zona-server-linux-x64.tar.gz -BuildOverride "${{ inputs.build_override }}"
+        run: pwsh -File scripts/publish-dev-build.ps1 -ClientZip dist/client/zona-dev-win-x64.zip -LauncherZip dist/launcher/zona-launcher-x64.zip -ServerTar dist/server/zona-server-linux-x64.tar.gz -BuildOverride "${{ inputs.build_override }}"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ZONA_SERVER_ADDR: ${{ vars.ZONA_SERVER_ADDR }}

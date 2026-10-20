@@ -58,7 +58,11 @@ $staging = Join-Path ([System.IO.Path]::GetTempPath()) ("zona-addr-" + [guid]::N
 New-Item -ItemType Directory -Path $staging | Out-Null
 try {
   $path = Join-Path $staging "manifest.json"
-  $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path $path -Encoding utf8
+  # utf8 БЕЗ BOM: под PS 5.1 -Encoding utf8 пишет с BOM, и тогда ни лаунчер
+  # (serde_json), ни бокс (python json) манифест не разберут.
+  $manifest | ConvertTo-Json -Depth 4 | ForEach-Object {
+    [System.IO.File]::WriteAllText($path, $_, (New-Object System.Text.UTF8Encoding($false)))
+  }
   Invoke-Checked gh @('release', 'upload', $ReleaseTag, $path, '--clobber', '-R', $Repo)
 } finally {
   Remove-Item $staging -Recurse -Force
