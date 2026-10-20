@@ -208,11 +208,10 @@ fn download_once(
     expected_size: u64,
     progress: &mut dyn FnMut(f32),
 ) -> Result<()> {
-    let mut request = ureq::get(url)
-        .config()
-        .timeout_connect(Some(std::time::Duration::from_secs(15)))
-        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
-        .build()
+    // Тот же агент, что и у манифеста: таймауты + прокси из окружения
+    // (в сетях со строгим фильтром Rust-TLS получает битые ответы).
+    let mut request = manifest::agent()
+        .get(url)
         .header("Accept", "application/octet-stream")
         .header("User-Agent", "zn-launcher");
     if let Some(token) = token {

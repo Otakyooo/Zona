@@ -9,6 +9,7 @@
 use crate::error::{Error, Result};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Тег rolling-релиза dev-сборок в GitHub Releases.
@@ -23,6 +24,30 @@ const SHA256_HEX_LEN: usize = 64;
 pub const API_BASE: &str = "https://api.github.com";
 /// Слаг репозитория: `ZONA_REPO`/`GITHUB_REPOSITORY` на сборке, иначе дефолт.
 const DEFAULT_REPO_SLUG: &str = "Otakyooo/ai_games";
+/// Сколько попыток GET при ТРАНСПОРТНЫХ сбоях (обрыв, DPI, битый ответ).
+const HTTP_ATTEMPTS: u32 = 3;
+/// Базовый бэкофф между попытками, мс (удваивается).
+const HTTP_BACKOFF_MS: u64 = 500;
+
+/// Единый ureq-агент: таймауты (M6-3) + прокси из окружения.
+///
+/// Прокси: `HTTPS_PROXY`/`ALL_PROXY`/`HTTP_PROXY` + `NO_PROXY` (плюс реестр
+/// Windows, если ureq собран с `win-system-proxy`). Нужен потому, что в
+/// сетях со строгим фильтром (DPI/антивирус/корпоративный прокси) Rust-TLS
+/// клиент может получать ответ, который не парсится
+/// («failed to parse header value») — маршрут через прокси лечит.
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// Общий агент лаунчера (лениво, один на процесс).
+pub fn agent() -> &'static ureq::Agent {
+    AGENT.get_or_init(|| {
+        let mut builder = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(15)))
+            .timeout_recv_response(Some(Duration::from_secs(60)));
+        builder = builder.proxy(ureq::Proxy::try_from_env());
+        builder.build().into()
+    })
+}
 
 /// Манифест релиза: клиентский zip (+ серверный tar для бокса).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,9 +242,9 @@ pub fn fetch_manifest(token: Option<&str>) -> Result<Manifest> {
 pub fn fetch_manifest_from(api_base: &str, token: Option<&str>) -> Result<Manifest> {
     let base = api_base.trim_end_matches('/');
     let release_url = format!("{base}/repos/{}/releases/tags/{RELEASE_TAG}", repo_slug());
-    let release_json = http_get(&release_url, token, "application/vnd.github+json")?;
+    let release_json = http_get_retried(&release_url, token, "application/vnd.github+json")?;
     let asset_url = manifest_asset_url(&release_json, &release_url)?;
-    http_get(&asset_url, token, "application/octet-stream").and_then(|body| parse(&body))
+    http_get_retried(&asset_url, token, "application/octet-stream").and_then(|body| parse(&body))
 }
 
 /// Достаёт API-URL ассета манифеста из JSON релиза.
@@ -241,34 +266,97 @@ fn manifest_asset_url(release_json: &str, release_url: &str) -> Result<String> {
     )))
 }
 
-/// GET с опциональным Bearer-токеном; не-2xx — ошибка.
-fn http_get(url: &str, token: Option<&str>, accept: &str) -> Result<String> {
-    let mut request = ureq::get(url)
-        .config()
-        .timeout_connect(Some(Duration::from_secs(15)))
-        .timeout_recv_response(Some(Duration::from_secs(60)))
-        .build()
+/// Внутренний исход одной попытки GET.
+enum HttpOnce {
+    /// Тело ответа (2xx).
+    Body(String),
+    /// Осмысленный HTTP-статус (404/401/…) — ретраить бессмысленно.
+    Status(u16),
+    /// Транспортная ошибка (обрыв, таймаут, непарсящийся ответ) — ретраить.
+    Transport(String),
+}
+
+/// GET с опциональным Bearer-токеном; не-2xx — [`HttpOnce::Status`].
+fn http_get_once(
+    url: &str,
+    token: Option<&str>,
+    accept: &str,
+) -> std::result::Result<HttpOnce, Error> {
+    let mut request = agent()
+        .get(url)
         .header("Accept", accept)
         .header("User-Agent", "zn-launcher");
     if let Some(token) = token {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let mut response = request
-        .call()
-        .map_err(|e| Error::Http(format!("GET {url}: {e}")))?;
+    let response = match request.call() {
+        Ok(response) => response,
+        Err(error) => return Ok(HttpOnce::Transport(format!("{error}"))),
+    };
     let status = response.status();
     if !status.is_success() {
-        return Err(Error::Http(format!("GET {url}: HTTP {status}")));
+        return Ok(HttpOnce::Status(status.as_u16()));
     }
+    let mut response = response;
     response
         .body_mut()
         .read_to_string()
+        .map(HttpOnce::Body)
         .map_err(|e| Error::Http(format!("GET {url}: чтение тела: {e}")))
+}
+
+/// Транспортные ошибки — ретура с бэкоффом (флаки-сети, DPI, битые ответы);
+/// HTTP-статусы — сразу. На финальной транспортной ошибке добавляем
+/// подсказку про сеть/антивирус/прокси.
+fn http_get_retried(url: &str, token: Option<&str>, accept: &str) -> Result<String> {
+    let mut last = String::new();
+    for attempt in 1..=HTTP_ATTEMPTS {
+        match http_get_once(url, token, accept)? {
+            HttpOnce::Body(body) => return Ok(body),
+            HttpOnce::Status(code) => {
+                return Err(Error::Http(format!("GET {url}: HTTP {code}")));
+            }
+            HttpOnce::Transport(message) => {
+                log::debug!("GET {url}: попытка {attempt}/{HTTP_ATTEMPTS}: {message}");
+                last = message;
+                if attempt < HTTP_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(
+                        HTTP_BACKOFF_MS * 2u64.pow(attempt - 1),
+                    ));
+                }
+            }
+        }
+    }
+    Err(Error::Http(transport_message(url, &last)))
+}
+
+/// Сообщение транспортной ошибки; для непарсящегося ответа — с подсказкой.
+fn transport_message(url: &str, message: &str) -> String {
+    let hint = if message.contains("failed to parse header value") {
+        " (ответ не разобрался — похоже на помехи в сети: антивирус/прокси/DPI; \
+         проверьте соединение или задайте переменную https_proxy)"
+    } else {
+        ""
+    };
+    format!("GET {url}: {message}{hint}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_message_hints_on_unparsable_response() {
+        let plain = transport_message("https://x/y", "connection refused");
+        assert!(plain.contains("connection refused"));
+        assert!(
+            !plain.contains("помехи"),
+            "для обычной ошибки подсказки не надо: {plain}"
+        );
+        let garbled = transport_message("https://x/y", "http: failed to parse header value");
+        assert!(garbled.contains("не разобрался"), "{garbled}");
+        assert!(garbled.contains("https_proxy"), "{garbled}");
+    }
 
     const SHA_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const SHA_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
