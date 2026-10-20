@@ -9,11 +9,11 @@ use std::thread;
 use eframe::egui;
 
 use crate::install::{self, Config, Layout};
+use crate::launcher_update::{self, SelfUpdateStep};
 use crate::manifest::Manifest;
 use crate::run::{self, ServerChoice};
 use crate::update::{self, UpdateReport};
-
-const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
+use crate::LAUNCHER_VERSION;
 
 /// Что UI просит у воркера.
 pub enum WorkCmd {
@@ -36,6 +36,38 @@ pub enum WorkMsg {
 pub struct WorkDone {
     pub report: Result<UpdateReport, String>,
     pub manifest: Option<Manifest>,
+    /// Итог шагов обновления самого лаунчера (M6-7 бандл + M6-8 манифест).
+    pub launcher: LauncherOutcome,
+}
+
+/// Что UI должен сделать с лаунчером после шагов самообновления.
+#[derive(Debug, Default)]
+pub struct LauncherOutcome {
+    /// Лаунчер подменён на месте — нужен relaunch.
+    pub relaunch: bool,
+    /// Предупреждение для пользователя (занят exe / не скачалось).
+    pub warning: Option<String>,
+}
+
+fn launcher_outcome(step: SelfUpdateStep) -> LauncherOutcome {
+    match step {
+        SelfUpdateStep::UpToDate => LauncherOutcome::default(),
+        SelfUpdateStep::Updated { .. } => LauncherOutcome {
+            relaunch: true,
+            warning: None,
+        },
+        SelfUpdateStep::Deferred => LauncherOutcome {
+            relaunch: false,
+            warning: Some(
+                "лаунчер не заменен (занят) — замените zn-launcher.exe вручную (файл .new рядом)"
+                    .to_string(),
+            ),
+        },
+        SelfUpdateStep::Failed { reason } => LauncherOutcome {
+            relaunch: false,
+            warning: Some(format!("обновление лаунчера: {reason}")),
+        },
+    }
 }
 
 enum Phase {
@@ -256,7 +288,11 @@ impl LauncherApp {
                     self.progress = fraction.clamp(0.0, 1.0);
                 }
                 WorkMsg::Done(done) => {
-                    let WorkDone { report, manifest } = *done;
+                    let WorkDone {
+                        report,
+                        manifest,
+                        launcher,
+                    } = *done;
                     // свежий манифест не затираем неудачей проверки
                     if manifest.is_some() {
                         self.manifest = manifest;
@@ -298,27 +334,17 @@ impl LauncherApp {
                         }
                     }
                     self.game_ready = playable;
-                    // Самообновление лаунчера (M6-7): zip несёт свежий exe.
-                    if let Ok(current) = std::env::current_exe() {
-                        if let Some(layout) = self.layout.clone() {
-                            match crate::selfupdate::update_from_layout(&layout, &current) {
-                                Ok(crate::selfupdate::SelfUpdate::Updated) => {
-                                    self.status = "Лаунчер обновлён — перезапуск…".to_string();
-                                    let _ = crate::selfupdate::relaunch(&current);
-                                    std::process::exit(0);
-                                }
-                                Ok(crate::selfupdate::SelfUpdate::Deferred) => {
-                                    self.error = Some(
-                                        "лаунчер не заменен (занят) — замените zn-launcher.exe вручную (файл .new рядом)"
-                                            .to_string(),
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    self.error = Some(format!("самообновление лаунчера: {error}"));
-                                }
-                            }
+                    // Обновление самого лаунчера (M6-7 бандл + M6-8 манифест):
+                    // подмена прошла в воркере — перезапускаемся.
+                    if launcher.relaunch {
+                        self.status = "Лаунчер обновлён — перезапуск…".to_string();
+                        if let Ok(current) = std::env::current_exe() {
+                            let _ = crate::selfupdate::relaunch_marked(&current);
                         }
+                        std::process::exit(0);
+                    }
+                    if let Some(warning) = launcher.warning {
+                        self.error = Some(warning);
                     }
                     if self.play_after_install && playable {
                         self.play_after_install = false;
@@ -564,11 +590,12 @@ fn worker(commands: Receiver<WorkCmd>, messages: Sender<WorkMsg>) {
         let mut progress = move |fraction: f32| {
             let _ = progress_tx.send(WorkMsg::Progress(fraction));
         };
+        let current_exe = std::env::current_exe().ok();
         let (report, manifest) = if force {
-            (
-                update::force_update(&layout, &channel, &mut progress).map_err(|e| e.to_string()),
-                None,
-            )
+            match update::force_update(&layout, &channel, &mut progress) {
+                Ok((report, manifest)) => (Ok(report), Some(manifest)),
+                Err(e) => (Err(e.to_string()), None),
+            }
         } else {
             match crate::manifest::fetch_manifest(crate::manifest::release_token()) {
                 Ok(manifest) => match manifest.validate() {
@@ -587,7 +614,22 @@ fn worker(commands: Receiver<WorkCmd>, messages: Sender<WorkMsg>) {
                 Err(e) => (Err(e.to_string()), None),
             }
         };
-        let _ = messages.send(WorkMsg::Done(Box::new(WorkDone { report, manifest })));
+        // Обновление самого лаунчера: бандл из клиентского zip (M6-7) и/или
+        // лаунчер-ассет манифеста (M6-8). Только когда манифест известен.
+        let launcher = match (&current_exe, &manifest) {
+            (Some(exe), Some(manifest)) => launcher_outcome(launcher_update::update_self(
+                manifest,
+                &layout,
+                exe,
+                &mut progress,
+            )),
+            _ => LauncherOutcome::default(),
+        };
+        let _ = messages.send(WorkMsg::Done(Box::new(WorkDone {
+            report,
+            manifest,
+            launcher,
+        })));
     }
 }
 

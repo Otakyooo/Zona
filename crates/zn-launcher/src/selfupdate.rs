@@ -118,6 +118,21 @@ pub fn relaunch(current_exe: &Path) -> Result<()> {
     Ok(())
 }
 
+/// То же + маркер [`crate::launcher_update::RELAUNCHED_ENV`]: второй
+/// проход не повторяет обновление лаунчеra (защита от петли).
+pub fn relaunch_marked(current_exe: &Path) -> Result<()> {
+    Command::new(current_exe)
+        .env(crate::launcher_update::RELAUNCHED_ENV, "1")
+        .spawn()
+        .map_err(|e| {
+            Error::Install(format!(
+                "не удалось перезапустить лаунчер ({}): {e}",
+                current_exe.display()
+            ))
+        })?;
+    Ok(())
+}
+
 fn old_path(current_exe: &Path) -> PathBuf {
     let mut name = current_exe.file_name().unwrap_or_default().to_os_string();
     name.push(".old");

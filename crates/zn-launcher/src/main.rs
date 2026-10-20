@@ -10,7 +10,7 @@ use zn_launcher::run::{self, ServerChoice};
 use zn_launcher::update::{self, UpdateReport};
 use zn_launcher::{Error, Result};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = zn_launcher::LAUNCHER_VERSION;
 
 struct Cli {
     channel: String,
@@ -170,19 +170,28 @@ fn run(cli: Cli) -> Result<()> {
     println!();
     print_report(&report);
 
-    // Самообновление лаунчера (M6-7): zip несёт и свежий zn-launcher.exe.
-    match zn_launcher::selfupdate::update_from_layout(&layout, &std::env::current_exe()?) {
-        Ok(zn_launcher::selfupdate::SelfUpdate::Updated) => {
-            println!("Лаунчер обновлён — перезапуск");
-            zn_launcher::selfupdate::relaunch(&std::env::current_exe()?)?;
+    // Обновление самого лаунчера: бандл из клиентского zip (M6-7) и/или
+    // лаунчер-ассет манифеста (M6-8 — отдельно от игры).
+    let current_exe = std::env::current_exe()?;
+    match zn_launcher::launcher_update::update_self(
+        &manifest,
+        &layout,
+        &current_exe,
+        &mut print_launcher_progress,
+    ) {
+        zn_launcher::launcher_update::SelfUpdateStep::Updated { from, to } => {
+            println!("\nЛаунчер обновлён: {from} → {to} — перезапуск");
+            zn_launcher::selfupdate::relaunch_marked(&current_exe)?;
             return Ok(());
         }
-        Ok(zn_launcher::selfupdate::SelfUpdate::Deferred) => eprintln!(
+        zn_launcher::launcher_update::SelfUpdateStep::Deferred => eprintln!(
             "предупреждение: не удалось заменить запущенный лаунчер — \
              замените zn-launcher.exe вручную (файл .new рядом)"
         ),
-        Ok(_) => {}
-        Err(error) => eprintln!("предупреждение: самообновление лаунчера: {error}"),
+        zn_launcher::launcher_update::SelfUpdateStep::Failed { reason } => {
+            eprintln!("предупреждение: обновление лаунчера: {reason}")
+        }
+        zn_launcher::launcher_update::SelfUpdateStep::UpToDate => {}
     }
 
     if cli.check_only {
@@ -202,7 +211,7 @@ fn run(cli: Cli) -> Result<()> {
         match choice.trim() {
             "" | "1" => break,
             "2" => match update::force_update(&layout, &config.channel, &mut print_progress) {
-                Ok(updated) => {
+                Ok((updated, _manifest)) => {
                     println!();
                     print_report(&updated);
                     report = updated;
@@ -278,6 +287,12 @@ fn prompt_install_dir(default: &Path) -> Result<PathBuf> {
 fn print_progress(fraction: f32) {
     let percent = (fraction * 100.0).round() as u32;
     print!("\rЗагрузка: {percent:>3}%");
+    let _ = std::io::stdout().flush();
+}
+
+fn print_launcher_progress(fraction: f32) {
+    let percent = (fraction * 100.0).round() as u32;
+    print!("\rЛаунчер: {percent:>3}%");
     let _ = std::io::stdout().flush();
 }
 

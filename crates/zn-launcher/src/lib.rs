@@ -6,9 +6,17 @@
 pub mod error;
 pub mod gui;
 pub mod install;
+pub mod launcher_update;
 pub mod manifest;
 pub mod run;
 pub mod selfupdate;
 pub mod update;
 
 pub use error::{Error, Result};
+
+/// Версия этого лаунчера: штамп CI (`ZONA_LAUNCHER_VERSION`)
+/// иначе версия крейта.
+pub const LAUNCHER_VERSION: &str = match option_env!("ZONA_LAUNCHER_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};

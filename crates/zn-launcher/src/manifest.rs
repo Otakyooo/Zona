@@ -47,6 +47,10 @@ pub struct Manifest {
     /// Серверный tar.gz (качает deploy/zona-update.sh на боксе).
     #[serde(default)]
     pub server: Option<ServerAsset>,
+    /// Отдельный артефакт лаунчера (M6-8): обновляется независимо от игры.
+    /// `None` — обновления лаунчера идут только бандлом из клиентского zip.
+    #[serde(default)]
+    pub launcher: Option<LauncherAsset>,
     #[serde(default)]
     pub notes: Option<String>,
 }
@@ -56,6 +60,20 @@ pub struct Manifest {
 pub struct ServerAsset {
     pub url: String,
     pub sha256: String,
+    pub size: u64,
+}
+
+/// Артефакт лаунчера того же релиза: свой zip и своя версия (M6-8).
+/// Позволяет выкатить хотфикс лаунчера без пересборки/перекачки игры.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LauncherAsset {
+    /// Версия лаунчера в этом артефакте (semver, например `0.1.42`).
+    pub version: String,
+    /// API-URL ассета лаунчер-зипа.
+    pub url: String,
+    /// sha256 (hex) зипа.
+    pub sha256: String,
+    /// Размер зипа в байтах.
     pub size: u64,
 }
 
@@ -100,12 +118,48 @@ impl Manifest {
                 return Err(Error::Manifest("server.size должен быть > 0".into()));
             }
         }
+        if let Some(launcher) = &self.launcher {
+            self.launcher_version_semver()?;
+            if !launcher.url.starts_with("https://") {
+                return Err(Error::Manifest(format!(
+                    "launcher.url должен быть https://, получено '{}'",
+                    launcher.url
+                )));
+            }
+            if !is_sha256_hex(&launcher.sha256) {
+                return Err(Error::Manifest(format!(
+                    "launcher.sha256 должен быть 64 hex-символами, получено '{}'",
+                    launcher.sha256
+                )));
+            }
+            if launcher.size == 0 {
+                return Err(Error::Manifest("launcher.size должен быть > 0".into()));
+            }
+        }
         Ok(())
     }
 
     /// Совпадает ли канал манифеста с ожидаемым.
     pub fn matches_channel(&self, channel: &str) -> bool {
         self.channel == channel
+    }
+
+    /// Версия лаунчер-ассета как semver (None — блока нет).
+    pub fn launcher_version_semver(&self) -> Result<Option<Version>> {
+        match &self.launcher {
+            None => Ok(None),
+            Some(launcher) => Version::parse(&launcher.version).map(Some).map_err(|e| {
+                Error::Version(format!("launcher.version '{}': {e}", launcher.version))
+            }),
+        }
+    }
+
+    /// Версия лаунчер-ассета, если она строго новее запущенного (M6-8).
+    /// `None` — блока нет или обновляться не надо.
+    pub fn pending_launcher_version(&self, running: &Version) -> Result<Option<Version>> {
+        Ok(self
+            .launcher_version_semver()?
+            .filter(|offered| offered > running))
     }
 
     /// Нужно ли обновление: установленной версии нет или версия манифеста
@@ -236,6 +290,12 @@ mod tests {
                 "sha256": "{SHA_B}",
                 "size": 654321
               }},
+              "launcher": {{
+                "version": "0.1.42",
+                "url": "https://api.github.com/repos/Otakyooo/ai_games/releases/assets/3",
+                "sha256": "{SHA_A}",
+                "size": 4096
+              }},
               "notes": "dev-build abc1234"
             }}"#
         )
@@ -277,8 +337,62 @@ mod tests {
         assert!(manifest.created_at.is_none());
         assert!(manifest.server_addr.is_none());
         assert!(manifest.server.is_none());
+        assert!(manifest.launcher.is_none());
         assert!(manifest.notes.is_none());
         assert_eq!(manifest.version_semver().unwrap().to_string(), "0.1.1");
+    }
+
+    #[test]
+    fn parses_launcher_asset() {
+        let manifest = parse(&full_json()).unwrap();
+        let launcher = manifest.launcher.as_ref().unwrap();
+        assert_eq!(launcher.version, "0.1.42");
+        assert_eq!(launcher.size, 4096);
+        assert_eq!(launcher.sha256, SHA_A);
+        assert_eq!(
+            manifest.launcher_version_semver().unwrap().unwrap(),
+            Version::parse("0.1.42").unwrap()
+        );
+    }
+
+    #[test]
+    fn pending_launcher_version_covers_all_cases() {
+        let manifest = parse(&full_json()).unwrap();
+        let older = Version::parse("0.1.41").unwrap();
+        let same = Version::parse("0.1.42").unwrap();
+        let newer = Version::parse("0.1.43").unwrap();
+        // манифест несёт 0.1.42
+        assert_eq!(
+            manifest.pending_launcher_version(&older).unwrap(),
+            Some(Version::parse("0.1.42").unwrap())
+        );
+        assert_eq!(manifest.pending_launcher_version(&same).unwrap(), None);
+        assert_eq!(manifest.pending_launcher_version(&newer).unwrap(), None);
+        // без блока launcher обновления нет
+        let minimal = parse(&minimal_json()).unwrap();
+        assert_eq!(minimal.pending_launcher_version(&older).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_bad_launcher_asset() {
+        // не-semver версия блока launcher
+        let json = full_json().replace(
+            "\"version\": \"0.1.42\",\n                \"url\": \"https://api.github.com/repos/Otakyooo/ai_games/releases/assets/3\"",
+            "\"version\": \"0.1.x\",\n                \"url\": \"https://api.github.com/repos/Otakyooo/ai_games/releases/assets/3\"",
+        );
+        assert!(matches!(parse(&json).unwrap_err(), Error::Version(_)));
+        // http-url в launcher
+        let json = full_json().replace(
+            "\"launcher\": {\n                \"version\": \"0.1.42\",\n                \"url\": \"https://api.github.com",
+            "\"launcher\": {\n                \"version\": \"0.1.42\",\n                \"url\": \"http://api.github.com",
+        );
+        assert!(matches!(parse(&json).unwrap_err(), Error::Manifest(_)));
+        // нулевой размер launcher
+        let json = full_json().replace(
+            &format!("\"sha256\": \"{SHA_A}\",\n                \"size\": 4096"),
+            &format!("\"sha256\": \"{SHA_A}\",\n                \"size\": 0"),
+        );
+        assert!(matches!(parse(&json).unwrap_err(), Error::Manifest(_)));
     }
 
     #[test]

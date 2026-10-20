@@ -76,14 +76,17 @@ pub fn check_and_update_with(
 }
 
 /// Принудительное обновление («Обновить» в UI): версия не сверяется.
+/// Манифест возвращается тоже — он нужен вызывающему для шагов
+/// обновления самого лаунчера (M6-7/M6-8).
 pub fn force_update(
     layout: &Layout,
     channel: &str,
     progress: ProgressFn<'_>,
-) -> Result<UpdateReport> {
+) -> Result<(UpdateReport, Manifest)> {
     let manifest = manifest::fetch_manifest(manifest::release_token())?;
     check_channel(&manifest, channel)?;
-    install_from_manifest(layout, &manifest, progress)
+    let report = install_from_manifest(layout, &manifest, progress)?;
+    Ok((report, manifest))
 }
 
 fn check_channel(manifest: &Manifest, channel: &str) -> Result<()> {
@@ -320,23 +323,29 @@ pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<Vec<PathBuf>> {
 /// Папка с `zn-client.exe` внутри распакованного архива: либо корень,
 /// либо единственный Top-Level-каталог архива (`zona-dev-win-x64/`).
 pub fn find_payload(extracted_root: &Path) -> Result<PathBuf> {
-    if extracted_root.join(CLIENT_EXE).is_file() {
+    find_file_payload(extracted_root, CLIENT_EXE)
+}
+
+/// Общий случай [`find_payload`]: папка с искомым exe — корень распаковки
+/// или единственный top-level каталог (лаунчер-зип M6-8, клиентский zip).
+pub fn find_file_payload(extracted_root: &Path, exe_name: &str) -> Result<PathBuf> {
+    if extracted_root.join(exe_name).is_file() {
         return Ok(extracted_root.to_path_buf());
     }
     let mut candidates = Vec::new();
     for entry in fs::read_dir(extracted_root)? {
         let path = entry?.path();
-        if path.is_dir() && path.join(CLIENT_EXE).is_file() {
+        if path.is_dir() && path.join(exe_name).is_file() {
             candidates.push(path);
         }
     }
     match candidates.len() {
         1 => Ok(candidates.pop().expect("проверено длиной")),
         0 => Err(Error::Install(format!(
-            "в архиве нет {CLIENT_EXE} — это не клиентская сборка ZONA"
+            "в архиве нет {exe_name} — это не сборка ZONA"
         ))),
         _ => Err(Error::Install(format!(
-            "в архиве несколько папок с {CLIENT_EXE} — неоднозначная сборка"
+            "в архиве несколько папок с {exe_name} — неоднозначная сборка"
         ))),
     }
 }
@@ -434,6 +443,7 @@ mod tests {
             size,
             server_addr: None,
             server: None,
+            launcher: None,
             notes: None,
         }
     }
