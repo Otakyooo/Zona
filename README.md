@@ -418,7 +418,7 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
 ## Тестовые сборки: лаунчер, сервер и сессии (M6)
 
 Автоматический контур тестирования: пуш в `main` → CI собирает клиент и сервер
-→ релиз «dev» → тестеры получают обновления через лаунчер, бокс `192.168.0.255`
+→ релиз «dev» → тестеры получают обновления через лаунчер, бокс `192.168.0.47`
 тянет сервер сам. Репозиторий приватный, хостинг бесплатный (квота Releases).
 
 ### Карта хранения
@@ -427,8 +427,8 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
 |---|---|---|
 | Исходники, контент, история | git-репо `Otakyooo/ai_games` (диск `E:\ai_games`) | dev |
 | Сборки: `zona-dev-win-x64.zip` + `zona-server-linux-x64.tar.gz` + `manifest.json` | GitHub Releases, rolling prerelease «dev» (2 последних zip + 2 tar + 1 manifest) | CI (`release.yml`) |
-| Игровой сервер | `192.168.0.255`: `/opt/zona/zn-server`, данные `/opt/zona/data/` | скрипт обновления на боксе |
-| Стэши профилей игроков | `192.168.0.255:/opt/zona/data/stashes.ron` (`--stash-file`; переживают редеплой и рестарт) | сервер |
+| Игровой сервер | `192.168.0.47`: `/opt/zona/zn-server`, данные `/opt/zona/data/` | скрипт обновления на боксе |
+| Стэши профилей игроков | `192.168.0.47:/opt/zona/data/stashes.ron` (`--stash-file`; переживают редеплой и рестарт) | сервер |
 | Лаунчер | куда распакует тестер bootstrap-zip (рекомендуем `%LOCALAPPDATA%\ZONA\launcher`) | тестер (1 раз) |
 | Конфиг лаунчера (канал, **выбранная игроком папка**, «свой сервер») | `%LOCALAPPDATA%\ZONA\launcher-config.json` | лаунчер |
 | Игра: `zn-client.exe` + `content/` | **папку выбирает игрок** при первом запуске (дефолт `%LOCALAPPDATA%\ZONA\channels\dev`) | лаунчер |
@@ -484,7 +484,7 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
   `ZONA_RELEASE_TOKEN` (и `/etc/zona/update.env` на боксе) → пуш в main
   (лаунчер пересобирается).
 
-### Сервер (192.168.0.255)
+### Сервер (192.168.0.47)
 
 - `/opt/zona/zn-server --bind 127.0.0.1 --port 7700 --content-root /opt/zona/content
   --stash-file /opt/zona/data/stashes.ron` под systemd
@@ -502,7 +502,8 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
   -ServerAddr xxx.playit.gg:7700` с машины dev'а (пустой адрес = offline для
   всех). Фолбэки: проброс UDP 7700 на роутере; WireGuard до финского VPS —
   только крайний вариант, он слабый.
-- Bootstrap (один раз): SSH на `.255` → `/opt/zona`, `/etc/zona/update.env`
+- Bootstrap (один раз): SSH на `.47` (`admin_lama`, ключ `id_ed25519` уже
+  авторизован) → `/opt/zona`, `/etc/zona/update.env`
   (`ZONA_PAT`, root-only) → `cp deploy/zona-*.service deploy/zona-update.timer
   /etc/systemd/system/` → `systemctl enable --now zona-server
   zona-update.timer` → агент playit (`deploy/playit.env`) → адрес туннеля в
@@ -558,7 +559,7 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
 - **M6**: лаунчер (GUI + CLI, выбор папки установки, канал dev, манифестные
   обновления с SHA-256 и атомарным свапом, самообновление лаунчера),
   авто-dev-сборки в GitHub Releases (`release.yml`) и сервер тестовых
-  сессий на `192.168.0.255` (pull-обновление с откатом, playit-вход) —
+  сессий на `192.168.0.47` (pull-обновление с откатом, playit-вход) —
   готово, валидация: тесты/clippy/fmt зелёные; инсталлятор — позже
 
 ## Звук (A1)
