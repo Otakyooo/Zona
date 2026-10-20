@@ -50,7 +50,7 @@ jobs:
           Copy-Item game/content $stage/content -Recurse
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path $stage -DestinationPath dist/zona-dev-win-x64.zip -Force
-      - name: Pack launcher zip (M6-8: отдельный артефакт лаунчера)
+      - name: "Pack launcher zip (M6-8: отдельный артефакт лаунчера)"
         run: |
           $stage = "dist/zona-launcher"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
