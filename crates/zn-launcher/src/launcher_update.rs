@@ -92,7 +92,10 @@ pub fn running_version_in(state_dir: Option<&Path>, current_exe: &Path) -> Versi
 
 /// Запоминает версию подменённого лаунчера (best-effort: read-only
 /// каталог не должен ломать запуск).
-fn record_launcher_version(state_dir: Option<&Path>, version: &str) -> std::result::Result<(), Error> {
+fn record_launcher_version(
+    state_dir: Option<&Path>,
+    version: &str,
+) -> std::result::Result<(), Error> {
     let Some(dir) = state_dir else {
         return Err(Error::Config("нет каталога состояния лаунчера".into()));
     };
@@ -164,15 +167,15 @@ pub fn update_self(
     }
     // 2. Лаунчер-ассет манифеста (M6-8). На relaunch-втором проходе —
     //    только предупреждение, чтобы не уйти в петлю.
-    let pending = match manifest.pending_launcher_version(&running_version_in(state_dir, current_exe))
-    {
-        Ok(pending) => pending,
-        Err(error) => {
-            return SelfUpdateStep::Failed {
-                reason: error.to_string(),
+    let pending =
+        match manifest.pending_launcher_version(&running_version_in(state_dir, current_exe)) {
+            Ok(pending) => pending,
+            Err(error) => {
+                return SelfUpdateStep::Failed {
+                    reason: error.to_string(),
+                }
             }
-        }
-    };
+        };
     if let Some(target) = pending {
         if is_relaunched() {
             return SelfUpdateStep::Failed {
@@ -371,13 +374,7 @@ mod tests {
         // бандл из «игры» — свежий лаунчер
         fixture(dir.path(), "game/zn-launcher.exe", b"bundled-fresh");
         let manifest = test_manifest("9.9.9");
-        let step = update_self(
-            &manifest,
-            &layout,
-            Some(state.path()),
-            &exe,
-            &mut |_| {},
-        );
+        let step = update_self(&manifest, &layout, Some(state.path()), &exe, &mut |_| {});
         assert_eq!(
             step,
             SelfUpdateStep::Updated {
@@ -413,13 +410,7 @@ mod tests {
             size: 1,
         });
         assert_eq!(
-            update_self(
-                &manifest,
-                &layout,
-                Some(state.path()),
-                &exe,
-                &mut |_| {}
-            ),
+            update_self(&manifest, &layout, Some(state.path()), &exe, &mut |_| {}),
             SelfUpdateStep::UpToDate
         );
         assert_eq!(fs::read(&exe).unwrap(), b"running");
@@ -442,13 +433,7 @@ mod tests {
             sha256: hash,
             size,
         });
-        let step = update_self(
-            &manifest,
-            &layout,
-            Some(state.path()),
-            &exe,
-            &mut |_| {},
-        );
+        let step = update_self(&manifest, &layout, Some(state.path()), &exe, &mut |_| {});
         assert_eq!(
             step,
             SelfUpdateStep::Updated {
@@ -487,13 +472,7 @@ mod tests {
             sha256: sha(),
             size: 1,
         });
-        let step = update_self(
-            &manifest,
-            &layout,
-            Some(state.path()),
-            &exe,
-            &mut |_| {},
-        );
+        let step = update_self(&manifest, &layout, Some(state.path()), &exe, &mut |_| {});
         assert!(
             matches!(step, SelfUpdateStep::Failed { .. }),
             "ожидали мягкий провал, получили {step:?}"

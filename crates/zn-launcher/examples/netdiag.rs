@@ -83,7 +83,10 @@ fn ureq_mode() {
     let token = std::env::var("ZONA_DIAG_TOKEN").ok();
     let agent = zn_launcher::manifest::agent();
     let url = format!("https://{HOST}{PATH}");
-    println!("== ureq: GET {url} (token: {})", if token.is_some() { "да" } else { "нет" });
+    println!(
+        "== ureq: GET {url} (token: {})",
+        if token.is_some() { "да" } else { "нет" }
+    );
     let mut request = agent
         .get(&url)
         .header("Accept", "application/vnd.github+json")

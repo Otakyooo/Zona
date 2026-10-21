@@ -41,16 +41,26 @@ jobs:
           # publish-dev-build.ps1: 0.1.<run_number> или build_override).
           # Уходит в LAUNCHER_VERSION лаунчера (option_env!).
           ZONA_LAUNCHER_VERSION: "0.1.${{ inputs.build_override || github.run_number }}"
-      # Код-подпись (Azure Artifact Signing / Trusted Signing). Шак пропущен,
+      # Код-подпись (Azure Artifact Signing / Trusted Signing). Шаги пропущены,
       # пока секреты не заданы: Defender ловит неподписанные бинарники как
       # Trojan:Script/Sabsik.FL.A!ml (известный FP, см. memory 2026-10-21).
       # Для активации: секреты AZURE_TENANT_ID / AZURE_CLIENT_ID /
       # AZURE_CLIENT_SECRET / AZURE_CODE_SIGNING_ENDPOINT (например
       # https://eus.codesigning.azure.net/) / AZURE_CODE_SIGNING_ACCOUNT /
       # AZURE_CODE_SIGNING_PROFILE + роль Artifact Signing Certificate
-      # Profile Signer на аккаунте.
+      # Profile Signer на аккаунте. (secrets недоступен в step-if — считаем
+      # output отдельным шагом.)
+      - name: Check signing config
+        id: signcfg
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.AZURE_CLIENT_ID }}" ] && [ -n "${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Sign Windows binaries (Azure Artifact Signing)
-        if: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CODE_SIGNING_ACCOUNT != '' }}
+        if: steps.signcfg.outputs.enabled == 'true'
         uses: azure/artifact-signing-action@v2
         with:
           endpoint: ${{ secrets.AZURE_CODE_SIGNING_ENDPOINT }}
