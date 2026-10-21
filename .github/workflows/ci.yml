@@ -4,13 +4,17 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  # Полный прогон (тесты + сборка) — вручную: квота Actions ограничена
+  # (2000 мин/мес), каждый пуш с полным прогоном стоил ~80 минут.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    runs-on: windows-latest
+  # Дёшево на каждый пуш: ubuntu (1x минуты), только fmt + clippy.
+  lint:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,6 +24,17 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Полный прогон: тесты + сборка. Windows — аудио (kira/WASAPI) и GUI
+  # (eframe) проверяются на своей платформе. Только по кнопке или на PR.
+  test:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: Tests
         run: cargo test --workspace
       - name: Build
