@@ -6,6 +6,7 @@
 mod procedural;
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use kira::{
@@ -18,6 +19,12 @@ use kira::{
 /// (STATUS_ACCESS_VIOLATION на CI-раннерах). Один init на процесс —
 /// детерминированно и в headless.
 static AUDIO_INIT: Mutex<()> = Mutex::new(());
+
+/// init уже пробовали и устройство не поднялось — больше не пробуем:
+/// на headless каждый повторный init роняет процесс целиком
+/// (STATUS_ACCESS_VIOLATION). Флаг читается/пишется только под
+/// [`AUDIO_INIT`], поэтому обычный `Ordering` достаточен.
+static AUDIO_INIT_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Звуки игры. `Extract` заведён под круги экстракции (M4d-2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -112,17 +119,27 @@ impl AudioEngine {
 
     /// Пытается поднять устройство звука; при неудаче — молчаливый режим.
     /// Создание сериализовано (см. [`AUDIO_INIT`]): на headless-машинах
-    /// повторный init kira роняет процесс целиком.
+    /// повторный init kira роняет процесс целиком. После первой неудачной
+    /// попытки (см. [`AUDIO_INIT_FAILED`]) init не повторяется вовсе —
+    /// поэтому zn-client-тесты (десятки `AudioEngine::new()` в параллели)
+    /// на CI не валят процесс.
     pub fn initialized(mut self) -> Self {
         let guard = AUDIO_INIT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if AUDIO_INIT_FAILED.load(Ordering::Relaxed) {
+            drop(guard);
+            return self;
+        }
         match AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()) {
             Ok(manager) => {
                 log::info!("audio engine initialized");
                 self.manager = Some(manager);
             }
             Err(error) => {
+                // Больше не пробуем: на машинах без устройства каждый
+                // следующий init — STATUS_ACCESS_VIOLATION процесса.
+                AUDIO_INIT_FAILED.store(true, Ordering::Relaxed);
                 log::warn!("audio device unavailable ({error}); running muted");
             }
         }
@@ -199,12 +216,13 @@ impl std::fmt::Debug for AudioEngine {
 mod tests {
     use super::*;
 
-    // ВАЖНО: реальный init (AudioEngine::new) пытается делать ТОЛЬКО тест
-    // ниже. На машинах без аудио-устройства (CI-раннеры) kira в повторных
-    // инициализациях валит весь процесс (STATUS_ACCESS_VIOLATION), а
-    // одиночный fail-soft init проходит чисто. Остальные тесты работают
-    // на «молчаливом» движке (manager: None) — этого достаточно для
-    // проверки логики громкости/мьюта/play.
+    // ВАЖНО: реальный init (AudioEngine::new) делает ТОЛЬКО тест ниже — но
+    // теперь это безопасно и для остальных: на машинах без аудио-устройства
+    // (CI-раннеры) первая неудачная попытка выставляет AUDIO_INIT_FAILED, и
+    // все повторные init сразу уходят в молчаливый режим. Раньше kira на
+    // headless при повторной инициализации валил весь процесс
+    // (STATUS_ACCESS_VIOLATION) — именно на этом падал CI в тестах
+    // zn-client (67 тестов, каждый со своим AudioEngine::new()).
 
     #[test]
     fn engine_initializes_or_fails_softly() {
@@ -216,6 +234,18 @@ mod tests {
             engine.muted()
         );
         assert_eq!(engine.volume(), DEFAULT_VOLUME);
+    }
+
+    #[test]
+    fn repeated_init_does_not_crash_headless() {
+        // Регрессия на CI: повторные init на машине без устройства валили
+        // процесс (STATUS_ACCESS_VIOLATION). Подряд два движка — на CI
+        // второй уходит в mute по флагу, локально оба поднимают устройство.
+        let first = AudioEngine::new();
+        let second = AudioEngine::new();
+        assert_eq!(first.volume(), second.volume());
+        // Флаг недоступности общий на процесс: состояния совпадают.
+        assert_eq!(first.enabled(), second.enabled());
     }
 
     #[test]
