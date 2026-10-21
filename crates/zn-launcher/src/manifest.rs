@@ -23,7 +23,7 @@ const SHA256_HEX_LEN: usize = 64;
 /// Базовый URL GitHub API (параметризован ради тестов).
 pub const API_BASE: &str = "https://api.github.com";
 /// Слаг репозитория: `ZONA_REPO`/`GITHUB_REPOSITORY` на сборке, иначе дефолт.
-const DEFAULT_REPO_SLUG: &str = "Otakyooo/ai_games";
+const DEFAULT_REPO_SLUG: &str = "Otakyooo/Zona";
 /// Сколько попыток GET при ТРАНСПОРТНЫХ сбоях (обрыв, DPI, битый ответ).
 const HTTP_ATTEMPTS: u32 = 3;
 /// Базовый бэкофф между попытками, мс (удваивается).
@@ -390,18 +390,18 @@ mod tests {
               "build": 42,
               "commit": "abc1234",
               "created_at": "2026-10-19T10:00:00Z",
-              "url": "https://api.github.com/repos/Otakyooo/ai_games/releases/assets/1",
+              "url": "https://api.github.com/repos/Otakyooo/Zona/releases/assets/1",
               "sha256": "{SHA_A}",
               "size": 123456,
               "server_addr": "zona.playit.gg:7700",
               "server": {{
-                "url": "https://api.github.com/repos/Otakyooo/ai_games/releases/assets/2",
+                "url": "https://api.github.com/repos/Otakyooo/Zona/releases/assets/2",
                 "sha256": "{SHA_B}",
                 "size": 654321
               }},
               "launcher": {{
                 "version": "0.1.42",
-                "url": "https://api.github.com/repos/Otakyooo/ai_games/releases/assets/3",
+                "url": "https://api.github.com/repos/Otakyooo/Zona/releases/assets/3",
                 "sha256": "{SHA_A}",
                 "size": 4096
               }},
@@ -415,7 +415,7 @@ mod tests {
             r#"{{
               "channel": "dev",
               "version": "0.1.1",
-              "url": "https://api.github.com/repos/Otakyooo/ai_games/releases/assets/9",
+              "url": "https://api.github.com/repos/Otakyooo/Zona/releases/assets/9",
               "sha256": "{SHA_A}",
               "size": 7
             }}"#
@@ -508,8 +508,8 @@ mod tests {
     fn rejects_bad_launcher_asset() {
         // не-semver версия блока launcher
         let json = full_json().replace(
-            "\"version\": \"0.1.42\",\n                \"url\": \"https://api.github.com/repos/Otakyooo/ai_games/releases/assets/3\"",
-            "\"version\": \"0.1.x\",\n                \"url\": \"https://api.github.com/repos/Otakyooo/ai_games/releases/assets/3\"",
+            "\"version\": \"0.1.42\",\n                \"url\": \"https://api.github.com/repos/Otakyooo/Zona/releases/assets/3\"",
+            "\"version\": \"0.1.x\",\n                \"url\": \"https://api.github.com/repos/Otakyooo/Zona/releases/assets/3\"",
         );
         assert!(matches!(parse(&json).unwrap_err(), Error::Version(_)));
         // http-url в launcher

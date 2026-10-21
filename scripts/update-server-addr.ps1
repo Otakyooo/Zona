@@ -14,7 +14,7 @@ param(
   [string]$ServerAddr,
   # Фингрейнд PAT с Contents: read не умеет релизные ассеты на запись —
   # здесь нужен токен с правами на Releases (например, классический repo).
-  [string]$Repo = "Otakyooo/ai_games"
+  [string]$Repo = "Otakyooo/Zona"
 )
 
 $ErrorActionPreference = 'Stop'

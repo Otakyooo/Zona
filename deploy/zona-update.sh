@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pull-обновление zn-server из GitHub Releases (приватный репо Otakyooo/ai_games).
+# Pull-обновление zn-server из GitHub Releases (публичный репо Otakyooo/Zona).
 #
 # CI в LAN не заходит — бокс тянет обновления САМ (pull-модель), это экономит
 # минуты Actions и не требует входящих портов. Алгоритм:
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-REPO="${ZONA_REPO:-Otakyooo/ai_games}"
+REPO="${ZONA_REPO:-Otakyooo/Zona}"
 TAG="dev"
 MANIFEST_ASSET="manifest.json"
 ZONA_DIR="${ZONA_DIR:-/opt/zona}"

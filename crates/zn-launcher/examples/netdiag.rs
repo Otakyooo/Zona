@@ -12,7 +12,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 const HOST: &str = "api.github.com";
-const PATH: &str = "/repos/Otakyooo/ai_games/releases/tags/dev";
+const PATH: &str = "/repos/Otakyooo/Zona/releases/tags/dev";
 
 fn token() -> String {
     std::env::var("ZONA_DIAG_TOKEN").unwrap_or_default()

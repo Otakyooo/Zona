@@ -436,7 +436,7 @@ PvP-бой: серверный hitscan-винтовкой (авто-огонь),
 
 | Что | Где | Кто пишет |
 |---|---|---|
-| Исходники, контент, история | git-репо `Otakyooo/ai_games` (диск `E:\ai_games`) | dev |
+| Исходники, контент, история | git-репо `Otakyooo/Zona` (диск `E:\ai_games`) | dev |
 | Сборки: `zona-dev-win-x64.zip` + `zona-launcher-x64.zip` + `zona-server-linux-x64.tar.gz` + `manifest.json` | GitHub Releases, rolling prerelease «dev» (2 zip + 2 лаунчер-зипа + 2 tar + 1 manifest) | CI (`release.yml`) |
 | Игровой сервер | `192.168.0.47`: `/opt/zona/zn-server`, данные `/opt/zona/data/` | скрипт обновления на боксе |
 | Стэши профилей игроков | `192.168.0.47:/opt/zona/data/stashes.ron` (`--stash-file`; переживают редеплой и рестарт) | сервер |

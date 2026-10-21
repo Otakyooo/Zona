@@ -27,7 +27,7 @@ param(
   # Собрать лаунчер локально (cargo build --release -p zn-launcher) и
   # упаковать зип самим. Иначе нужен готовый -LauncherZip.
   [switch]$Build,
-  [string]$Repo = "Otakyooo/ai_games"
+  [string]$Repo = "Otakyooo/Zona"
 )
 
 $ErrorActionPreference = 'Stop'
