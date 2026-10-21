@@ -6358,6 +6358,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "log",
+ "native-tls",
  "rfd",
  "semver",
  "serde",
