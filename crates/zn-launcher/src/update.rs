@@ -53,7 +53,7 @@ pub fn check_and_update(
     if crate::run::is_dev_mode(&std::env::current_exe().unwrap_or_default()) {
         return Ok(UpdateReport::DevMode);
     }
-    let manifest = manifest::fetch_manifest(manifest::release_token())?;
+    let manifest = manifest::fetch_manifest(None)?;
     check_and_update_with(layout, channel, &manifest, progress)
 }
 
@@ -83,7 +83,7 @@ pub fn force_update(
     channel: &str,
     progress: ProgressFn<'_>,
 ) -> Result<(UpdateReport, Manifest)> {
-    let manifest = manifest::fetch_manifest(manifest::release_token())?;
+    let manifest = manifest::fetch_manifest(None)?;
     check_channel(&manifest, channel)?;
     let report = install_from_manifest(layout, &manifest, progress)?;
     Ok((report, manifest))
@@ -141,7 +141,7 @@ fn install_via_staging(
     let pack = staging.join("pack.zip");
     download(
         &manifest.url,
-        manifest::release_token(),
+        None,
         &pack,
         &manifest.sha256,
         manifest.size,

@@ -21,8 +21,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
-license = "MIT"
-repository = "https://github.com/zona-project/zona"
+license = "AGPL-3.0"
+repository = "https://github.com/Otakyooo/Zona"
 description = "ZONA — own game engine, launcher and an extraction FPS in a Strugatsky-style setting"
 
 [workspace.dependencies]

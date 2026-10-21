@@ -25,23 +25,26 @@ INSTALLED_FILE="${ZONA_DIR}/installed"
 log() { echo "[zona-update] $*"; }
 die() { log "ОШИБКА: $*"; exit 1; }
 
-[ -r "$SECRETS_FILE" ] || die "нет доступа к ${SECRETS_FILE} (должен быть root-only, с ZONA_PAT)"
+[ -r "$SECRETS_FILE" ] || die "нет доступа к ${SECRETS_FILE} (должен быть root-only)"
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
-[ -n "${ZONA_PAT:-}" ] || die "ZONA_PAT не задан в ${SECRETS_FILE}"
 
 for tool in curl python3 tar sha256sum; do
   command -v "$tool" >/dev/null || die "нужен ${tool}"
 done
 
 BASE="https://api.github.com/repos/${REPO}"
-auth=(-H "Authorization: Bearer ${ZONA_PAT}" -H "User-Agent: zona-update")
+# Репозиторий публичный — PAT не нужен (ассеты качаются анонимно).
+# Если репо снова станет приватным, ZONA_PAT в ${SECRETS_FILE} включится сам.
+auth=(-H "User-Agent: zona-update")
+[ -n "${ZONA_PAT:-}" ] && auth+=(-H "Authorization: Bearer ${ZONA_PAT}")
 
 log "качаем ${BASE}/releases/tags/${TAG} → ассет ${MANIFEST_ASSET}"
 # Web-URL github.com/.../releases/download/... для приватного репо отдаёт 404,
-# поэтому манифест и tar берём через API-URL ассетов с Accept: octet-stream.
+# поэтому манифест и tar берём через API-URL ассетов с Accept: octet-stream —
+# единый путь для публичного и приватного случаев.
 release_json="$(curl -fsSL "${auth[@]}" "${BASE}/releases/tags/${TAG}")" \
-  || die "не удалось получить релиз '${TAG}' (проверьте ZONA_PAT и репозиторий)"
+  || die "не удалось получить релиз '${TAG}' (проверьте репозиторий и сеть)"
 manifest_url="$(printf '%s' "$release_json" | python3 -c 'import json,sys
 d = json.load(sys.stdin)
 print(next((a["url"] for a in d["assets"] if a["name"] == "manifest.json"), ""))')" \

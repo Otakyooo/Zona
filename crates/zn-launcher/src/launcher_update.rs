@@ -20,7 +20,7 @@
 
 use crate::error::{Error, Result};
 use crate::install::{Layout, LAUNCHER_EXE};
-use crate::manifest::{self, Manifest};
+use crate::manifest::Manifest;
 use crate::selfupdate::{self, ReplaceOutcome};
 use crate::LAUNCHER_VERSION;
 use semver::Version;
@@ -224,14 +224,7 @@ fn install_launcher(
     let result = (|| -> Result<bool> {
         fs::create_dir_all(&staging)?;
         let pack = staging.join("pack.zip");
-        crate::update::download(
-            &asset.url,
-            manifest::release_token(),
-            &pack,
-            &asset.sha256,
-            asset.size,
-            progress,
-        )?;
+        crate::update::download(&asset.url, None, &pack, &asset.sha256, asset.size, progress)?;
         let extracted = staging.join("root");
         crate::update::extract_zip(&pack, &extracted)?;
         let payload = crate::update::find_file_payload(&extracted, LAUNCHER_EXE)?;

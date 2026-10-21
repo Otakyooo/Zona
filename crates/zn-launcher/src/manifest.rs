@@ -233,19 +233,6 @@ pub fn api_base() -> String {
     std::env::var("ZONA_API_BASE").unwrap_or_else(|_| API_BASE.to_string())
 }
 
-/// PAT (`Contents: read`), вкомпилированный в бинарник на сборке CI.
-/// `None` — собрано без токена (локальная/dev-сборка): приватные ассеты
-/// не скачаются, лаунчер честно скажет об этом.
-///
-/// Токен обрезается по краям: секрет в GitHub Actions нередко попадает
-/// со случайным `\n`/пробелом при вставке, и `Bearer <token>\n` —
-/// невалидное значение заголовка (`InvalidHeaderValue`), из-за чего
-/// запрос падал ещё до подключения к сети ("failed to parse header
-/// value" на любом канале, ВНЛ вкл/выкл не помогали).
-pub fn release_token() -> Option<&'static str> {
-    option_env!("ZONA_RELEASE_TOKEN").map(str::trim)
-}
-
 /// Качает и разбирает манифест тега [`RELEASE_TAG`] (API-база — [`api_base`]).
 pub fn fetch_manifest(token: Option<&str>) -> Result<Manifest> {
     fetch_manifest_from(&api_base(), token)

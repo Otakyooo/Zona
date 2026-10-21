@@ -598,7 +598,7 @@ fn worker(commands: Receiver<WorkCmd>, messages: Sender<WorkMsg>, state_dir: Pat
                 Err(e) => (Err(e.to_string()), None),
             }
         } else {
-            match crate::manifest::fetch_manifest(crate::manifest::release_token()) {
+            match crate::manifest::fetch_manifest(None) {
                 Ok(manifest) => match manifest.validate() {
                     Ok(()) => {
                         let report = update::check_and_update_with(

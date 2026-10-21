@@ -163,7 +163,7 @@ fn run(cli: Cli) -> Result<()> {
         return launch_dev(&launcher_exe, cli.keep_console);
     }
 
-    let manifest = manifest::fetch_manifest(manifest::release_token())?;
+    let manifest = manifest::fetch_manifest(None)?;
     manifest.validate()?;
     let mut report =
         update::check_and_update_with(&layout, &config.channel, &manifest, &mut print_progress)?;
