@@ -227,8 +227,14 @@ pub fn api_base() -> String {
 /// PAT (`Contents: read`), вкомпилированный в бинарник на сборке CI.
 /// `None` — собрано без токена (локальная/dev-сборка): приватные ассеты
 /// не скачаются, лаунчер честно скажет об этом.
+///
+/// Токен обрезается по краям: секрет в GitHub Actions нередко попадает
+/// со случайным `\n`/пробелом при вставке, и `Bearer <token>\n` —
+/// невалидное значение заголовка (`InvalidHeaderValue`), из-за чего
+/// запрос падал ещё до подключения к сети ("failed to parse header
+/// value" на любом канале, ВНЛ вкл/выкл не помогали).
 pub fn release_token() -> Option<&'static str> {
-    option_env!("ZONA_RELEASE_TOKEN")
+    option_env!("ZONA_RELEASE_TOKEN").map(str::trim)
 }
 
 /// Качает и разбирает манифест тега [`RELEASE_TAG`] (API-база — [`api_base`]).
@@ -287,7 +293,13 @@ fn http_get_once(
         .header("Accept", accept)
         .header("User-Agent", "zn-launcher");
     if let Some(token) = token {
-        request = request.header("Authorization", format!("Bearer {token}"));
+        // Края токена подчищаем ещё и здесь: секрет/ENV могли приехать
+        // с `\n`, а `HeaderValue` такой байт отвергает — запрос умирал
+        // бы на конструкторе заголовка, до любого соединения.
+        let token = token.trim();
+        if !token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
     }
     let response = match request.call() {
         Ok(response) => response,

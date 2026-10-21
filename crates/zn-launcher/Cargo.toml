@@ -37,3 +37,4 @@ windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+native-tls = "0.2.18"
