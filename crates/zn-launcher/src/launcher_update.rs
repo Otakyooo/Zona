@@ -340,15 +340,15 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"build");
         let manifest = test_manifest("0.1.5");
-        let state = Some(state.path());
+        let state = state.path();
         // без файла состояния: фолбэк (версия крейта) < 0.1.5 — бандл применяется
-        assert!(bundle_newer_than_running(&manifest, state, &exe));
+        assert!(bundle_newer_than_running(&manifest, Some(state), &exe));
         // hotfix 0.1.99 уже применён — бандл 0.1.5 не трогаем
-        fixture(state.unwrap(), LAUNCHER_VERSION_FILE, b"0.1.99");
-        assert!(!bundle_newer_than_running(&manifest, state, &exe));
+        fixture(state, LAUNCHER_VERSION_FILE, b"0.1.99");
+        assert!(!bundle_newer_than_running(&manifest, Some(state), &exe));
         // равные версии — не применяем
-        fixture(state.unwrap(), LAUNCHER_VERSION_FILE, b"0.1.5");
-        assert!(!bundle_newer_than_running(&manifest, state, &exe));
+        fixture(state, LAUNCHER_VERSION_FILE, b"0.1.5");
+        assert!(!bundle_newer_than_running(&manifest, Some(state), &exe));
     }
 
     #[test]

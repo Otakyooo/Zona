@@ -27,7 +27,7 @@ sha2 = { workspace = true }
 # такой же отпечаток, как браузеры, и проходит.
 # win-system-proxy: без переменных окружения читает системный прокси
 # Windows (Параметры → Сеть → Прокси), если он включён.
-ureq = { workspace = true, default-features = false, features = ["gzip", "native-tls", "win-system-proxy"] }
+ureq = { workspace = true, features = ["gzip", "native-tls", "win-system-proxy"] }
 zip = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
