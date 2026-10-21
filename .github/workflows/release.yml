@@ -34,9 +34,6 @@ jobs:
       - name: Build client
         run: cargo build --release -p zn-client -p zn-launcher
         env:
-          # PAT вкомпиливается в лаунчер (option_env!) — иначе приватные
-          # ассеты Releases не скачать. Secrets недоступны в fork-PR.
-          ZONA_RELEASE_TOKEN: ${{ secrets.ZONA_RELEASE_TOKEN }}
           # Версия лаунчера = версия релиза (формула — как в
           # publish-dev-build.ps1: 0.1.<run_number> или build_override).
           # Уходит в LAUNCHER_VERSION лаунчера (option_env!).
