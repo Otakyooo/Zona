@@ -118,7 +118,10 @@ if ($LauncherZip) {
     size    = $launcherSize
   }
 }
-if ($env:ZONA_SERVER_ADDR) { $manifest['server_addr'] = $env:ZONA_SERVER_ADDR }
+# Адрес из переменной репозитория подчищаем: вставка в UI GitHub нередко
+# приносит `\r\n`, и `traded-convenient.tun.ply.gg:11114\r\n` уезжает в
+# манифест — лаунчер тогда не узнаёт host:port и пускает тестеров в offline.
+if ($env:ZONA_SERVER_ADDR) { $manifest['server_addr'] = $env:ZONA_SERVER_ADDR.Trim() }
 
 # utf8 БЕЗ BOM: PS 5.1 при -Encoding utf8 добавляет BOM, и тогда ни
 # лаунчер (serde_json), ни бокс (python json) манифест не разберут.

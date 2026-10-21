@@ -205,7 +205,16 @@ pub fn is_sha256_hex(value: &str) -> bool {
 
 /// Разбор и валидация манифеста из JSON.
 pub fn parse(json: &str) -> Result<Manifest> {
-    let manifest: Manifest = serde_json::from_str(json)?;
+    let mut manifest: Manifest = serde_json::from_str(json)?;
+    // Края адреса подчищаем: `server_addr` уезжает в манифест из переменной
+    // репозитория, а вставка в UI GitHub нередко приносит `\r\n` —
+    // `traded-convenient.tun.ply.gg:11114\r\n` не проходит проверку host:port,
+    // и лаунчер молча пускает тестеров в offline вместо игры.
+    manifest.server_addr = manifest
+        .server_addr
+        .take()
+        .map(|addr| addr.trim().to_string())
+        .filter(|addr| !addr.is_empty());
     manifest.validate()?;
     Ok(manifest)
 }
@@ -411,6 +420,28 @@ mod tests {
               "size": 7
             }}"#
         )
+    }
+
+    #[test]
+    fn parse_trims_server_addr() {
+        // Переменная репозитория с `\r\n` не должна убивать online-режим:
+        // адрес приезжает в манифест грязным, лаунчик обязан подрезать.
+        let json = full_json().replace(
+            "\"server_addr\": \"zona.playit.gg:7700\"",
+            "\"server_addr\": \"zona.playit.gg:7700\\r\\n\"",
+        );
+        let manifest = parse(&json).unwrap();
+        assert_eq!(manifest.server_addr.as_deref(), Some("zona.playit.gg:7700"));
+    }
+
+    #[test]
+    fn parse_drops_whitespace_only_server_addr() {
+        let json = full_json().replace(
+            "\"server_addr\": \"zona.playit.gg:7700\"",
+            "\"server_addr\": \"   \\n\"",
+        );
+        let manifest = parse(&json).unwrap();
+        assert!(manifest.server_addr.is_none());
     }
 
     #[test]

@@ -20,6 +20,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $ReleaseTag = 'dev'
 
+# Вставленный адрес мог приехать с `\r\n`/пробелами — иначе они уедут в
+# манифест, и лаунчер отвергнет значение как не-host:port (offline-режим).
+$ServerAddr = $ServerAddr.Trim()
+
 function Invoke-Checked {
   param([string]$Exe, [string[]]$GhArgs)
   & $Exe @GhArgs
