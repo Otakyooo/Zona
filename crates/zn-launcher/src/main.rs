@@ -176,6 +176,7 @@ fn run(cli: Cli) -> Result<()> {
     match zn_launcher::launcher_update::update_self(
         &manifest,
         &layout,
+        Some(&config_home),
         &current_exe,
         &mut print_launcher_progress,
     ) {

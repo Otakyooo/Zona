@@ -9,9 +9,14 @@
 //!
 //! Откат назад исключён версионным гейтом: и бандл (M6-7), и манифест
 //! (M6-8) применяются только если их версия строго новее запущенного
-//! лаунчера. Версия запущенного — sidecar `<exe>.lversion` (пишется после
-//! каждой удачной подмены), иначе штамп сборки [`crate::LAUNCHER_VERSION`]
+//! лаунчера. Версия запущенного — файл состояния
+//! [`LAUNCHER_VERSION_FILE`] в профиле пользователя (пишется после каждой
+//! удачной подмены), иначе штамп сборки [`crate::LAUNCHER_VERSION`]
 //! (CI-переменная `ZONA_LAUNCHER_VERSION`, фолбэк — версия крейта).
+//! Раньше версия жила в sidecar `<exe>.lversion` рядом с exe — на рабочем
+//! столе это посторонний файл, поэтому состояние переехало в
+//! `%LOCALAPPDATA%\ZONA` (рядом с конфигом); старый sidecar дочитывается
+//! один раз при миграции и удаляется.
 
 use crate::error::{Error, Result};
 use crate::install::{Layout, LAUNCHER_EXE};
@@ -40,31 +45,61 @@ pub enum SelfUpdateStep {
     Failed { reason: String },
 }
 
-/// Sidecar-файл версии запущенного лаунчера: `<exe>.lversion`.
-fn sidecar_path(current_exe: &Path) -> PathBuf {
+/// Файл версии запущенного лаунчера в каталоге состояния
+/// (`%LOCALAPPDATA%\ZONA\launcher-version.txt`) — не рядом с exe, чтобы
+/// не мусорить (ранее был sidecar `<exe>.lversion`, в т.ч. на рабочем
+/// столе).
+pub const LAUNCHER_VERSION_FILE: &str = "launcher-version.txt";
+
+/// Путь к файлу версии в каталоге состояния.
+pub fn version_state_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(LAUNCHER_VERSION_FILE)
+}
+
+/// Legacy sidecar `<exe>.lversion`: только миграция, потом удаление.
+fn legacy_sidecar_path(current_exe: &Path) -> PathBuf {
     let mut name = current_exe.file_name().unwrap_or_default().to_os_string();
     name.push(".lversion");
     current_exe.with_file_name(name)
 }
 
-/// Версия запущенного лаунчера: sidecar после последней подмены, иначе
-/// штамп сборки, иначе версия крейта (её semver всегда валиден).
-pub fn running_version(current_exe: &Path) -> Version {
-    if let Ok(text) = fs::read_to_string(sidecar_path(current_exe)) {
-        if let Ok(version) = Version::parse(text.trim()) {
+/// Читает версию из файла состояния; мусор/отсутствие — `None`.
+fn read_version_file(path: &Path) -> Option<Version> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| Version::parse(text.trim()).ok())
+}
+
+/// Версия запущенного лаунчера: файл состояния в профиле, иначе (разовая
+/// миграция) legacy sidecar `<exe>.lversion`, иначе штамп сборки, иначе
+/// версия крейта (её semver всегда валиден).
+pub fn running_version_in(state_dir: Option<&Path>, current_exe: &Path) -> Version {
+    if let Some(dir) = state_dir {
+        if let Some(version) = read_version_file(&version_state_path(dir)) {
             return version;
         }
+    }
+    // Миграция со старого sidecar: забираем значение и убираем файл.
+    let legacy = legacy_sidecar_path(current_exe);
+    if let Some(version) = read_version_file(&legacy) {
+        if record_launcher_version(state_dir, &version.to_string()).is_ok() {
+            let _ = fs::remove_file(&legacy);
+        }
+        return version;
     }
     Version::parse(LAUNCHER_VERSION).unwrap_or_else(|_| Version::new(0, 1, 0))
 }
 
 /// Запоминает версию подменённого лаунчера (best-effort: read-only
 /// каталог не должен ломать запуск).
-fn record_launcher_version(current_exe: &Path, version: &str) {
-    let path = sidecar_path(current_exe);
-    if let Err(error) = fs::write(&path, version) {
-        log::debug!("не удалось записать {}: {error}", path.display());
-    }
+fn record_launcher_version(state_dir: Option<&Path>, version: &str) -> std::result::Result<(), Error> {
+    let Some(dir) = state_dir else {
+        return Err(Error::Config("нет каталога состояния лаунчера".into()));
+    };
+    let path = version_state_path(dir);
+    fs::create_dir_all(dir)?;
+    fs::write(&path, version)?;
+    Ok(())
 }
 
 /// Процесс уже перезапущен после подмены лаунчера?
@@ -84,10 +119,14 @@ pub fn relaunch_marker_from(value: Option<&str>) -> bool {
 /// Бандл лаунчера из клиентского zip (M6-7) новее запущенного?
 /// Гейт против откатов: если ранее применён хотфикс из манифеста
 /// (версия выше текущего релиза), старый бандл не должен его заменять.
-pub fn bundle_newer_than_running(manifest: &Manifest, current_exe: &Path) -> bool {
+pub fn bundle_newer_than_running(
+    manifest: &Manifest,
+    state_dir: Option<&Path>,
+    current_exe: &Path,
+) -> bool {
     manifest
         .version_semver()
-        .is_ok_and(|bundle| bundle > running_version(current_exe))
+        .is_ok_and(|bundle| bundle > running_version_in(state_dir, current_exe))
 }
 
 /// Полный цикл обновления самого лаунчера после обновления игры:
@@ -100,16 +139,17 @@ pub fn bundle_newer_than_running(manifest: &Manifest, current_exe: &Path) -> boo
 pub fn update_self(
     manifest: &Manifest,
     layout: &Layout,
+    state_dir: Option<&Path>,
     current_exe: &Path,
     progress: &mut dyn FnMut(f32),
 ) -> SelfUpdateStep {
-    let before = running_version(current_exe);
+    let before = running_version_in(state_dir, current_exe);
     // 1. Бандл из zip (M6-7). Раньше был hash-based; теперь под версионным
     //    гейтом, иначе хотфикс из манифеста откатывался бы бандлом.
-    if bundle_newer_than_running(manifest, current_exe) {
+    if bundle_newer_than_running(manifest, state_dir, current_exe) {
         match selfupdate::check_and_apply(current_exe, &layout.bundled_launcher()) {
             Ok(selfupdate::SelfUpdate::Updated) => {
-                record_launcher_version(current_exe, &manifest.version);
+                let _ = record_launcher_version(state_dir, &manifest.version);
                 return SelfUpdateStep::Updated {
                     from: before.to_string(),
                     to: manifest.version.clone(),
@@ -124,7 +164,8 @@ pub fn update_self(
     }
     // 2. Лаунчер-ассет манифеста (M6-8). На relaunch-втором проходе —
     //    только предупреждение, чтобы не уйти в петлю.
-    let pending = match manifest.pending_launcher_version(&running_version(current_exe)) {
+    let pending = match manifest.pending_launcher_version(&running_version_in(state_dir, current_exe))
+    {
         Ok(pending) => pending,
         Err(error) => {
             return SelfUpdateStep::Failed {
@@ -141,7 +182,7 @@ pub fn update_self(
                 ),
             };
         }
-        return match install_launcher(manifest, current_exe, progress, &target) {
+        return match install_launcher(manifest, current_exe, state_dir, progress, &target) {
             Ok(true) => SelfUpdateStep::Updated {
                 from: before.to_string(),
                 to: target.to_string(),
@@ -160,6 +201,7 @@ pub fn update_self(
 fn install_launcher(
     manifest: &Manifest,
     current_exe: &Path,
+    state_dir: Option<&Path>,
     progress: &mut dyn FnMut(f32),
     _target: &Version,
 ) -> Result<bool> {
@@ -193,7 +235,7 @@ fn install_launcher(
         let fresh = payload.join(LAUNCHER_EXE);
         match selfupdate::replace_executable(current_exe, &fresh)? {
             ReplaceOutcome::Replaced => {
-                record_launcher_version(current_exe, &asset.version);
+                let _ = record_launcher_version(state_dir, &asset.version);
                 Ok(true)
             }
             ReplaceOutcome::Busy => {
@@ -244,44 +286,78 @@ mod tests {
     }
 
     #[test]
-    fn running_version_prefers_sidecar() {
+    fn running_version_prefers_state_file() {
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"build");
-        // без sidecar — версия крейта/штампа (в тестах это версия пакета)
-        let fallback = running_version(&exe);
-        fixture(dir.path(), "zn-launcher.exe.lversion", b"0.1.99");
-        let stamped = running_version(&exe);
+        // без файла состояния — версия крейта/штампа (в тестах это версия пакета)
+        let fallback = running_version_in(Some(state.path()), &exe);
+        fixture(state.path(), LAUNCHER_VERSION_FILE, b"0.1.99");
+        let stamped = running_version_in(Some(state.path()), &exe);
         assert_eq!(stamped, Version::parse("0.1.99").unwrap());
         assert_ne!(stamped, fallback);
-        // мусор в sidecar — снова фолбэк
-        fixture(dir.path(), "zn-launcher.exe.lversion", b"not-semver");
-        assert_eq!(running_version(&exe), fallback);
+        // мусор в файле — снова фолбэк
+        fixture(state.path(), LAUNCHER_VERSION_FILE, b"not-semver");
+        assert_eq!(running_version_in(Some(state.path()), &exe), fallback);
+        // без каталога состояния (нет %LOCALAPPDATA%) — тоже фолбэк
+        assert_eq!(running_version_in(None, &exe), fallback);
+    }
+
+    #[test]
+    fn running_version_migrates_legacy_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let exe = fixture(dir.path(), "zn-launcher.exe", b"build");
+        // старый sidecar рядом с exe (на рабочих столах таких полно)
+        fixture(dir.path(), "zn-launcher.exe.lversion", b"0.1.77");
+        // значение подхвачено…
+        assert_eq!(
+            running_version_in(Some(state.path()), &exe),
+            Version::parse("0.1.77").unwrap()
+        );
+        // …переписано в профиль…
+        assert_eq!(
+            fs::read_to_string(version_state_path(state.path()))
+                .unwrap()
+                .trim(),
+            "0.1.77"
+        );
+        // …и sidecar удалён
+        assert!(!legacy_sidecar_path(&exe).exists());
+        // второй раз читаем уже из состояния
+        assert_eq!(
+            running_version_in(Some(state.path()), &exe),
+            Version::parse("0.1.77").unwrap()
+        );
     }
 
     #[test]
     fn bundle_gate_blocks_downgrade() {
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"build");
         let manifest = test_manifest("0.1.5");
-        // без sidecar: фолбэк (версия крейта) < 0.1.5 — бандл применяется
-        assert!(bundle_newer_than_running(&manifest, &exe));
+        let state = Some(state.path());
+        // без файла состояния: фолбэк (версия крейта) < 0.1.5 — бандл применяется
+        assert!(bundle_newer_than_running(&manifest, state, &exe));
         // hotfix 0.1.99 уже применён — бандл 0.1.5 не трогаем
-        fixture(dir.path(), "zn-launcher.exe.lversion", b"0.1.99");
-        assert!(!bundle_newer_than_running(&manifest, &exe));
+        fixture(state.unwrap(), LAUNCHER_VERSION_FILE, b"0.1.99");
+        assert!(!bundle_newer_than_running(&manifest, state, &exe));
         // равные версии — не применяем
-        fixture(dir.path(), "zn-launcher.exe.lversion", b"0.1.5");
-        assert!(!bundle_newer_than_running(&manifest, &exe));
+        fixture(state.unwrap(), LAUNCHER_VERSION_FILE, b"0.1.5");
+        assert!(!bundle_newer_than_running(&manifest, state, &exe));
     }
 
     #[test]
     fn update_self_noop_when_up_to_date() {
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"build");
         let layout = Layout::new(dir.path());
         let manifest = test_manifest("0.1.0"); // версия крейта в тестах
                                                // ни бандл, ни лаунчер-блок не новее — тишина
         assert_eq!(
-            update_self(&manifest, &layout, &exe, &mut |_| {}),
+            update_self(&manifest, &layout, Some(state.path()), &exe, &mut |_| {}),
             SelfUpdateStep::UpToDate
         );
     }
@@ -289,12 +365,19 @@ mod tests {
     #[test]
     fn update_self_applies_bundle_then_records_version() {
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"running-old");
         let layout = Layout::new(dir.path());
         // бандл из «игры» — свежий лаунчер
         fixture(dir.path(), "game/zn-launcher.exe", b"bundled-fresh");
         let manifest = test_manifest("9.9.9");
-        let step = update_self(&manifest, &layout, &exe, &mut |_| {});
+        let step = update_self(
+            &manifest,
+            &layout,
+            Some(state.path()),
+            &exe,
+            &mut |_| {},
+        );
         assert_eq!(
             step,
             SelfUpdateStep::Updated {
@@ -302,22 +385,26 @@ mod tests {
                 to: "9.9.9".to_string()
             }
         );
-        // exe подменён, sidecar записан
+        // exe подменён, версия записана в профиль (не рядом с exe!)
         assert_eq!(fs::read(&exe).unwrap(), b"bundled-fresh");
         assert_eq!(
-            fs::read_to_string(sidecar_path(&exe)).unwrap().trim(),
+            fs::read_to_string(version_state_path(state.path()))
+                .unwrap()
+                .trim(),
             "9.9.9"
         );
+        assert!(!legacy_sidecar_path(&exe).exists());
     }
 
     #[test]
     fn update_self_skips_stale_launcher_asset() {
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"running");
         let layout = Layout::new(dir.path());
-        // хотфис 0.1.99 уже применён (sidecar); релиз и ассет старее —
+        // хотфис 0.1.99 уже применён; релиз и ассет старее —
         // ничего не качаем и не откатываем
-        fixture(dir.path(), "zn-launcher.exe.lversion", b"0.1.99");
+        fixture(state.path(), LAUNCHER_VERSION_FILE, b"0.1.99");
         let mut manifest = test_manifest("0.1.5");
         manifest.launcher = Some(LauncherAsset {
             version: "0.1.6".into(),
@@ -326,7 +413,13 @@ mod tests {
             size: 1,
         });
         assert_eq!(
-            update_self(&manifest, &layout, &exe, &mut |_| {}),
+            update_self(
+                &manifest,
+                &layout,
+                Some(state.path()),
+                &exe,
+                &mut |_| {}
+            ),
             SelfUpdateStep::UpToDate
         );
         assert_eq!(fs::read(&exe).unwrap(), b"running");
@@ -338,6 +431,7 @@ mod tests {
         let size = bytes.len() as u64;
         let url = serve_bytes(bytes);
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"running-old");
         let layout = Layout::new(dir.path());
         // версия релиза = версия крейта (бандл не новее) — работает ассет
@@ -348,7 +442,13 @@ mod tests {
             sha256: hash,
             size,
         });
-        let step = update_self(&manifest, &layout, &exe, &mut |_| {});
+        let step = update_self(
+            &manifest,
+            &layout,
+            Some(state.path()),
+            &exe,
+            &mut |_| {},
+        );
         assert_eq!(
             step,
             SelfUpdateStep::Updated {
@@ -356,12 +456,15 @@ mod tests {
                 to: "9.9.9".to_string()
             }
         );
-        // exe подменён скачанным, sidecar записан, staging убран
+        // exe подменён скачанным, версия в профиле, staging убран
         assert_eq!(fs::read(&exe).unwrap(), b"fake-launcher fresh");
         assert_eq!(
-            fs::read_to_string(sidecar_path(&exe)).unwrap().trim(),
+            fs::read_to_string(version_state_path(state.path()))
+                .unwrap()
+                .trim(),
             "9.9.9"
         );
+        assert!(!legacy_sidecar_path(&exe).exists());
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -373,6 +476,7 @@ mod tests {
     #[test]
     fn update_self_launcher_asset_download_failure_is_soft() {
         let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let exe = fixture(dir.path(), "zn-launcher.exe", b"running");
         let layout = Layout::new(dir.path());
         let mut manifest = test_manifest(env!("CARGO_PKG_VERSION"));
@@ -383,7 +487,13 @@ mod tests {
             sha256: sha(),
             size: 1,
         });
-        let step = update_self(&manifest, &layout, &exe, &mut |_| {});
+        let step = update_self(
+            &manifest,
+            &layout,
+            Some(state.path()),
+            &exe,
+            &mut |_| {},
+        );
         assert!(
             matches!(step, SelfUpdateStep::Failed { .. }),
             "ожидали мягкий провал, получили {step:?}"

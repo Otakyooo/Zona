@@ -136,7 +136,8 @@ impl LauncherApp {
         };
         let (work_tx, commands) = channel();
         let (messages, work_rx) = channel();
-        thread::spawn(move || worker(commands, messages));
+        let state_dir = config_home.clone();
+        thread::spawn(move || worker(commands, messages, state_dir));
         let dev_mode = run::is_dev_mode(&std::env::current_exe().unwrap_or_default());
         // Самообновление (M6-7): уборка .old от прошлой подмены.
         if let Ok(exe) = std::env::current_exe() {
@@ -579,7 +580,7 @@ impl eframe::App for LauncherApp {
 }
 
 /// Воркер: единственное место, где UI ходит по сети и в ФС установки.
-fn worker(commands: Receiver<WorkCmd>, messages: Sender<WorkMsg>) {
+fn worker(commands: Receiver<WorkCmd>, messages: Sender<WorkMsg>, state_dir: PathBuf) {
     while let Ok(WorkCmd::Install {
         layout,
         channel,
@@ -620,6 +621,7 @@ fn worker(commands: Receiver<WorkCmd>, messages: Sender<WorkMsg>) {
             (Some(exe), Some(manifest)) => launcher_outcome(launcher_update::update_self(
                 manifest,
                 &layout,
+                Some(state_dir.as_path()),
                 exe,
                 &mut progress,
             )),
