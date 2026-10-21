@@ -4,8 +4,8 @@ on:
   push:
     branches: [main, dev]
   pull_request:
-  # Полный прогон (тесты + сборка) — вручную: квота Actions ограничена
-  # (2000 мин/мес), каждый пуш с полным прогоном стоил ~80 минут.
+  # Полный прогон (тесты + сборка) — вручную или на PR: репо публичный
+  # (минуты безлимитны), но полный прогон на каждый пуш — ~40 минут.
   workflow_dispatch:
 
 env:
@@ -22,6 +22,8 @@ jobs:
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --all --check
+      - name: Install ALSA dev (zn-audio/kira на Linux)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
