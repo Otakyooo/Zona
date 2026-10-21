@@ -41,6 +41,31 @@ jobs:
           # publish-dev-build.ps1: 0.1.<run_number> или build_override).
           # Уходит в LAUNCHER_VERSION лаунчера (option_env!).
           ZONA_LAUNCHER_VERSION: "0.1.${{ inputs.build_override || github.run_number }}"
+      # Код-подпись (Azure Artifact Signing / Trusted Signing). Шак пропущен,
+      # пока секреты не заданы: Defender ловит неподписанные бинарники как
+      # Trojan:Script/Sabsik.FL.A!ml (известный FP, см. memory 2026-10-21).
+      # Для активации: секреты AZURE_TENANT_ID / AZURE_CLIENT_ID /
+      # AZURE_CLIENT_SECRET / AZURE_CODE_SIGNING_ENDPOINT (например
+      # https://eus.codesigning.azure.net/) / AZURE_CODE_SIGNING_ACCOUNT /
+      # AZURE_CODE_SIGNING_PROFILE + роль Artifact Signing Certificate
+      # Profile Signer на аккаунте.
+      - name: Sign Windows binaries (Azure Artifact Signing)
+        if: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CODE_SIGNING_ACCOUNT != '' }}
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.AZURE_CODE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CODE_SIGNING_PROFILE }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          files: |
+            ${{ github.workspace }}\target\release\zn-launcher.exe
+            ${{ github.workspace }}\target\release\zn-client.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: ZONA dev build
       - name: Pack client zip
         run: |
           $stage = "dist/zona-dev-win-x64"
