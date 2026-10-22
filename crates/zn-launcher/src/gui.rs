@@ -98,6 +98,9 @@ pub struct LauncherApp {
     manifest: Option<Manifest>,
     /// Можно жать «Играть» (есть установленная сборка).
     game_ready: bool,
+    /// Авто-проверка обновлений на старте уже уходила воркеру (фикс серой
+    /// «Играть»: без неё `game_ready` не поднимался до ручного «Обновить»).
+    checked_once: bool,
     play_after_install: bool,
     /// «Играть гостем» после установки (M5-3): запуск без аккаунта.
     guest_after_install: bool,
@@ -164,6 +167,7 @@ impl LauncherApp {
             password_field,
             manifest: None,
             game_ready: false,
+            checked_once: false,
             play_after_install: false,
             guest_after_install: false,
             move_prompt: None,
@@ -363,33 +367,21 @@ impl LauncherApp {
                     self.phase = Phase::Ready;
                     let mut playable = false;
                     match &report {
-                        Ok(UpdateReport::NoUpdate { installed }) => {
-                            self.status = format!("Установлена актуальная версия {installed}");
-                            self.error = None;
-                            playable = true;
-                        }
-                        Ok(UpdateReport::Installed { version }) => {
-                            self.status = format!("Установлена версия {version}");
-                            self.error = None;
-                            playable = true;
-                        }
-                        Ok(UpdateReport::Updated { from, to }) => {
-                            self.status = format!("Обновлено: {from} → {to}");
-                            self.error = None;
-                            playable = true;
-                        }
-                        Ok(UpdateReport::DevMode) => {
-                            self.status = "dev-режим: клиент из рабочего дерева".to_string();
-                        }
-                        Ok(UpdateReport::Failed { keep, reason }) => {
-                            self.error = Some(format!("Обновление не удалось: {reason}"));
-                            match keep {
-                                Some(version) => {
-                                    self.status = format!("Установлена версия {version} (старая)");
-                                    playable = true;
+                        Ok(report) => {
+                            self.status = status_line(report);
+                            self.error = match report {
+                                UpdateReport::Failed { reason, .. } => {
+                                    Some(format!("Обновление не удалось: {reason}"))
                                 }
-                                None => self.status = "Игра не установлена".to_string(),
-                            }
+                                _ => None,
+                            };
+                            playable = matches!(
+                                report,
+                                UpdateReport::NoUpdate { .. }
+                                    | UpdateReport::Installed { .. }
+                                    | UpdateReport::Updated { .. }
+                                    | UpdateReport::Failed { keep: Some(_), .. }
+                            );
                         }
                         Err(error) => {
                             self.status = "Ошибка".to_string();
@@ -519,7 +511,7 @@ impl LauncherApp {
                 let working = matches!(self.phase, Phase::Working);
                 if ui
                     .add_enabled(
-                        !working && self.game_ready && !self.dev_mode,
+                        play_enabled(working, self.game_ready, self.dev_mode),
                         egui::Button::new("Играть"),
                     )
                     .clicked()
@@ -531,7 +523,7 @@ impl LauncherApp {
                 }
                 if ui
                     .add_enabled(
-                        !working && self.game_ready && !self.dev_mode,
+                        play_enabled(working, self.game_ready, self.dev_mode),
                         egui::Button::new("Играть гостем"),
                     )
                     .on_hover_text("Вход без аккаунта: склад и кошелёк не сохраняются")
@@ -631,7 +623,9 @@ impl LauncherApp {
         let new_root = Layout::new(dir).root().to_path_buf();
         self.layout = Some(Layout::new(new_root.clone()));
         self.game_ready = false;
-        self.status = "Папка изменена — установите игру заново".to_string();
+        // Авто-проверка взводится заново: новая папка ещё без сборки.
+        self.checked_once = false;
+        self.status = "Папка изменена — устанавливаем игру".to_string();
         if let Some(old) = old {
             if old != new_root && old.exists() {
                 self.move_prompt = Some(old);
@@ -684,6 +678,14 @@ impl Default for LauncherApp {
 impl eframe::App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_worker(ui.ctx());
+        // Авто-проверка обновлений на старте: без неё «Играть» оставалась
+        // серой (game_ready поднимался только ответом воркера), и зайти
+        // можно было лишь после ручного «Обновить». В dev-режиме проверка
+        // не нужна — клиент берётся из рабочего дерева.
+        if !self.dev_mode && !self.checked_once && matches!(self.phase, Phase::Ready) {
+            self.checked_once = true;
+            self.request_install(false);
+        }
         if matches!(self.phase, Phase::FirstRun { .. }) {
             self.draw_first_run(ui);
         } else {
@@ -764,6 +766,13 @@ pub fn server_choice<'a>(
     }
 }
 
+/// Можно жать «Играть»/«Играть гостем»: воркер не занят, а сборка либо
+/// установлена (ответ проверки), либо dev-режим — клиент из рабочего дерева
+/// (фикс M5-3: в dev кнопка была навсегда серой).
+pub fn play_enabled(working: bool, game_ready: bool, dev_mode: bool) -> bool {
+    !working && (game_ready || dev_mode)
+}
+
 /// Текст статуса для строки состояния (чистая логика — для тестов).
 pub fn status_line(report: &UpdateReport) -> String {
     match report {
@@ -820,5 +829,17 @@ mod tests {
             reason: "сеть".into()
         })
         .contains("Не установлено"));
+    }
+
+    #[test]
+    fn play_button_needs_installed_build_or_dev_mode() {
+        // Обычный режим: кнопка серая, пока проверка не подтвердила сборку.
+        assert!(!play_enabled(false, false, false));
+        assert!(play_enabled(false, true, false));
+        // Воркер занят (проверка/установка на старте) — кнопка недоступна.
+        assert!(!play_enabled(true, true, false));
+        // dev-режим: клиент из рабочего дерева — играть можно сразу.
+        assert!(play_enabled(false, false, true));
+        assert!(!play_enabled(true, false, true));
     }
 }

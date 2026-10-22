@@ -1,11 +1,14 @@
-//! Кастомный gizmo редактора: 3 цветные оси, экранный drag оси (translate)
-//! и горизонтальный drag (rotate). Чистая логика отделена от painter'а.
+//! Кастомный gizmo редактора: 3 цветные оси, экранный drag оси (translate),
+//! горизонтальный drag (rotate) и радиальный drag (scale). Чистая логика
+//! отделена от painter'а.
 
 use glam::{Vec2, Vec3};
 
 pub const GIZMO_LENGTH_PX: f32 = 80.0;
 pub const GIZMO_HIT_TOLERANCE_PX: f32 = 8.0;
 pub const GIZMO_ROTATE_SPEED: f32 = 0.01;
+/// Множитель масштаба за пиксель горизонтального drag (scale-режим).
+pub const GIZMO_SCALE_SPEED: f32 = 0.005;
 
 /// Цвета осей gizmo (egui-палитра): X — красный, Y — зелёный, Z — синий.
 pub const AXIS_COLORS: [(u8, u8, u8); 3] = [(229, 83, 75), (126, 200, 80), (86, 149, 229)];
@@ -15,6 +18,8 @@ pub enum GizmoMode {
     #[default]
     Translate,
     Rotate,
+    /// Uniform-масштаб (G4): drag вправо/влево — крупнее/мельче.
+    Scale,
 }
 
 impl GizmoMode {
@@ -22,13 +27,16 @@ impl GizmoMode {
         match self {
             Self::Translate => "перемещение",
             Self::Rotate => "вращение",
+            Self::Scale => "масштаб",
         }
     }
 
-    pub fn toggled(&self) -> Self {
+    /// Следующий режим по циклу G: перемещение → вращение → масштаб.
+    pub fn next(&self) -> Self {
         match self {
             Self::Translate => Self::Rotate,
-            Self::Rotate => Self::Translate,
+            Self::Rotate => Self::Scale,
+            Self::Scale => Self::Translate,
         }
     }
 }
@@ -55,7 +63,7 @@ impl GizmoState {
     }
 
     pub fn toggle_mode(&mut self) {
-        self.mode = self.mode.toggled();
+        self.mode = self.mode.next();
         self.reset_yaw();
     }
 
@@ -72,8 +80,8 @@ impl GizmoState {
         cursor: Vec2,
     ) -> bool {
         self.last_cursor = Some(cursor);
-        if self.mode == GizmoMode::Rotate {
-            self.active = true; // вращение начинается от любого места у объекта
+        if matches!(self.mode, GizmoMode::Rotate | GizmoMode::Scale) {
+            self.active = true; // вращение/масштаб начинаются от любого места у объекта
             return true;
         }
         if let Some(axis) = pick_axis(camera, viewport_px, center, cursor) {
@@ -84,8 +92,8 @@ impl GizmoState {
         false
     }
 
-    /// Обновляет drag: returns мировое смещение (translate) и сбрасывает yaw-
-    /// дельту (rotate) или None при отсутствии активного drag.
+    /// Обновляет drag: returns мировое смещение (translate), дельту yaw
+    /// (rotate) или множитель масштаба (scale); None — drag не активен.
     pub fn update_drag(
         &mut self,
         camera: &zn_render::Camera,
@@ -112,6 +120,12 @@ impl GizmoState {
                 self.yaw += yaw_delta;
                 Some(GizmoDelta::Rotation(yaw_delta))
             }
+            GizmoMode::Scale => {
+                // Uniform: drag вправо — крупнее, влево — мельче. Множитель
+                // за кадр — серия кадров дает плавный рост.
+                let factor = 1.0 + delta_px.x * GIZMO_SCALE_SPEED;
+                Some(GizmoDelta::Scale(factor.max(0.01)))
+            }
         }
     }
 
@@ -130,6 +144,8 @@ impl GizmoState {
 pub enum GizmoDelta {
     Translation(Vec3),
     Rotation(f32),
+    /// Множитель масштаба за кадр (uniform).
+    Scale(f32),
 }
 
 /// Экранная позиция мировой точки (None — за камерой).
@@ -356,11 +372,41 @@ mod tests {
     }
 
     #[test]
-    fn gizmo_mode_toggles() {
+    fn gizmo_mode_cycles_through_three_modes() {
         let mut gizmo = GizmoState::new(GizmoMode::Translate);
         assert_eq!(gizmo.mode, GizmoMode::Translate);
         gizmo.toggle_mode();
         assert_eq!(gizmo.mode, GizmoMode::Rotate);
         assert_eq!(gizmo.mode.label(), "вращение");
+        gizmo.toggle_mode();
+        assert_eq!(gizmo.mode, GizmoMode::Scale);
+        assert_eq!(gizmo.mode.label(), "масштаб");
+        gizmo.toggle_mode();
+        assert_eq!(gizmo.mode, GizmoMode::Translate, "цикл замкнулся");
+    }
+
+    #[test]
+    fn gizmo_scale_drag_grows_and_shrinks() {
+        let camera = test_camera(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO);
+        let viewport = Vec2::new(1600.0, 900.0);
+        let center = Vec3::ZERO;
+        let mut gizmo = GizmoState::new(GizmoMode::Scale);
+
+        // Масштаб начинается от любого места у объекта, как вращение.
+        assert!(gizmo.begin_drag(&camera, viewport, center, Vec2::splat(800.0)));
+        let delta = gizmo.update_drag(&camera, viewport, center, Vec2::new(820.0, 800.0));
+        assert!(
+            matches!(delta, Some(GizmoDelta::Scale(factor)) if factor > 1.0),
+            "drag вправо — крупнее: {delta:?}"
+        );
+
+        // Возврат влево — мельче (множитель меньше единицы).
+        let delta = gizmo.update_drag(&camera, viewport, center, Vec2::new(780.0, 800.0));
+        assert!(
+            matches!(delta, Some(GizmoDelta::Scale(factor)) if factor < 1.0),
+            "drag влево — мельче: {delta:?}"
+        );
+        gizmo.end_drag();
+        assert!(!gizmo.is_dragging());
     }
 }

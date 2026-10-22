@@ -1,14 +1,15 @@
 //! История правок редактора (M4g‑G4a): undo/redo по объектам сцены.
 //!
 //! Модель — стопка команд; каждая команда — набор элементарных правок
-//! (замена/добавление/удаление объекта). Откат применяет «до» в обратном
-//! порядке, повтор — «после». Подряд идущие однотипные замены тех же
-//! объектов в пределах `COALESCE_WINDOW` склеиваются: перетаскивание
-//! DragValue или gizmo — одна команда истории, а не сотни кадровых правок.
+//! (замена/добавление/удаление объекта, замена атмосферы). Откат применяет
+//! «до» в обратном порядке, повтор — «после». Подряд идущие однотипные
+//! замены тех же объектов в пределах `COALESCE_WINDOW` склеиваются:
+//! перетаскивание DragValue или gizmo — одна команда истории, а не сотни
+//! кадровых правок.
 
 use std::time::{Duration, Instant};
 
-use zn_scene::{Scene, SceneObject};
+use zn_scene::{Scene, SceneEnvironment, SceneObject};
 
 /// Глубина истории (команд): старые вытесняются.
 pub const HISTORY_LIMIT: usize = 200;
@@ -35,6 +36,11 @@ pub enum SceneEdit {
         index: usize,
         object: Box<SceneObject>,
     },
+    /// Замена атмосферы сцены (G4): солнце, ambient, туман, небо.
+    Environment {
+        before: Box<SceneEnvironment>,
+        after: Box<SceneEnvironment>,
+    },
 }
 
 impl SceneEdit {
@@ -56,6 +62,7 @@ impl SceneEdit {
                     log::warn!("история: объект {index} уже удалён — повтор пропущен");
                 }
             }
+            Self::Environment { after, .. } => scene.environment = (**after).clone(),
         }
     }
 
@@ -77,6 +84,7 @@ impl SceneEdit {
                 let index = (*index).min(scene.objects.len());
                 scene.objects.insert(index, (**object).clone());
             }
+            Self::Environment { before, .. } => scene.environment = (**before).clone(),
         }
     }
 }
@@ -135,6 +143,21 @@ impl EditCommand {
         )
     }
 
+    /// Замена атмосферы сцены (G4): пресет или правка поля панели.
+    pub fn environment(
+        label: impl Into<String>,
+        before: &SceneEnvironment,
+        after: &SceneEnvironment,
+    ) -> Self {
+        Self::new(
+            label,
+            vec![SceneEdit::Environment {
+                before: Box::new(before.clone()),
+                after: Box::new(after.clone()),
+            }],
+        )
+    }
+
     /// Имя команды для меню «Отменить»/«Вернуть».
     pub fn label(&self) -> &str {
         &self.label
@@ -170,6 +193,12 @@ impl EditCommand {
                     before: before.clone(),
                     after: after.clone(),
                 }),
+                (SceneEdit::Environment { before, .. }, SceneEdit::Environment { after, .. }) => {
+                    merged.push(SceneEdit::Environment {
+                        before: before.clone(),
+                        after: after.clone(),
+                    })
+                }
                 _ => return false,
             }
         }
@@ -315,6 +344,32 @@ pub fn object_edit_label(before: &SceneObject, after: &SceneObject) -> String {
         "лут"
     } else {
         "объект"
+    };
+    label.to_string()
+}
+
+/// Имя правки атмосферы по первому изменившемуся полю — для меню «Отменить».
+pub fn environment_edit_label(before: &SceneEnvironment, after: &SceneEnvironment) -> String {
+    let label = if before.sun_direction != after.sun_direction {
+        "солнце (направление)"
+    } else if before.sun_color != after.sun_color {
+        "солнце (цвет)"
+    } else if before.sun_intensity != after.sun_intensity {
+        "солнце (яркость)"
+    } else if before.ambient_color != after.ambient_color {
+        "ambient (цвет)"
+    } else if before.ambient_intensity != after.ambient_intensity {
+        "ambient (яркость)"
+    } else if before.fog_color != after.fog_color {
+        "туман (цвет)"
+    } else if before.fog_density != after.fog_density {
+        "туман (плотность)"
+    } else if before.sky_top != after.sky_top {
+        "небо (зенит)"
+    } else if before.sky_horizon != after.sky_horizon {
+        "небо (горизонт)"
+    } else {
+        "атмосфера"
     };
     label.to_string()
 }
@@ -512,6 +567,108 @@ mod tests {
         assert_eq!(object_edit_label(&base, &uv), "текстура (UV)");
 
         assert_eq!(object_edit_label(&base, &base), "объект", "без правок");
+    }
+
+    fn foggy(environment: &SceneEnvironment) -> SceneEnvironment {
+        let mut after = environment.clone();
+        after.fog_density = 0.05;
+        after.fog_color = Vec3::new(0.5, 0.5, 0.5);
+        after
+    }
+
+    #[test]
+    fn environment_undo_and_redo_round_trip() {
+        let mut scene = Scene::new("тест");
+        let before = scene.environment.clone();
+        let after = foggy(&before);
+        scene.environment = after.clone();
+
+        let mut history = History::default();
+        let now = Instant::now();
+        history.push(EditCommand::environment("туман", &before, &after), now);
+
+        assert_eq!(history.undo_label(), Some("туман"));
+        let label = history.undo(&mut scene, now).expect("откат");
+        assert_eq!(label, "туман");
+        assert_eq!(scene.environment, before, "«до» восстановлено");
+        assert_eq!(scene.environment.fog_density, 0.0);
+
+        let label = history.redo(&mut scene, now).expect("повтор");
+        assert_eq!(label, "туман");
+        assert_eq!(scene.environment, after, "«после» вернулось");
+    }
+
+    #[test]
+    fn environment_changes_coalesce_like_drags() {
+        let mut scene = Scene::new("тест");
+        let mut history = History::default();
+        let start = Instant::now();
+
+        // Серия кадровых правок одного поля — как при перетаскивании DragValue.
+        let original = scene.environment.clone();
+        let mut environment = original.clone();
+        for (step, density) in [0.01_f32, 0.02, 0.03].iter().enumerate() {
+            let before = environment.clone();
+            environment.fog_density = *density;
+            scene.environment = environment.clone();
+            let now = start + Duration::from_millis(step as u64 * 100);
+            history.push(
+                EditCommand::environment("туман (плотность)", &before, &environment),
+                now,
+            );
+        }
+
+        assert_eq!(history.depth(), 1, "серия правок склеена");
+        history.undo(&mut scene, start).expect("откат");
+        assert_eq!(scene.environment, original, "вернулись к исходному");
+        history.redo(&mut scene, start).expect("повтор");
+        assert_eq!(scene.environment.fog_density, 0.03, "повторилась серия");
+    }
+
+    #[test]
+    fn different_environment_fields_do_not_merge() {
+        let scene = Scene::new("тест");
+        let mut history = History::default();
+        let now = Instant::now();
+        let base = scene.environment.clone();
+
+        let mut fog = base.clone();
+        fog.fog_density = 0.02;
+        history.push(
+            EditCommand::environment("туман (плотность)", &base, &fog),
+            now,
+        );
+
+        let mut sun = fog.clone();
+        sun.sun_intensity = 2.0;
+        history.push(
+            EditCommand::environment("солнце (яркость)", &fog, &sun),
+            now,
+        );
+
+        assert_eq!(history.depth(), 2, "разные поля — разные команды");
+    }
+
+    #[test]
+    fn environment_edit_label_names_field() {
+        let base = SceneEnvironment::default();
+        let mut sun = base.clone();
+        sun.sun_color = Vec3::new(1.0, 0.5, 0.2);
+        assert_eq!(environment_edit_label(&base, &sun), "солнце (цвет)");
+
+        let mut fog = base.clone();
+        fog.fog_density = 0.01;
+        assert_eq!(environment_edit_label(&base, &fog), "туман (плотность)");
+
+        let mut sky = base.clone();
+        sky.sky_top = Vec3::new(0.2, 0.3, 0.6);
+        assert_eq!(environment_edit_label(&base, &sky), "небо (зенит)");
+
+        assert_eq!(
+            environment_edit_label(&base, &base),
+            "атмосфера",
+            "без правок"
+        );
     }
 
     #[test]

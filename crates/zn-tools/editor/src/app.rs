@@ -12,10 +12,12 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowId;
 
 use zn_render::{Camera, DrawList, InstanceRaw, MaterialId, MaterialSpec, MeshId, Renderer};
-use zn_scene::{ColliderShape, Scene, SceneObject};
+use zn_scene::{ColliderShape, Scene, SceneEnvironment, SceneObject};
 
 use crate::gizmo::{self, GizmoDelta, GizmoMode, GizmoState};
-use crate::history::{object_edit_label, EditCommand, History, HISTORY_LIMIT};
+use crate::history::{
+    environment_edit_label, object_edit_label, EditCommand, History, HISTORY_LIMIT,
+};
 use crate::orbit::OrbitCamera;
 use crate::picking::{cursor_ray, pick_object, placement_point};
 
@@ -25,6 +27,8 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(350);
 const DOUBLE_CLICK_DISTANCE_PX: f32 = 4.0;
 const FLY_SPEED: f32 = 12.0;
 const PLACE_SCALE_DEFAULT: f32 = 1.0;
+/// Шаг привязки по умолчанию (G4), метры.
+const SNAP_DEFAULT: f32 = 0.5;
 
 /// Двойной клик: тот же участок экрана в пределах `DOUBLE_CLICK_INTERVAL`.
 fn is_double_click(last: Option<(Instant, Vec2)>, now: Instant, cursor: Vec2) -> bool {
@@ -80,6 +84,9 @@ pub struct EditorApp {
     asset_files: Vec<String>,
     place_scale: f32,
     place_color: [f32; 4],
+    /// Шаг привязки к сетке (G4), 0 — выключена. Округляется x/z; y не
+    /// трогаем — объекты стоят на поверхностях.
+    snap: f32,
     status: String,
     ctrl_down: bool,
 }
@@ -121,6 +128,7 @@ impl EditorApp {
             asset_files: Vec::new(),
             place_scale: PLACE_SCALE_DEFAULT,
             place_color: [0.55, 0.55, 0.6, 1.0],
+            snap: SNAP_DEFAULT,
             status: "готов".into(),
             ctrl_down: false,
         }
@@ -340,6 +348,7 @@ impl EditorApp {
             self.status = "нет поверхности под курсором".into();
             return;
         };
+        let point = snap_xz(point, self.snap);
         let object = SceneObject::new(point, scale, glam::Vec4::from_array(self.place_color))
             .with_asset(key.clone())
             .with_yaw(0.0);
@@ -349,6 +358,25 @@ impl EditorApp {
             .push(EditCommand::add(index, &object), Instant::now());
         self.selected = Some(index);
         self.status = format!("размещён объект {index} ({key})");
+    }
+
+    /// Дублирует выделенный объект (G4): клон встык за оригиналом, копия
+    /// становится выделенной — её сразу можно тащить gizmo или править.
+    fn duplicate_selected(&mut self) {
+        let Some(index) = self.selected else {
+            self.status = "нечего дублировать — выделите объект".into();
+            return;
+        };
+        let Some(object) = self.scene.objects.get(index) else {
+            return;
+        };
+        let copy = object.clone();
+        let insert_at = index + 1;
+        self.scene.objects.insert(insert_at, copy.clone());
+        self.history
+            .push(EditCommand::add(insert_at, &copy), Instant::now());
+        self.selected = Some(insert_at);
+        self.status = format!("объект {index} продублирован → {insert_at}");
     }
 
     fn delete_selected(&mut self) {
@@ -497,10 +525,16 @@ impl EditorApp {
             .update_drag(&self.camera, self.viewport_px(), center, cursor)
         {
             Some(GizmoDelta::Translation(translation)) => {
-                self.scene.objects[index].position += translation;
+                let object = &mut self.scene.objects[index];
+                object.position = snap_xz(object.position + translation, self.snap);
             }
             Some(GizmoDelta::Rotation(yaw_delta)) => {
                 self.scene.objects[index].yaw += yaw_delta;
+            }
+            Some(GizmoDelta::Scale(factor)) => {
+                // Uniform-масштаб: пропорции сохраняются, разумные пределы.
+                let scale = &mut self.scene.objects[index].scale;
+                *scale = (*scale * factor).clamp(Vec3::splat(0.01), Vec3::splat(100.0));
             }
             None => {}
         }
@@ -649,6 +683,9 @@ impl EditorApp {
                     if ui.button("Удалить").clicked() {
                         self.delete_selected();
                     }
+                    if ui.button("Дублировать").clicked() {
+                        self.duplicate_selected();
+                    }
                     if ui.button("Снять выделение").clicked() {
                         self.selected = None;
                     }
@@ -669,6 +706,30 @@ impl EditorApp {
                     let mut color = self.place_color;
                     if ui.color_edit_button_rgba_unmultiplied(&mut color).changed() {
                         self.place_color = color;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("привязка:");
+                    let mut snap = self.snap;
+                    egui::ComboBox::from_id_salt("snap")
+                        .selected_text(if snap > 0.0 {
+                            format!("{snap} м")
+                        } else {
+                            "выкл".to_string()
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut snap, 0.0, "выкл");
+                            for step in [0.25, 0.5, 1.0, 2.0] {
+                                ui.selectable_value(&mut snap, step, format!("{step} м"));
+                            }
+                        });
+                    if snap != self.snap {
+                        self.snap = snap;
+                        self.status = if snap > 0.0 {
+                            format!("привязка к сетке {snap} м")
+                        } else {
+                            "привязка выключена".into()
+                        };
                     }
                 });
 
@@ -707,275 +768,327 @@ impl EditorApp {
             .resizable(true)
             .show(&mut root, |ui| {
                 ui.label(RichText::new("Свойства").strong());
-                let Some(index) = self.selected else {
-                    ui.label(RichText::new("ничего не выделено").weak());
-                    return;
-                };
-                // Имена материалов импортированного ассета объекта — для комбо.
-                let asset_material_names: Vec<String> = self
-                    .scene
-                    .objects
-                    .get(index)
-                    .and_then(|object| object.asset.as_deref())
-                    .and_then(|key| self.assets.get(key))
-                    .map(|asset| {
-                        let mut names: Vec<String> = asset
-                            .materials
-                            .iter()
-                            .filter_map(|(name, _)| name.clone())
-                            .collect();
-                        names.sort();
-                        names.dedup();
-                        names
-                    })
-                    .unwrap_or_default();
-                let Some(object) = self.scene.objects.get_mut(index) else {
-                    return;
-                };
-                // Снимок «до» — правки за кадр сравниваются с ним и уходят
-                // в историю одной командой (серии DragValue склеиваются).
-                let before = object.clone();
-                ui.label(format!("Объект #{index}"));
+                // Свойства выделенного объекта и атмосфера сцены (G4) — в одной
+                // прокрутке: длинные панели больше не обрезаются по высоте.
+                egui::ScrollArea::vertical()
+                    .id_salt("properties-scroll")
+                    .show(ui, |ui| {
+                        if let Some(index) = self.selected {
+                            // Имена материалов импортированного ассета объекта — для комбо.
+                            let asset_material_names: Vec<String> = self
+                                .scene
+                                .objects
+                                .get(index)
+                                .and_then(|object| object.asset.as_deref())
+                                .and_then(|key| self.assets.get(key))
+                                .map(|asset| {
+                                    let mut names: Vec<String> = asset
+                                        .materials
+                                        .iter()
+                                        .filter_map(|(name, _)| name.clone())
+                                        .collect();
+                                    names.sort();
+                                    names.dedup();
+                                    names
+                                })
+                                .unwrap_or_default();
 
-                ui.horizontal(|ui| {
-                    ui.label("position");
-                    ui.add(
-                        egui::DragValue::new(&mut object.position.x)
-                            .speed(0.1)
-                            .prefix("x "),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut object.position.y)
-                            .speed(0.1)
-                            .prefix("y "),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut object.position.z)
-                            .speed(0.1)
-                            .prefix("z "),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("scale");
-                    ui.add(
-                        egui::DragValue::new(&mut object.scale.x)
-                            .speed(0.1)
-                            .range(0.01..=100.0)
-                            .prefix("x "),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut object.scale.y)
-                            .speed(0.1)
-                            .range(0.01..=100.0)
-                            .prefix("y "),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut object.scale.z)
-                            .speed(0.1)
-                            .range(0.01..=100.0)
-                            .prefix("z "),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("yaw");
-                    let mut yaw = object.yaw.to_degrees();
-                    if ui
-                        .add(egui::DragValue::new(&mut yaw).speed(1.0).suffix("°"))
-                        .changed()
-                    {
-                        object.yaw = yaw.to_radians();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("tint");
-                    let mut color = object.color.to_array();
-                    if ui.color_edit_button_rgba_unmultiplied(&mut color).changed() {
-                        object.color = glam::Vec4::from_array(color);
-                    }
-                });
+                            // Снимок «до» — правки за кадр сравниваются с ним и
+                            // уходят в историю одной командой (склейка по окну).
+                            let before = self.scene.objects.get(index).cloned();
+                            if let Some(object) = self.scene.objects.get_mut(index) {
+                                ui.label(format!("Объект #{index}"));
 
-                let mut asset = object.asset.clone().unwrap_or_default();
-                if ui
-                    .horizontal(|ui| {
-                        ui.label("asset");
-                        ui.text_edit_singleline(&mut asset).changed()
-                    })
-                    .inner
-                {
-                    object.asset = if asset.is_empty() { None } else { Some(asset) };
-                }
-
-                ui.horizontal(|ui| {
-                    ui.label("material");
-                    let current = object.material.clone().unwrap_or_default();
-                    let mut material = current.clone();
-                    let edited = ui.text_edit_singleline(&mut material).changed();
-                    let mut picked = false;
-                    if !asset_material_names.is_empty() {
-                        // Имена материалов ассета — помимо ручного ввода.
-                        egui::ComboBox::from_id_salt("object-material")
-                            .selected_text("▾")
-                            .show_ui(ui, |ui| {
-                                if ui
-                                    .selectable_label(material.is_empty(), "<по мешу>")
-                                    .clicked()
-                                {
-                                    material.clear();
-                                    picked = true;
-                                }
-                                for name in &asset_material_names {
-                                    if ui.selectable_label(material == *name, name).clicked() {
-                                        material = name.clone();
-                                        picked = true;
+                                ui.horizontal(|ui| {
+                                    ui.label("position");
+                                    // Правка идёт по копии: при включённой
+                                    // привязке округляем x/z до сетки (G4).
+                                    let mut position = object.position;
+                                    let mut edited = false;
+                                    edited |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut position.x)
+                                                .speed(0.1)
+                                                .prefix("x "),
+                                        )
+                                        .changed();
+                                    edited |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut position.y)
+                                                .speed(0.1)
+                                                .prefix("y "),
+                                        )
+                                        .changed();
+                                    edited |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut position.z)
+                                                .speed(0.1)
+                                                .prefix("z "),
+                                        )
+                                        .changed();
+                                    if edited {
+                                        object.position = snap_xz(position, self.snap);
                                     }
-                                }
-                            });
-                    }
-                    if edited || picked {
-                        object.material = if material.is_empty() {
-                            None
-                        } else {
-                            Some(material)
-                        };
-                    }
-                });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("scale");
+                                    ui.add(
+                                        egui::DragValue::new(&mut object.scale.x)
+                                            .speed(0.1)
+                                            .range(0.01..=100.0)
+                                            .prefix("x "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(&mut object.scale.y)
+                                            .speed(0.1)
+                                            .range(0.01..=100.0)
+                                            .prefix("y "),
+                                    );
+                                    ui.add(
+                                        egui::DragValue::new(&mut object.scale.z)
+                                            .speed(0.1)
+                                            .range(0.01..=100.0)
+                                            .prefix("z "),
+                                    );
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("yaw");
+                                    let mut yaw = object.yaw.to_degrees();
+                                    if ui
+                                        .add(egui::DragValue::new(&mut yaw).speed(1.0).suffix("°"))
+                                        .changed()
+                                    {
+                                        object.yaw = yaw.to_radians();
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("tint");
+                                    let mut color = object.color.to_array();
+                                    if ui.color_edit_button_rgba_unmultiplied(&mut color).changed()
+                                    {
+                                        object.color = glam::Vec4::from_array(color);
+                                    }
+                                });
 
-                // Материал поверхности (M4g): текстура, тайлинг, факторы.
-                ui.separator();
-                ui.label(RichText::new("Материал поверхности").strong());
-                ui.horizontal(|ui| {
-                    ui.label("texture");
-                    let mut texture = object.texture.clone().unwrap_or_default();
-                    let mut picked = false;
-                    egui::ComboBox::from_id_salt("object-texture")
-                        .selected_text(if texture.is_empty() {
-                            "—".to_string()
-                        } else {
-                            texture.trim_start_matches("builtin://").to_string()
-                        })
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_label(texture.is_empty(), "—").clicked() {
-                                texture.clear();
-                                picked = true;
-                            }
-                            for name in zn_assets::BUILTIN_TEXTURE_NAMES {
-                                let key = zn_assets::builtin_key(name);
-                                if ui.selectable_label(texture == key, *name).clicked() {
-                                    texture = key;
-                                    picked = true;
+                                let mut asset = object.asset.clone().unwrap_or_default();
+                                if ui
+                                    .horizontal(|ui| {
+                                        ui.label("asset");
+                                        ui.text_edit_singleline(&mut asset).changed()
+                                    })
+                                    .inner
+                                {
+                                    object.asset =
+                                        if asset.is_empty() { None } else { Some(asset) };
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.label("material");
+                                    let current = object.material.clone().unwrap_or_default();
+                                    let mut material = current.clone();
+                                    let edited = ui.text_edit_singleline(&mut material).changed();
+                                    let mut picked = false;
+                                    if !asset_material_names.is_empty() {
+                                        // Имена материалов ассета — помимо ручного ввода.
+                                        egui::ComboBox::from_id_salt("object-material")
+                                            .selected_text("▾")
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        material.is_empty(),
+                                                        "<по мешу>",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    material.clear();
+                                                    picked = true;
+                                                }
+                                                for name in &asset_material_names {
+                                                    if ui
+                                                        .selectable_label(material == *name, name)
+                                                        .clicked()
+                                                    {
+                                                        material = name.clone();
+                                                        picked = true;
+                                                    }
+                                                }
+                                            });
+                                    }
+                                    if edited || picked {
+                                        object.material = if material.is_empty() {
+                                            None
+                                        } else {
+                                            Some(material)
+                                        };
+                                    }
+                                });
+
+                                // Материал поверхности (M4g): текстура, тайлинг, факторы.
+                                ui.separator();
+                                ui.label(RichText::new("Материал поверхности").strong());
+                                ui.horizontal(|ui| {
+                                    ui.label("texture");
+                                    let mut texture = object.texture.clone().unwrap_or_default();
+                                    let mut picked = false;
+                                    egui::ComboBox::from_id_salt("object-texture")
+                                        .selected_text(if texture.is_empty() {
+                                            "—".to_string()
+                                        } else {
+                                            texture.trim_start_matches("builtin://").to_string()
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            if ui
+                                                .selectable_label(texture.is_empty(), "—")
+                                                .clicked()
+                                            {
+                                                texture.clear();
+                                                picked = true;
+                                            }
+                                            for name in zn_assets::BUILTIN_TEXTURE_NAMES {
+                                                let key = zn_assets::builtin_key(name);
+                                                if ui
+                                                    .selectable_label(texture == key, *name)
+                                                    .clicked()
+                                                {
+                                                    texture = key;
+                                                    picked = true;
+                                                }
+                                            }
+                                        });
+                                    if picked {
+                                        let had_texture = object.texture.is_some();
+                                        object.texture = if texture.is_empty() {
+                                            None
+                                        } else {
+                                            Some(texture)
+                                        };
+                                        // Первая текстура на кубах — сразу мировые UV: без
+                                        // растяжения по граням (флажок ниже это переопределяет).
+                                        if !had_texture && object.texture.is_some() {
+                                            object.world_uv = true;
+                                        }
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("uv scale");
+                                    ui.add(
+                                        egui::DragValue::new(&mut object.uv_scale)
+                                            .speed(0.1)
+                                            .range(0.05..=64.0),
+                                    );
+                                    let mut world_uv = object.world_uv;
+                                    if ui.checkbox(&mut world_uv, "мировые UV").changed() {
+                                        object.world_uv = world_uv;
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("roughness");
+                                    let mut enabled = object.roughness.is_some();
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        object.roughness = if enabled { Some(0.85) } else { None };
+                                    }
+                                    if let Some(value) = object.roughness.as_mut() {
+                                        ui.add(
+                                            egui::DragValue::new(value)
+                                                .speed(0.01)
+                                                .range(0.0..=1.0),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("metallic");
+                                    let mut enabled = object.metallic.is_some();
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        object.metallic = if enabled { Some(0.0) } else { None };
+                                    }
+                                    if let Some(value) = object.metallic.as_mut() {
+                                        ui.add(
+                                            egui::DragValue::new(value)
+                                                .speed(0.01)
+                                                .range(0.0..=1.0),
+                                        );
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("emissive");
+                                    let mut enabled = object.emissive.is_some();
+                                    if ui.checkbox(&mut enabled, "").changed() {
+                                        object.emissive = if enabled {
+                                            Some(Vec3::new(0.8, 0.7, 0.4))
+                                        } else {
+                                            None
+                                        };
+                                    }
+                                    if let Some(value) = object.emissive.as_mut() {
+                                        let mut color = [value.x, value.y, value.z];
+                                        if ui.color_edit_button_rgb(&mut color).changed() {
+                                            *value = Vec3::from_array(color);
+                                        }
+                                    }
+                                });
+                                if object.has_material_overrides() {
+                                    ui.label(RichText::new("персональный материал (M4g)").weak());
+                                }
+                                ui.separator();
+
+                                let mut collider = object.collider;
+                                egui::ComboBox::from_id_salt("collider")
+                                    .selected_text(
+                                        object
+                                            .collider
+                                            .map(|shape| shape.as_str())
+                                            .unwrap_or("по умолчанию (box)"),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut collider,
+                                            None,
+                                            "по умолчанию (box)",
+                                        );
+                                        for shape in [
+                                            ColliderShape::Box,
+                                            ColliderShape::Cylinder,
+                                            ColliderShape::Sphere,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut collider,
+                                                Some(shape),
+                                                shape.as_str(),
+                                            );
+                                        }
+                                    });
+                                if collider != object.collider {
+                                    object.collider = collider;
+                                }
+
+                                let mut solid = object.solid;
+                                if ui.checkbox(&mut solid, "solid").changed() {
+                                    object.solid = solid;
                                 }
                             }
-                        });
-                    if picked {
-                        let had_texture = object.texture.is_some();
-                        object.texture = if texture.is_empty() {
-                            None
+                            // Итог правок за кадр — команда истории (склейка по окну).
+                            if let (Some(before), Some(after)) =
+                                (before, self.scene.objects.get(index))
+                            {
+                                if before != *after {
+                                    let label = object_edit_label(&before, after);
+                                    self.history.push(
+                                        EditCommand::change(label, index, &before, after),
+                                        Instant::now(),
+                                    );
+                                }
+                            }
                         } else {
-                            Some(texture)
-                        };
-                        // Первая текстура на кубах — сразу мировые UV: без
-                        // растяжения по граням (флажок ниже это переопределяет).
-                        if !had_texture && object.texture.is_some() {
-                            object.world_uv = true;
+                            ui.label(RichText::new("ничего не выделено").weak());
                         }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("uv scale");
-                    ui.add(
-                        egui::DragValue::new(&mut object.uv_scale)
-                            .speed(0.1)
-                            .range(0.05..=64.0),
-                    );
-                    let mut world_uv = object.world_uv;
-                    if ui.checkbox(&mut world_uv, "мировые UV").changed() {
-                        object.world_uv = world_uv;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("roughness");
-                    let mut enabled = object.roughness.is_some();
-                    if ui.checkbox(&mut enabled, "").changed() {
-                        object.roughness = if enabled { Some(0.85) } else { None };
-                    }
-                    if let Some(value) = object.roughness.as_mut() {
-                        ui.add(egui::DragValue::new(value).speed(0.01).range(0.0..=1.0));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("metallic");
-                    let mut enabled = object.metallic.is_some();
-                    if ui.checkbox(&mut enabled, "").changed() {
-                        object.metallic = if enabled { Some(0.0) } else { None };
-                    }
-                    if let Some(value) = object.metallic.as_mut() {
-                        ui.add(egui::DragValue::new(value).speed(0.01).range(0.0..=1.0));
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("emissive");
-                    let mut enabled = object.emissive.is_some();
-                    if ui.checkbox(&mut enabled, "").changed() {
-                        object.emissive = if enabled {
-                            Some(Vec3::new(0.8, 0.7, 0.4))
-                        } else {
-                            None
-                        };
-                    }
-                    if let Some(value) = object.emissive.as_mut() {
-                        let mut color = [value.x, value.y, value.z];
-                        if ui.color_edit_button_rgb(&mut color).changed() {
-                            *value = Vec3::from_array(color);
-                        }
-                    }
-                });
-                if object.has_material_overrides() {
-                    ui.label(RichText::new("персональный материал (M4g)").weak());
-                }
-                ui.separator();
-
-                let mut collider = object.collider;
-                egui::ComboBox::from_id_salt("collider")
-                    .selected_text(
-                        object
-                            .collider
-                            .map(|shape| shape.as_str())
-                            .unwrap_or("по умолчанию (box)"),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut collider, None, "по умолчанию (box)");
-                        for shape in [
-                            ColliderShape::Box,
-                            ColliderShape::Cylinder,
-                            ColliderShape::Sphere,
-                        ] {
-                            ui.selectable_value(&mut collider, Some(shape), shape.as_str());
-                        }
+                        ui.separator();
+                        self.draw_environment(ui);
                     });
-                if collider != object.collider {
-                    object.collider = collider;
-                }
-
-                let mut solid = object.solid;
-                if ui.checkbox(&mut solid, "solid").changed() {
-                    object.solid = solid;
-                }
-
-                // Итог правок за кадр — команда истории (склейка по окну).
-                if let Some(after) = self.scene.objects.get(index) {
-                    if before != *after {
-                        let label = object_edit_label(&before, after);
-                        self.history.push(
-                            EditCommand::change(label, index, &before, after),
-                            Instant::now(),
-                        );
-                    }
-                }
             });
 
         egui::Panel::bottom("hints").resizable(false).show(&mut root, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("ЛКМ-драг: орбита · ЛКМ-клик: выделить · ПКМ-драг: панорама · Space+WASD: полёт · колесо: зум · G: gizmo · Del: удалить · Ctrl+Z/Ctrl+Y: отменить/повторить · Ctrl+S: сохранить");
+                ui.label("ЛКМ-драг: орбита · ЛКМ-клик: выделить · ПКМ-драг: панорама · Space+WASD: полёт · колесо: зум · G: gizmo · Del: удалить · Ctrl+D: дублировать · Ctrl+Z/Ctrl+Y: отменить/повторить · Ctrl+S: сохранить");
             });
         });
 
@@ -1003,6 +1116,129 @@ impl EditorApp {
                 }
             });
     }
+
+    /// Панель атмосферы (G4): солнце, ambient, туман, небо. Правки уходят в
+    /// историю одной командой (серии DragValue склеиваются по окну), превью
+    /// живое — `set_atmosphere` вызывается каждый кадр отрисовки.
+    fn draw_environment(&mut self, ui: &mut egui::Ui) {
+        let before = self.scene.environment.clone();
+        ui.label(RichText::new("Атмосфера").strong());
+        ui.horizontal_wrapped(|ui| {
+            for (preset, label) in [
+                ("clear", "ясный день"),
+                ("dust", "пыльная мгла"),
+                ("underground", "подземка"),
+                ("overcast", "пасмурно"),
+            ] {
+                if ui.small_button(label).clicked() {
+                    if let Some(environment) = environment_preset(preset) {
+                        self.scene.environment = environment;
+                        self.status = format!("атмосфера: {label}");
+                    }
+                }
+            }
+            if ui.small_button("сброс").clicked() {
+                self.scene.environment = SceneEnvironment::default();
+                self.status = "атмосфера: по умолчанию".into();
+            }
+        });
+
+        {
+            let environment = &mut self.scene.environment;
+            ui.label(RichText::new("Солнце").weak());
+            ui.horizontal(|ui| {
+                ui.label("направление");
+                ui.add(
+                    egui::DragValue::new(&mut environment.sun_direction.x)
+                        .speed(0.01)
+                        .range(-1.0..=1.0)
+                        .prefix("x "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut environment.sun_direction.y)
+                        .speed(0.01)
+                        .range(-1.0..=1.0)
+                        .prefix("y "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut environment.sun_direction.z)
+                        .speed(0.01)
+                        .range(-1.0..=1.0)
+                        .prefix("z "),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("цвет");
+                let mut color = environment.sun_color.to_array();
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    environment.sun_color = Vec3::from_array(color);
+                }
+                ui.label("яркость");
+                ui.add(
+                    egui::DragValue::new(&mut environment.sun_intensity)
+                        .speed(0.05)
+                        .range(0.0..=4.0),
+                );
+            });
+
+            ui.label(RichText::new("Ambient").weak());
+            ui.horizontal(|ui| {
+                ui.label("цвет");
+                let mut color = environment.ambient_color.to_array();
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    environment.ambient_color = Vec3::from_array(color);
+                }
+                ui.label("яркость");
+                ui.add(
+                    egui::DragValue::new(&mut environment.ambient_intensity)
+                        .speed(0.05)
+                        .range(0.0..=4.0),
+                );
+            });
+
+            ui.label(RichText::new("Туман").weak());
+            ui.horizontal(|ui| {
+                ui.label("цвет");
+                let mut color = environment.fog_color.to_array();
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    environment.fog_color = Vec3::from_array(color);
+                }
+                ui.label("плотность");
+                ui.add(
+                    egui::DragValue::new(&mut environment.fog_density)
+                        .speed(0.002)
+                        .range(0.0..=0.2),
+                );
+            });
+
+            ui.label(RichText::new("Небо").weak());
+            ui.horizontal(|ui| {
+                ui.label("зенит");
+                let mut color = environment.sky_top.to_array();
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    environment.sky_top = Vec3::from_array(color);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("горизонт");
+                let mut color = environment.sky_horizon.to_array();
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    environment.sky_horizon = Vec3::from_array(color);
+                }
+            });
+        }
+
+        // Итог правок за кадр — команда истории (склейка серий по окну).
+        let after = self.scene.environment.clone();
+        if before != after {
+            let label = environment_edit_label(&before, &after);
+            self.history.push(
+                EditCommand::environment(label, &before, &after),
+                Instant::now(),
+            );
+        }
+    }
+
     fn build_draw_list(&self) -> DrawList {
         let renderer = self.renderer();
         let mut list = DrawList::new();
@@ -1255,6 +1491,7 @@ impl ApplicationHandler for EditorApp {
                         }
                         KeyCode::KeyZ if self.ctrl_down => self.undo_last(),
                         KeyCode::KeyY if self.ctrl_down => self.redo_last(),
+                        KeyCode::KeyD if self.ctrl_down => self.duplicate_selected(),
                         KeyCode::Delete | KeyCode::Backspace => self.delete_selected(),
                         KeyCode::Escape => {
                             self.selected = None;
@@ -1389,6 +1626,19 @@ impl EditorApp {
 
 // --- помощники отрисовки/геометрии ------------------------------------------
 
+/// Привязка к сетке (G4): округление x/z до шага `snap` (0 — выключена).
+/// y не трогаем: объекты стоят на поверхностях, высоту задаёт placement.
+fn snap_xz(point: Vec3, snap: f32) -> Vec3 {
+    if snap <= 0.0 {
+        return point;
+    }
+    Vec3::new(
+        (point.x / snap).round() * snap,
+        point.y,
+        (point.z / snap).round() * snap,
+    )
+}
+
 fn scene_bounds(object: &SceneObject) -> zn_assets::Bounds {
     let (min, max) = object.bounds();
     zn_assets::Bounds { min, max }
@@ -1440,6 +1690,63 @@ fn draw_selection_outline(
     }
 }
 
+/// Пресеты атмосферы (G4) — настроения встроенных локаций: быстрый старт
+/// дизайна новой сцены без ручной подгонки девяти полей. Значения зеркалят
+/// `SceneEnvironment` встроенных сцен (`zn_scene::Scene::base` и др.).
+fn environment_preset(name: &str) -> Option<SceneEnvironment> {
+    Some(match name {
+        // База: ясный день, синее небо, слабая дымка.
+        "clear" => SceneEnvironment {
+            sun_direction: Vec3::new(-0.35, 0.75, 0.45),
+            sun_color: Vec3::new(1.0, 0.95, 0.86),
+            sun_intensity: 1.1,
+            ambient_color: Vec3::new(0.28, 0.30, 0.36),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.60, 0.66, 0.75),
+            fog_density: 0.006,
+            sky_top: Vec3::new(0.12, 0.26, 0.55),
+            sky_horizon: Vec3::new(0.60, 0.70, 0.80),
+        },
+        // Свалка: низкое пыльное солнце, рыжая мгла, тяжёлый туман.
+        "dust" => SceneEnvironment {
+            sun_direction: Vec3::new(-0.25, 0.62, 0.50),
+            sun_color: Vec3::new(1.0, 0.88, 0.68),
+            sun_intensity: 0.8,
+            ambient_color: Vec3::new(0.30, 0.27, 0.22),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.50, 0.44, 0.35),
+            fog_density: 0.020,
+            sky_top: Vec3::new(0.30, 0.29, 0.26),
+            sky_horizon: Vec3::new(0.60, 0.54, 0.44),
+        },
+        // Подземка: холодный полумрак, плотный тёмный туман коридоров.
+        "underground" => SceneEnvironment {
+            sun_direction: Vec3::new(0.0, 1.0, 0.0),
+            sun_color: Vec3::new(0.70, 0.78, 0.95),
+            sun_intensity: 0.24,
+            ambient_color: Vec3::new(0.22, 0.24, 0.29),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.04, 0.05, 0.07),
+            fog_density: 0.035,
+            sky_top: Vec3::new(0.004, 0.005, 0.009),
+            sky_horizon: Vec3::new(0.02, 0.025, 0.04),
+        },
+        // Пасмурный день: мягкое солнце, серая мгла.
+        "overcast" => SceneEnvironment {
+            sun_direction: Vec3::new(0.4, 0.8, 0.3),
+            sun_color: Vec3::new(1.0, 0.95, 0.85),
+            sun_intensity: 0.9,
+            ambient_color: Vec3::new(0.24, 0.25, 0.28),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.62, 0.63, 0.60),
+            fog_density: 0.010,
+            sky_top: Vec3::new(0.35, 0.42, 0.52),
+            sky_horizon: Vec3::new(0.68, 0.68, 0.66),
+        },
+        _ => return None,
+    })
+}
+
 fn draw_gizmo(
     painter: &egui::Painter,
     camera: &Camera,
@@ -1469,6 +1776,16 @@ fn draw_gizmo(
             Stroke::new(1.5, Color32::from_rgb(200, 200, 200)),
         );
     }
+    if mode == gizmo::GizmoMode::Scale {
+        // Квадрат в центре — метка масштаба (оси те же, что у перемещения).
+        let half = gizmo::GIZMO_LENGTH_PX * 0.25;
+        painter.rect_stroke(
+            egui::Rect::from_center_size(start, egui::vec2(half * 2.0, half * 2.0)),
+            2.0,
+            Stroke::new(1.5, Color32::from_rgb(220, 200, 120)),
+            egui::StrokeKind::Middle,
+        );
+    }
 }
 
 fn material_images<'a>(
@@ -1488,6 +1805,71 @@ fn material_images<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec4;
+
+    #[test]
+    fn snap_rounds_xz_and_keeps_height() {
+        let point = Vec3::new(0.3, 1.7, -0.6);
+        assert_eq!(
+            snap_xz(point, 0.5),
+            Vec3::new(0.5, 1.7, -0.5),
+            "x/z округлены, y не тронут"
+        );
+        assert_eq!(snap_xz(point, 0.0), point, "выкл — без изменений");
+        assert_eq!(
+            snap_xz(Vec3::new(-0.3, 0.0, -1.2), 1.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            "отрицательные координаты округляются к ближайшему узлу"
+        );
+    }
+
+    #[test]
+    fn duplicate_inserts_copy_after_original() {
+        let mut scene = Scene::new("тест");
+        scene.add(SceneObject::new(Vec3::ZERO, Vec3::ONE, Vec4::ONE));
+        scene.add(SceneObject::new(
+            Vec3::new(5.0, 0.0, 0.0),
+            Vec3::ONE,
+            Vec4::ONE,
+        ));
+        let mut app = EditorApp::new(scene, None, PathBuf::from("game/content"));
+        app.selected = Some(0);
+
+        app.duplicate_selected();
+        assert_eq!(app.scene.len(), 3, "копия добавлена");
+        assert_eq!(app.selected, Some(1), "копия выделена");
+        assert_eq!(app.scene.objects[1].position, Vec3::ZERO, "клон встык");
+        assert_eq!(app.scene.objects[2].position.x, 5.0, "хвост сдвинут");
+        assert_eq!(app.history.depth(), 1, "одна команда истории");
+
+        // Откат убирает копию, хвост возвращается на место.
+        app.undo_last();
+        assert_eq!(app.scene.len(), 2);
+        assert_eq!(app.scene.objects[1].position.x, 5.0);
+    }
+
+    #[test]
+    fn environment_presets_mirror_builtin_locations() {
+        // Пресеты панели атмосферы (G4) — те же настроения, что у встроенных
+        // сцен: правки пресета не должны расходиться с локациями.
+        assert_eq!(
+            environment_preset("clear"),
+            Some(zn_scene::Scene::base().environment)
+        );
+        assert_eq!(
+            environment_preset("dust"),
+            Some(zn_scene::Scene::svalka().environment)
+        );
+        assert_eq!(
+            environment_preset("underground"),
+            Some(zn_scene::Scene::podzemka().environment)
+        );
+        assert_eq!(
+            environment_preset("overcast"),
+            Some(zn_scene::Scene::demo_zone().environment)
+        );
+        assert!(environment_preset("такого нет").is_none());
+    }
 
     #[test]
     fn double_click_requires_recent_same_spot() {
