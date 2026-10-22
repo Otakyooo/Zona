@@ -8,9 +8,10 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::Instant;
 
 use zn_net::{
-    decode_message, encode_message, BoltNet, ClientInput, CorpseNet, GameEvent, GroundItemNet,
-    InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason, StashAction,
-    CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL, PROTOCOL_VERSION,
+    decode_message, encode_message, AuthHello, BaseActionKind, BoltNet, ClientInput, CorpseNet,
+    GameEvent, GroundItemNet, InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason,
+    StashAction, CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL,
+    PROTOCOL_VERSION,
 };
 
 /// События для приложения, извлечённые из входящих пакетов.
@@ -22,6 +23,8 @@ pub enum NetEvent {
         spawn: [f32; 3],
         /// Локация игрока (id из `LocationRegistry`, M4d).
         location: u8,
+        /// Аккаунт создан этим подключением (M5) — уведомление в HUD.
+        account_created: bool,
     },
     Reject(RejectReason),
     Snapshot {
@@ -58,6 +61,18 @@ pub enum NetEvent {
     StashUpdate {
         items: Vec<ItemStackNet>,
     },
+    /// Состояние базы владельцу (M5-2): открытая станция (или `None` —
+    /// панель закрыта), кошелёк, уровни станций и офферы торговца.
+    BaseUpdate {
+        station: Option<u8>,
+        wallet: u32,
+        facilities: [u8; 3],
+        offers: Vec<ItemStackNet>,
+    },
+    /// Уведомление базы (M5-2): отказ или итог действия станции.
+    BaseNotice {
+        text: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,9 +91,9 @@ pub struct NetClient {
     content_hash: u64,
     items_hash: u64,
     name: String,
-    /// Профиль игрока (M4d-2): ключ персистентного склада. `None` — склад
-    /// живёт только в памяти сессии сервера.
-    profile: Option<String>,
+    /// Аккаунт игрока (M5): имя + дайджест пароля. `None` — гостевой вход
+    /// (склад живёт только в памяти сессии сервера).
+    auth: Option<AuthHello>,
     status: NetStatus,
     last_hello: Option<Instant>,
     last_ping: Option<Instant>,
@@ -98,7 +113,7 @@ impl NetClient {
         content_hash: u64,
         items_hash: u64,
         name: &str,
-        profile: Option<String>,
+        auth: Option<AuthHello>,
     ) -> io::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_nonblocking(true)?;
@@ -113,7 +128,7 @@ impl NetClient {
             content_hash,
             items_hash,
             name: name.to_string(),
-            profile,
+            auth,
             status: NetStatus::Connecting,
             last_hello: None,
             last_ping: None,
@@ -128,6 +143,11 @@ impl NetClient {
 
     pub fn status(&self) -> NetStatus {
         self.status
+    }
+
+    /// Локальный адрес сокета клиента (куда серверу отвечать; диагностика).
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
     }
 
     pub fn rtt_ms(&self) -> Option<f32> {
@@ -218,6 +238,26 @@ impl NetClient {
         }
     }
 
+    /// Отправляет взаимодействие со станцией базы (M5-2) с тем же повтором.
+    pub fn send_base_interact(&mut self, tick: u64, station: u8) {
+        if self.status != NetStatus::Connected {
+            return;
+        }
+        for _ in 0..INPUT_REDUNDANCY {
+            self.send(&Message::BaseInteract { tick, station });
+        }
+    }
+
+    /// Отправляет действие в панели станции базы (M5-2) с тем же повтором.
+    pub fn send_base_action(&mut self, tick: u64, action: BaseActionKind) {
+        if self.status != NetStatus::Connected {
+            return;
+        }
+        for _ in 0..INPUT_REDUNDANCY {
+            self.send(&Message::BaseAction { tick, action });
+        }
+    }
+
     fn poll_timers(&mut self, now: Instant) {
         match self.status {
             NetStatus::Connecting => {
@@ -231,7 +271,7 @@ impl NetClient {
                         content_hash: self.content_hash,
                         items_hash: self.items_hash,
                         name: self.name.clone(),
-                        profile: self.profile.clone(),
+                        auth: self.auth.clone(),
                     };
                     self.send(&hello);
                 }
@@ -307,6 +347,7 @@ impl NetClient {
                 server_tick,
                 spawn,
                 location,
+                account_created,
             } => {
                 if self.status == NetStatus::Connecting {
                     log::info!(
@@ -323,6 +364,7 @@ impl NetClient {
                     server_tick,
                     spawn,
                     location,
+                    account_created,
                 })
             }
             Message::ServerReject { reason } => {
@@ -386,6 +428,28 @@ impl NetClient {
                     return None;
                 }
                 Some(NetEvent::StashUpdate { items })
+            }
+            Message::BaseUpdate {
+                station,
+                wallet,
+                facilities,
+                offers,
+            } => {
+                if self.status != NetStatus::Connected {
+                    return None;
+                }
+                Some(NetEvent::BaseUpdate {
+                    station,
+                    wallet,
+                    facilities,
+                    offers,
+                })
+            }
+            Message::BaseNotice { text } => {
+                if self.status != NetStatus::Connected {
+                    return None;
+                }
+                Some(NetEvent::BaseNotice { text })
             }
             Message::Pong { nonce, .. } => {
                 if let Some((pending_nonce, sent_at)) = self.pending_ping {
@@ -478,6 +542,7 @@ mod tests {
                 server_tick: 10,
                 spawn: [0.0, 0.0, 14.0],
                 location: 0,
+                account_created: false,
             },
         );
         let events = client.poll(Instant::now());
@@ -500,7 +565,10 @@ mod tests {
             0x42,
             0x77,
             "Сталкер",
-            None,
+            Some(AuthHello {
+                account: "stalker-1".to_string(),
+                password_digest: zn_net::password_digest("hunter2"),
+            }),
         )
         .unwrap();
         let t0 = Instant::now();
@@ -513,13 +581,19 @@ mod tests {
                 content_hash,
                 items_hash,
                 name,
-                profile,
+                auth,
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(content_hash, 0x42);
                 assert_eq!(items_hash, 0x77);
                 assert_eq!(name, "Сталкер");
-                assert_eq!(profile, None);
+                let auth = auth.expect("аккаунт в Hello");
+                assert_eq!(auth.account, "stalker-1");
+                assert_eq!(
+                    auth.password_digest,
+                    zn_net::password_digest("hunter2"),
+                    "дайджест совпадает с функцией протокола"
+                );
             }
             other => panic!("ожидался ClientHello, получили {}", other.kind()),
         }
@@ -528,7 +602,7 @@ mod tests {
         client.poll(t0 + HELLO_RESEND_INTERVAL - Duration::from_millis(100));
         assert!(drain(&server).is_none());
 
-        // После — повтор.
+        // После — повтор (с тем же аккаунтом).
         client.poll(t0 + HELLO_RESEND_INTERVAL + Duration::from_millis(1));
         assert!(matches!(
             expect_message(&server).0,
@@ -544,6 +618,7 @@ mod tests {
                 server_tick: 7,
                 spawn: [1.0, 2.0, 3.0],
                 location: 1,
+                account_created: true,
             },
         );
         let events = client.poll(t0 + HELLO_RESEND_INTERVAL + Duration::from_millis(2));
@@ -554,6 +629,7 @@ mod tests {
                 server_tick: 7,
                 spawn: [1.0, 2.0, 3.0],
                 location: 1,
+                account_created: true,
             }]
         );
         assert_eq!(client.status(), NetStatus::Connected);
@@ -601,6 +677,70 @@ mod tests {
             events,
             vec![NetEvent::StashUpdate {
                 items: vec![ItemStackNet { item: 2, count: 7 }],
+            }]
+        );
+    }
+
+    #[test]
+    fn base_interact_and_actions_repeat_and_pass_through() {
+        let server = loopback_server();
+        let (mut client, addr) = connected_client(&server);
+
+        // E у станции и действия панели уходят с повтором (дедуп по tick).
+        client.send_base_interact(11, 2);
+        for _ in 0..INPUT_REDUNDANCY {
+            match expect_message(&server).0 {
+                Message::BaseInteract { tick, station } => {
+                    assert_eq!(tick, 11);
+                    assert_eq!(station, 2);
+                }
+                other => panic!("ожидался BaseInteract, получили {}", other.kind()),
+            }
+        }
+
+        client.send_base_action(12, BaseActionKind::Buy { offer: 1 });
+        for _ in 0..INPUT_REDUNDANCY {
+            match expect_message(&server).0 {
+                Message::BaseAction { tick, action } => {
+                    assert_eq!(tick, 12);
+                    assert_eq!(action, BaseActionKind::Buy { offer: 1 });
+                }
+                other => panic!("ожидался BaseAction, получили {}", other.kind()),
+            }
+        }
+
+        // Ответы базы доходят до приложения событиями.
+        send_to(
+            &server,
+            addr,
+            &Message::BaseUpdate {
+                station: Some(0),
+                wallet: 700,
+                facilities: [1, 0, 0],
+                offers: vec![ItemStackNet { item: 3, count: 30 }],
+            },
+        );
+        assert_eq!(
+            client.poll(Instant::now()),
+            vec![NetEvent::BaseUpdate {
+                station: Some(0),
+                wallet: 700,
+                facilities: [1, 0, 0],
+                offers: vec![ItemStackNet { item: 3, count: 30 }],
+            }]
+        );
+
+        send_to(
+            &server,
+            addr,
+            &Message::BaseNotice {
+                text: "не хватает RU".to_string(),
+            },
+        );
+        assert_eq!(
+            client.poll(Instant::now()),
+            vec![NetEvent::BaseNotice {
+                text: "не хватает RU".to_string(),
             }]
         );
     }
@@ -746,6 +886,45 @@ mod tests {
         assert_eq!(
             client.status(),
             NetStatus::Rejected(RejectReason::ContentMismatch)
+        );
+
+        // Ни Hello, ни инпуты, ни прощание наружу не уходят.
+        client.send_inputs(&[ClientInput::new(0)]);
+        client.send_bye();
+        client.poll(t0 + Duration::from_secs(30));
+        assert!(drain(&server).is_none());
+    }
+
+    #[test]
+    fn auth_failed_stops_outgoing_traffic() {
+        let server = loopback_server();
+        let mut client = NetClient::connect(
+            &server.local_addr().unwrap().to_string(),
+            0,
+            0,
+            "Тест",
+            Some(AuthHello {
+                account: "stalker-1".to_string(),
+                password_digest: zn_net::password_digest("wrong"),
+            }),
+        )
+        .unwrap();
+        let t0 = Instant::now();
+        client.poll(t0);
+        let (_, addr) = expect_message(&server);
+
+        send_to(
+            &server,
+            addr,
+            &Message::ServerReject {
+                reason: RejectReason::AuthFailed,
+            },
+        );
+        let events = client.poll(t0 + Duration::from_millis(10));
+        assert_eq!(events, vec![NetEvent::Reject(RejectReason::AuthFailed)]);
+        assert_eq!(
+            client.status(),
+            NetStatus::Rejected(RejectReason::AuthFailed)
         );
 
         // Ни Hello, ни инпуты, ни прощание наружу не уходят.

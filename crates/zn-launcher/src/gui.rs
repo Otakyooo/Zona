@@ -92,10 +92,15 @@ pub struct LauncherApp {
     status: String,
     error: Option<String>,
     server_field: String,
+    /// Логин/пароль аккаунта (M5-1): уходят в клиент через ZN_PROFILE/ZN_PASSWORD.
+    account_field: String,
+    password_field: String,
     manifest: Option<Manifest>,
     /// Можно жать «Играть» (есть установленная сборка).
     game_ready: bool,
     play_after_install: bool,
+    /// «Играть гостем» после установки (M5-3): запуск без аккаунта.
+    guest_after_install: bool,
     /// Куда переносим игру — ждём подтверждения удаления старой папки.
     move_prompt: Option<PathBuf>,
     work_tx: Sender<WorkCmd>,
@@ -122,6 +127,8 @@ impl LauncherApp {
             ),
         };
         let server_field = config.server_override.clone().unwrap_or_default();
+        let account_field = config.account.clone().unwrap_or_default();
+        let password_field = config.password.clone().unwrap_or_default();
         let layout = config
             .install_dir
             .as_ref()
@@ -153,9 +160,12 @@ impl LauncherApp {
             status: load_error.unwrap_or_else(|| "Готов к проверке обновлений".to_string()),
             error: None,
             server_field,
+            account_field,
+            password_field,
             manifest: None,
             game_ready: false,
             play_after_install: false,
+            guest_after_install: false,
             move_prompt: None,
             work_tx,
             work_rx,
@@ -166,8 +176,19 @@ impl LauncherApp {
     fn save_config(&mut self) {
         self.config.server_override =
             Some(self.server_field.trim().to_string()).filter(|value| !value.is_empty());
+        self.config.account =
+            Some(self.account_field.trim().to_string()).filter(|value| !value.is_empty());
+        self.config.password = Some(self.password_field.clone()).filter(|value| !value.is_empty());
         if let Err(error) = self.config.save(&self.config_path) {
             self.error = Some(format!("не удалось сохранить конфиг: {error}"));
+        }
+    }
+
+    /// Логин/пароль из полей GUI (M5-1).
+    fn credentials(&self) -> run::Credentials<'_> {
+        run::Credentials {
+            account: Some(self.account_field.as_str()),
+            password: Some(self.password_field.as_str()),
         }
     }
 
@@ -192,14 +213,27 @@ impl LauncherApp {
     }
 
     fn play(&mut self) {
+        self.launch(false);
+    }
+
+    /// «Играть гостем» (M5-3): запуск без аккаунта — поля и сохранённый
+    /// конфиг не трогаем, креды пустые (ZN_PASSWORD снимается с процесса).
+    fn play_guest(&mut self) {
+        self.launch(true);
+    }
+
+    /// Запуск клиента. `guest` — без аккаунта: конфиг не перезаписывается.
+    fn launch(&mut self, guest: bool) {
         if self.dev_mode {
-            self.launch_dev();
+            self.launch_dev(guest);
             return;
         }
         let Some(layout) = self.layout.clone() else {
             return;
         };
-        self.save_config();
+        if !guest {
+            self.save_config();
+        }
         let server = server_choice(
             &self.server_field,
             self.manifest
@@ -211,22 +245,50 @@ impl LauncherApp {
         } else {
             self.error = None;
         }
-        let mut command = run::client_command(&layout.client_exe(), &layout.content_dir(), &server);
+        let credentials = if guest {
+            run::Credentials::default()
+        } else {
+            self.credentials()
+        };
+        let mut command = run::client_command(
+            &layout.client_exe(),
+            &layout.content_dir(),
+            &server,
+            &credentials,
+        );
         match command.spawn() {
-            Ok(_) => self.status = "Игра запущена".to_string(),
+            Ok(_) => {
+                self.status = if guest {
+                    "Игра запущена (гость)".to_string()
+                } else {
+                    "Игра запущена".to_string()
+                }
+            }
             Err(error) => self.error = Some(format!("не удалось запустить игру: {error}")),
         }
     }
 
-    fn launch_dev(&mut self) {
+    fn launch_dev(&mut self, guest: bool) {
         let exe = std::env::current_exe().unwrap_or_default();
         let Some(content) = run::dev_content_root(&exe) else {
             self.error = Some("dev-режим: не найден game/content".to_string());
             return;
         };
         let client = run::resolve_client_exe(&exe, true);
-        match run::client_command(&client, &content, &ServerChoice::default()).spawn() {
-            Ok(_) => self.status = "dev-клиент запущен".to_string(),
+        let credentials = if guest {
+            run::Credentials::default()
+        } else {
+            self.credentials()
+        };
+        match run::client_command(&client, &content, &ServerChoice::default(), &credentials).spawn()
+        {
+            Ok(_) => {
+                self.status = if guest {
+                    "dev-клиент запущен (гость)".to_string()
+                } else {
+                    "dev-клиент запущен".to_string()
+                }
+            }
             Err(error) => {
                 self.error = Some(format!("dev-режим: не удалось запустить клиента: {error}"))
             }
@@ -349,7 +411,13 @@ impl LauncherApp {
                     }
                     if self.play_after_install && playable {
                         self.play_after_install = false;
-                        self.play();
+                        let guest = self.guest_after_install;
+                        self.guest_after_install = false;
+                        if guest {
+                            self.play_guest();
+                        } else {
+                            self.play();
+                        }
                     }
                 }
             }
@@ -458,6 +526,20 @@ impl LauncherApp {
                 {
                     // ensure update → spawn
                     self.play_after_install = true;
+                    self.guest_after_install = false;
+                    self.request_install(false);
+                }
+                if ui
+                    .add_enabled(
+                        !working && self.game_ready && !self.dev_mode,
+                        egui::Button::new("Играть гостем"),
+                    )
+                    .on_hover_text("Вход без аккаунта: склад и кошелёк не сохраняются")
+                    .clicked()
+                {
+                    // Гость (M5-3): ensure update → spawn без аккаунта.
+                    self.play_after_install = true;
+                    self.guest_after_install = true;
                     self.request_install(false);
                 }
                 if ui
@@ -502,6 +584,37 @@ impl LauncherApp {
                 .and_then(|m| m.server_addr.as_deref())
             {
                 ui.small(format!("Сервер из манифеста: {addr}"));
+            }
+
+            // Аккаунт (M5-1): логин + пароль. Без пароля клиент — гость:
+            // играет онлайн, но склад между рейдами не сохраняется.
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Аккаунт:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.account_field)
+                        .hint_text("логин (пусто — гость)")
+                        .desired_width(200.0),
+                );
+                if response.lost_focus() {
+                    self.save_config();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Пароль:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.password_field)
+                        .password(true)
+                        .hint_text("пароль (пусто — гость)")
+                        .desired_width(200.0),
+                );
+                if response.lost_focus() {
+                    self.save_config();
+                }
+            });
+            if self.account_field.trim().is_empty() || self.password_field.is_empty() {
+                ui.small("Без аккаунта склад базы не сохраняется между рейдами");
+                ui.small("Можно играть без аккаунта — кнопка «Играть гостем»");
             }
         });
         self.draw_move_prompt(ui);

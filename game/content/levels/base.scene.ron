@@ -171,6 +171,42 @@
     bubbles: [],
     bubble_arrivals: [],
     extractions: [],
+    stations: [
+        (
+            position: (-8.0, 0.0, 10.0),
+            radius: 2.0,
+            kind: Trader,
+            label: "Торговец",
+            offers: [
+                (item: "medkit", count: 1),
+                (item: "bandage", count: 1),
+                (item: "ammo_545", count: 30),
+                (item: "canned_food", count: 1),
+                (item: "vodka", count: 1),
+            ],
+        ),
+        (
+            position: (8.0, 0.0, 14.0),
+            radius: 2.0,
+            kind: Medpost,
+            label: "Медпункт",
+            offers: [],
+        ),
+        (
+            position: (-8.0, 0.0, 18.0),
+            radius: 2.0,
+            kind: Workbench,
+            label: "Верстак",
+            offers: [],
+        ),
+        (
+            position: (8.0, 0.0, 18.0),
+            radius: 2.0,
+            kind: Safe,
+            label: "Сейф",
+            offers: [],
+        ),
+    ],
     environment: (
         sun_direction: (-0.35, 0.75, 0.45),
         sun_color: (1.0, 0.95, 0.86),

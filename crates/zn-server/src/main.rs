@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use zn_content::ItemCatalog;
 use zn_net::{MAX_PLAYERS_PER_SESSION, PROTOCOL_VERSION, SIMULATION_HZ, SNAPSHOT_HZ};
 use zn_scene::{LocationId, LocationRegistry, Scene};
-use zn_server::{Session, SessionConfig, DEFAULT_PORT, STASH_FILE_DEFAULT};
+use zn_server::{Database, Session, SessionConfig, DB_FILE_DEFAULT, DEFAULT_PORT};
 
 const USAGE: &str = "usage: zn-server [--bind <addr>] [--port <port>] [--max-players <n>] \
 [--content-root <dir>] [--level <name>] [--sim-latency-ms <ms>] [--sim-loss-pct <0..100>] \
-[--stash-file <path>|--no-stash]\n\
+[--db-file <path>|--no-db] [--auth-required]\n\
+режимы: без флагов — сервер; --backup-db <path> --out <file> — копия БД аккаунтов и выход\n\
 без --level поднимается мир локаций из <content-root>/locations.ron";
 
 #[derive(Clone, Debug)]
@@ -24,8 +25,14 @@ struct ServerArgs {
     level: Option<String>,
     sim_latency_ms: u64,
     sim_loss_pct: f32,
-    /// Файл персиста стэшей профилей (M4d-2). `None` — персист выключен.
-    stash_file: Option<PathBuf>,
+    /// Файл БД аккаунтов (M5). `None` — персист выключен.
+    db_file: Option<PathBuf>,
+    /// Гостевой вход запрещён (M5-3): клиент без аккаунта получает отказ.
+    auth_required: bool,
+    /// Одноразовый режим (M5-3): исходная БД для копии.
+    backup_db: Option<PathBuf>,
+    /// Одноразовый режим (M5-3): файл-приёмник копии.
+    backup_out: Option<PathBuf>,
 }
 
 impl Default for ServerArgs {
@@ -38,7 +45,10 @@ impl Default for ServerArgs {
             level: None,
             sim_latency_ms: 0,
             sim_loss_pct: 0.0,
-            stash_file: Some(PathBuf::from(STASH_FILE_DEFAULT)),
+            db_file: Some(PathBuf::from(DB_FILE_DEFAULT)),
+            auth_required: false,
+            backup_db: None,
+            backup_out: None,
         }
     }
 }
@@ -49,7 +59,8 @@ fn parse_args() -> Result<ServerArgs, String> {
     while let Some(flag) = iter.next() {
         match flag.as_str() {
             // Флаги без значения.
-            "--no-stash" => args.stash_file = None,
+            "--no-db" => args.db_file = None,
+            "--auth-required" => args.auth_required = true,
             // Флаги со значением.
             _ => {
                 let value = iter
@@ -79,7 +90,18 @@ fn parse_args() -> Result<ServerArgs, String> {
                             .parse()
                             .map_err(|_| format!("invalid sim loss pct: {value}"))?
                     }
-                    "--stash-file" => args.stash_file = Some(PathBuf::from(value)),
+                    "--db-file" => args.db_file = Some(PathBuf::from(value)),
+                    "--backup-db" => args.backup_db = Some(PathBuf::from(value)),
+                    "--out" => args.backup_out = Some(PathBuf::from(value)),
+                    // Легаси (M4d-2): стэши переехали в БД (M5). Рядом с БД
+                    // ищется stashes.ron и мигрируется автоматически, поэтому
+                    // старый флаг только предупреждает — юнит не сломается.
+                    "--stash-file" => {
+                        log::warn!(
+                            "--stash-file устарел (M5): персист переехал в БД, \
+                             используйте --db-file; миграция стэшей автоматическая"
+                        );
+                    }
                     other => return Err(format!("unknown flag: {other}")),
                 }
             }
@@ -87,6 +109,9 @@ fn parse_args() -> Result<ServerArgs, String> {
     }
     args.max_players = args.max_players.clamp(1, MAX_PLAYERS_PER_SESSION);
     args.sim_loss_pct = args.sim_loss_pct.clamp(0.0, 100.0);
+    if args.backup_db.is_some() != args.backup_out.is_some() {
+        return Err("--backup-db и --out задаются вместе".to_string());
+    }
     Ok(args)
 }
 
@@ -102,12 +127,28 @@ fn main() {
         }
     };
 
+    // Одноразовый режим (M5-3): копия БД аккаунтов и выход — без контента,
+    // без листена. Можно запускать на живой БД (SQLite Backup API читает
+    // согласованный снапшот).
+    if let (Some(source), Some(out)) = (args.backup_db.clone(), args.backup_out.clone()) {
+        let code = run_backup(&source, &out);
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+    if args.auth_required && args.db_file.is_none() {
+        log::warn!(
+            "--auth-required при --no-db: аккаунты проверяются, но не сохраняются \
+             между перезапусками"
+        );
+    }
+
     let catalog = load_catalog(&args.content_root);
     let config = SessionConfig {
         max_players: args.max_players,
         out_latency: Duration::from_millis(args.sim_latency_ms),
         out_loss_pct: args.sim_loss_pct,
-        stash_file: args.stash_file.clone(),
+        db_file: args.db_file.clone(),
+        auth_required: args.auth_required,
         ..SessionConfig::default()
     };
 
@@ -174,6 +215,7 @@ protocol={PROTOCOL_VERSION}, max_players={}, локаций: {}",
                 "quit" | "exit" => running = false,
                 "status" | "" => print_status(&mut session, &args, boot),
                 "list" => print_clients(&mut session),
+                "accounts" => print_accounts(&session),
                 "spawn" => {
                     let id = session.debug_spawn();
                     println!("spawned player {id}");
@@ -193,8 +235,8 @@ protocol={PROTOCOL_VERSION}, max_players={}, локаций: {}",
                         print_bubbles(&session, other.trim_start_matches("bubbles"));
                     } else {
                         println!(
-                            "unknown command: {other} (try: status, list, kick <id>, spawn, \
-loot <id> <item> <count>, tp <id> <location>, bubbles [<location>], quit)"
+                            "unknown command: {other} (try: status, list, accounts, kick <id>, \
+spawn, loot <id> <item> <count>, tp <id> <location>, bubbles [<location>], quit)"
                         );
                     }
                 }
@@ -210,8 +252,8 @@ loot <id> <item> <count>, tp <id> <location>, bubbles [<location>], quit)"
     }
 
     println!("server stopped after {} ticks", session.tick());
-    // Персист стэшей (M4d-2): склад профилей переживает остановку сервера.
-    session.flush_stashes();
+    // Персист аккаунтов (M5): склады переживают остановку сервера.
+    session.flush_accounts();
     let _ = std::io::stdout().flush();
 }
 
@@ -424,4 +466,90 @@ fn print_clients(session: &mut Session) {
         );
     }
     let _ = std::io::stdout().flush();
+}
+
+/// Одноразовый режим `--backup-db <path> --out <file>` (M5-3): онлайн-копия
+/// БД аккаунтов через SQLite Backup API. Запускается на живой БД — читается
+/// согласованный снапшот, запись в приёмник блокируется на время копии.
+/// Код выхода: 0 — успех, 1 — ошибка.
+fn run_backup(source: &Path, out: &Path) -> i32 {
+    if !source.exists() {
+        eprintln!("error: бд не найдена: {}", source.display());
+        return 1;
+    }
+    match Database::open(source) {
+        Ok(db) => match db.backup_to(out) {
+            Ok(()) => {
+                println!("backup: {} → {}", source.display(), out.display());
+                0
+            }
+            Err(error) => {
+                eprintln!(
+                    "error: backup {} → {}: {error}",
+                    source.display(),
+                    out.display()
+                );
+                1
+            }
+        },
+        Err(error) => {
+            eprintln!("error: не удалось открыть бд {}: {error}", source.display());
+            1
+        }
+    }
+}
+
+/// Консоль `accounts` (M5-3): сводка аккаунтов — кошелёк, уровни станций,
+/// предметы в стэше, claim-статус, последний вход (UTC).
+fn print_accounts(session: &Session) {
+    let accounts = session.account_summaries();
+    if accounts.is_empty() {
+        println!("аккаунтов нет (персист выключен или бд пуста)");
+        return;
+    }
+    for account in accounts {
+        println!(
+            "  id={} name='{}' {} wallet={} RU станции={:?} стэш={} последний вход={}",
+            account.id,
+            account.name,
+            if account.claimed {
+                "пароль"
+            } else {
+                "без пароля"
+            },
+            account.wallet,
+            account.facilities,
+            account.stash_items,
+            format_unix_utc(account.last_seen_at),
+        );
+    }
+    let _ = std::io::stdout().flush();
+}
+
+/// Unix-секунды → `YYYY-MM-DD HH:MM:SSZ` (UTC). Алгоритм civil_from_days
+/// Хиннанта — без внешних зависимостей, корректен для всех лет после 1970.
+fn format_unix_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let of_day = secs.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
+        of_day / 3600,
+        (of_day % 3600) / 60,
+        of_day % 60,
+    )
+}
+
+/// Дней от 1970-01-01 → (год, месяц, день) по григорианскому календарю.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }

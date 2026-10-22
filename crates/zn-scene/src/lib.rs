@@ -293,6 +293,79 @@ impl SceneExtraction {
     }
 }
 
+/// Тип станции базы (M5-2).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StationKind {
+    /// Торговец: продажа лута по `value_rub`, покупка офферов по `value×2`.
+    Trader,
+    /// Верстак: +10 % сохраняемой добычи за уровень (к `percent` круга).
+    Workbench,
+    /// Медпункт: реген HP игрокам на базе, сила — уровень.
+    Medpost,
+    /// Сейф: доля лута, спасённая со трупа при смерти, — уровень.
+    Safe,
+}
+
+/// Оффер торговца (M5-2): предмет каталога по ключу и количество в партии.
+/// Сервер резолвит ключ в индекс каталога при старте (сцена не знает индексов).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneOffer {
+    /// Ключ предмета в `items.ron`.
+    pub item: String,
+    /// Сколько штук в одной покупке.
+    #[serde(default = "default_offer_count")]
+    pub count: u32,
+}
+
+fn default_offer_count() -> u32 {
+    1
+}
+
+/// Станция базы (M5-2): круг радиуса `radius` вокруг `position`; E внутри —
+/// взаимодействие (`BaseInteract`). У торговца — офферы; у верстака/медпункта/
+/// сейфа — только вид и уровень из `facilities` аккаунта (не в сцене).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneStation {
+    /// Якорь круга на полу.
+    pub position: Vec3,
+    pub radius: f32,
+    pub kind: StationKind,
+    /// Подпись для UI («Торговец», «Верстак», «Медпункт», «Сейф»).
+    #[serde(default)]
+    pub label: String,
+    /// Офферы торговца; у остальных станций пусто.
+    #[serde(default)]
+    pub offers: Vec<SceneOffer>,
+}
+
+impl SceneStation {
+    pub fn new(position: Vec3, radius: f32, kind: StationKind) -> Self {
+        Self {
+            position,
+            radius,
+            kind,
+            label: String::new(),
+            offers: Vec::new(),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    pub fn with_offers(mut self, offers: Vec<SceneOffer>) -> Self {
+        self.offers = offers;
+        self
+    }
+
+    /// Точка в зоне станции? Расстояние по горизонтали: зона — цилиндр.
+    pub fn contains(&self, point: Vec3) -> bool {
+        let delta = Vec3::new(point.x - self.position.x, 0.0, point.z - self.position.z);
+        delta.length_squared() <= self.radius * self.radius
+    }
+}
+
 /// Запись реестра локаций: название для UI и файл сцены без расширения
 /// (`levels/<scene>.scene.ron`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -698,6 +771,9 @@ pub struct Scene {
     /// Круги экстракции (M4d-2): вход сохраняет `percent` добычи в стэш.
     #[serde(default)]
     pub extractions: Vec<SceneExtraction>,
+    /// Станции базы (M5-2): торговец, верстак, медпункт, сейф.
+    #[serde(default)]
+    pub stations: Vec<SceneStation>,
     /// Атмосфера локации (M4g): солнце, ambient, туман, небо.
     #[serde(default)]
     pub environment: SceneEnvironment,
@@ -715,6 +791,7 @@ impl Scene {
             bubbles: Vec::new(),
             bubble_arrivals: Vec::new(),
             extractions: Vec::new(),
+            stations: Vec::new(),
             environment: SceneEnvironment::default(),
         }
     }
@@ -753,6 +830,16 @@ impl Scene {
     pub fn add_extraction(&mut self, extraction: SceneExtraction) -> &mut Self {
         self.extractions.push(extraction);
         self
+    }
+
+    pub fn add_station(&mut self, station: SceneStation) -> &mut Self {
+        self.stations.push(station);
+        self
+    }
+
+    /// Станция, накрывающая точку (ступни игрока), если есть.
+    pub fn station_at(&self, point: Vec3) -> Option<&SceneStation> {
+        self.stations.iter().find(|station| station.contains(point))
     }
 
     /// Круг экстракции, накрывающий точку (ступни игрока), если есть.
@@ -1032,6 +1119,46 @@ impl Scene {
             )
             .with_yaw(std::f32::consts::PI)
             .with_label("Кордон"),
+        );
+
+        // Станции базы (M5-2): четыре круга у спавна. Торговец несёт офферы
+        // (покупка по двойной цене каталога), остальные — уровни из аккаунта.
+        scene.add_station(
+            SceneStation::new(Vec3::new(-8.0, 0.0, 10.0), 2.0, StationKind::Trader)
+                .with_label("Торговец")
+                .with_offers(vec![
+                    SceneOffer {
+                        item: "medkit".into(),
+                        count: 1,
+                    },
+                    SceneOffer {
+                        item: "bandage".into(),
+                        count: 1,
+                    },
+                    SceneOffer {
+                        item: "ammo_545".into(),
+                        count: 30,
+                    },
+                    SceneOffer {
+                        item: "canned_food".into(),
+                        count: 1,
+                    },
+                    SceneOffer {
+                        item: "vodka".into(),
+                        count: 1,
+                    },
+                ]),
+        );
+        scene.add_station(
+            SceneStation::new(Vec3::new(8.0, 0.0, 14.0), 2.0, StationKind::Medpost)
+                .with_label("Медпункт"),
+        );
+        scene.add_station(
+            SceneStation::new(Vec3::new(-8.0, 0.0, 18.0), 2.0, StationKind::Workbench)
+                .with_label("Верстак"),
+        );
+        scene.add_station(
+            SceneStation::new(Vec3::new(8.0, 0.0, 18.0), 2.0, StationKind::Safe).with_label("Сейф"),
         );
 
         scene

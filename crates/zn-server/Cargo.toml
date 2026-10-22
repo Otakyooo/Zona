@@ -16,11 +16,17 @@ name = "zn-server"
 path = "src/main.rs"
 
 [dependencies]
+argon2 = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+rand_core = { workspace = true }
 ron = { workspace = true }
+rusqlite = { workspace = true }
 serde = { workspace = true }
 zn-content = { path = "../../game/zn-content" }
 zn-net = { path = "../zn-net" }
 zn-scene = { path = "../zn-scene" }
 zn-sim = { path = "../../game/zn-sim" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 /// обнаружения аномалии; v6 — локации и база (M4d): локация в Welcome, смена
 /// локации (переходы/пузыри), склад базы; v7 — экстракция (M4d-2): профиль
 /// игрока в Hello, событие эвакуации; v8 — выживание (M4d-3b): нокдаун и
-/// выброс (события в снапшоте). Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// выброс (события в снапшоте); v9 — аккаунты (M5): дайджест пароля в Hello
+/// вместо профиля, отказ `AuthFailed`, признак создания аккаунта в Welcome.
+/// Несовпадение версий отвергается.
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -22,6 +24,31 @@ pub const INPUT_REDUNDANCY: usize = 4;
 
 /// Максимальная длина имени игрока (байты UTF-8): защита от раздутых Hello.
 pub const MAX_NAME_LEN: usize = 32;
+
+// ── Аккаунты (M5) ──────────────────────────────────────────────────────
+
+/// Дайджест пароля для Hello (M5): SHA-256 от пароля игрока. Сам пароль не
+/// пересекает сеть; сервер хранит argon2id-хэш этого дайджеста. Гость
+/// (`auth = None`) — как профиль `None` в v8: без персиста.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthHello {
+    /// Имя аккаунта (прежний `ZN_PROFILE`: ключ персистентного склада).
+    pub account: String,
+    /// `SHA-256(пароль)` — 32 байта.
+    pub password_digest: [u8; 32],
+}
+
+/// Дайджест пароля клиента. Чистая функция: одинаковый пароль даёт одинаковые
+/// байты на всех платформах (тесты клиента и сервера делят её).
+pub fn password_digest(password: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
 
 /// Клиент повторяет `ClientHello` с этим интервалом, пока нет ответа сервера.
 pub const HELLO_RESEND_INTERVAL: Duration = Duration::from_millis(500);
@@ -108,6 +135,20 @@ pub enum StashAction {
     Take { index: u16 },
     /// Положить ячейку инвентаря в склад.
     Put { slot: u8 },
+}
+
+/// Действие в панели станции базы (M5-2, C→S): повтор с тем же tick
+/// отбрасывается сервером — как у прочих действий.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BaseActionKind {
+    /// Продать выделенный предмет торговцу по цене каталога.
+    /// `from_stash` — из склада (иначе из инвентаря); `slot` — ячейка
+    /// инвентаря или позиция в списке склада.
+    Sell { from_stash: bool, slot: u8 },
+    /// Купить оффер торговца: индекс в `SceneStation::offers`.
+    Buy { offer: u8 },
+    /// Улучшить станцию (верстак/медпункт/сейф) на один уровень.
+    Upgrade,
 }
 
 /// Предмет на земле в снапшоте; позиция квантована до `POS_QUANTUM`.
@@ -226,6 +267,8 @@ pub enum RejectReason {
     ContentMismatch,
     /// В сессии нет свободных слотов.
     SessionFull,
+    /// Аккаунт занят другим паролем (M5): дайджест не сошёлся с argon2-хэшем.
+    AuthFailed,
 }
 
 /// Одна датаграмма = одно сообщение. Все пакеты самодостаточны: потеря
@@ -240,9 +283,9 @@ pub enum Message {
         /// Хэш каталога предметов (`ItemCatalog::content_hash`).
         items_hash: u64,
         name: String,
-        /// Профиль игрока (M4d-2): ключ персонального склада при персисте.
-        /// `None` — профиль не задан (склад сессии живёт до отключения).
-        profile: Option<String>,
+        /// Аккаунт игрока (M5): имя + дайджест пароля. `None` — гостевой вход
+        /// (склад живёт только в памяти сессии сервера).
+        auth: Option<AuthHello>,
     },
     /// Последние инпуты (не более `INPUT_REDUNDANCY`, по возрастанию tick).
     InputPacket {
@@ -263,6 +306,17 @@ pub enum Message {
         tick: u64,
         action: StashAction,
     },
+    /// Взаимодействие со станцией базы (M5-2): E внутри круга станции
+    /// открывает/закрывает панель; `station` — индекс в `Scene::stations`.
+    BaseInteract {
+        tick: u64,
+        station: u8,
+    },
+    /// Действие в панели станции (M5-2); `tick` — для дедупликации повторов.
+    BaseAction {
+        tick: u64,
+        action: BaseActionKind,
+    },
     /// Бросок болта (G); `tick` — для дедупликации повторов.
     ThrowBolt {
         tick: u64,
@@ -280,6 +334,8 @@ pub enum Message {
         spawn: [f32; 3],
         /// Локация игрока (id из `LocationRegistry`).
         location: u8,
+        /// Аккаунт создан этим Hello (M5): клиент показывает уведомление.
+        account_created: bool,
     },
     ServerReject {
         reason: RejectReason,
@@ -327,6 +383,24 @@ pub enum Message {
     StashUpdate {
         items: Vec<ItemStackNet>,
     },
+    /// Персональное состояние станции базы (M5-2): уходит при открытии
+    /// панели, после каждого действия и при смене кошелька/уровней.
+    /// `station = None` — панель закрыта (кошелёк и уровни актуальны).
+    BaseUpdate {
+        station: Option<u8>,
+        /// Баланс кошелька аккаунта (RU).
+        wallet: u32,
+        /// Уровни станций: [верстак, медпункт, сейф].
+        facilities: [u8; 3],
+        /// Офферы торговца: (индекс предмета в каталоге, количество).
+        /// Пусто у не-торговца и при закрытой панели.
+        offers: Vec<ItemStackNet>,
+    },
+    /// Всплывающее уведомление базы (M5-2): отказ или итог действия
+    /// («не хватает RU», «куплено: Аптечка», «верстак → уровень 2»).
+    BaseNotice {
+        text: String,
+    },
 }
 
 impl Message {
@@ -338,6 +412,8 @@ impl Message {
             Self::Interact { .. } => "Interact",
             Self::InventoryAction { .. } => "InventoryAction",
             Self::StashAction { .. } => "StashAction",
+            Self::BaseInteract { .. } => "BaseInteract",
+            Self::BaseAction { .. } => "BaseAction",
             Self::ThrowBolt { .. } => "ThrowBolt",
             Self::Ping { .. } => "Ping",
             Self::ClientBye => "ClientBye",
@@ -349,6 +425,8 @@ impl Message {
             Self::ContainerUpdate { .. } => "ContainerUpdate",
             Self::LocationChanged { .. } => "LocationChanged",
             Self::StashUpdate { .. } => "StashUpdate",
+            Self::BaseUpdate { .. } => "BaseUpdate",
+            Self::BaseNotice { .. } => "BaseNotice",
         }
     }
 }

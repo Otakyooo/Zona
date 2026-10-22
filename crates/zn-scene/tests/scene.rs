@@ -4,8 +4,8 @@ mod tests {
     use zn_scene::{
         distances_to_base, world_content_hash, AnomalyKind, ColliderShape, LocationRegistry,
         LootEntry, Scene, SceneAnomaly, SceneBubble, SceneEnvironment, SceneExtraction,
-        SceneObject, SceneTransition, BUILTIN_CUBE, LOCATION_BASE, LOCATION_KORDON,
-        LOCATION_PODZEMKA, LOCATION_SVALKA,
+        SceneObject, SceneOffer, SceneStation, SceneTransition, StationKind, BUILTIN_CUBE,
+        LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA, LOCATION_SVALKA,
     };
 
     #[test]
@@ -592,6 +592,88 @@ mod tests {
             let extraction = &scene.extractions[0];
             assert!(extraction.percent > 0.0 && extraction.percent < 1.0);
             assert!(!extraction.label.is_empty());
+        }
+    }
+
+    #[test]
+    fn station_circle_containment_and_lookup() {
+        let mut scene = Scene::new("test");
+        scene.add_station(
+            SceneStation::new(Vec3::new(-8.0, 0.0, 10.0), 2.0, StationKind::Trader)
+                .with_label("Торговец")
+                .with_offers(vec![SceneOffer {
+                    item: "medkit".into(),
+                    count: 1,
+                }]),
+        );
+
+        // Горизонтальный цилиндр, как у кругов экстракции.
+        assert!(scene.station_at(Vec3::new(-8.0, 1.6, 10.0)).is_some());
+        assert!(scene.station_at(Vec3::new(-9.5, 0.0, 9.0)).is_some());
+        assert!(scene.station_at(Vec3::new(0.0, 0.0, 14.0)).is_none());
+
+        let station = scene
+            .station_at(Vec3::new(-8.0, 0.0, 10.0))
+            .expect("станция под точкой");
+        assert_eq!(station.kind, StationKind::Trader);
+        assert_eq!(station.label, "Торговец");
+        assert_eq!(station.offers.len(), 1);
+        assert_eq!(station.offers[0].item, "medkit");
+        assert_eq!(station.offers[0].count, 1);
+    }
+
+    #[test]
+    fn scene_without_stations_field_still_loads() {
+        // Обратная совместимость RON: поле `stations` необязательное.
+        let ron = r#"(
+            name: "legacy",
+            objects: [],
+        )"#;
+        let scene: Scene = ron::from_str(ron).expect("сцена без stations");
+        assert!(scene.stations.is_empty());
+        assert!(scene.station_at(Vec3::ZERO).is_none());
+    }
+
+    #[test]
+    fn base_has_four_stations_near_spawn() {
+        let base = Scene::base();
+        assert_eq!(base.stations.len(), 4, "торговец, медпункт, верстак, сейф");
+        for station in &base.stations {
+            assert!(!station.label.is_empty());
+            // Все станции — в паре шагов от спавна.
+            let flat = Vec3::new(base.spawn.x, 0.0, base.spawn.z);
+            let delta = Vec3::new(
+                station.position.x - flat.x,
+                0.0,
+                station.position.z - flat.z,
+            );
+            assert!(
+                delta.length() < 10.0,
+                "станция '{}' далеко от спавна",
+                station.label
+            );
+        }
+        let trader = base
+            .stations
+            .iter()
+            .find(|station| station.kind == StationKind::Trader)
+            .expect("торговец на базе");
+        assert!(!trader.offers.is_empty(), "у торговца есть офферы");
+        // Ровно одна станция каждого вида.
+        for kind in [
+            StationKind::Trader,
+            StationKind::Workbench,
+            StationKind::Medpost,
+            StationKind::Safe,
+        ] {
+            assert_eq!(
+                base.stations
+                    .iter()
+                    .filter(|station| station.kind == kind)
+                    .count(),
+                1,
+                "одна станция вида {kind:?}"
+            );
         }
     }
 }

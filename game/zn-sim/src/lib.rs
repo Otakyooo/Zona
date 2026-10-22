@@ -818,48 +818,39 @@ impl Simulation {
     /// влезают, либо остаются. `percent` ∈ [0, 1]; 1 — сохраняется всё.
     pub fn extract_inventory(&mut self, id: u64, percent: f32) -> (Vec<Stack>, Vec<Stack>) {
         let items = self.take_inventory_all(id);
-        let percent = percent.clamp(0.0, 1.0);
-        if items.is_empty() || percent >= 1.0 {
-            return (items, Vec::new());
-        }
-        let catalog = catalog_of(&self.world);
-        let unit_weight = |item: u16| -> u64 {
-            catalog
-                .get(item)
-                .map(|item| u64::from(item_weight_grams(item)))
-                .unwrap_or(0)
+        split_by_weight(items, percent, &catalog_of(&self.world))
+    }
+
+    /// Медпункт (M5-2): лечение игрока без предмета (реген на базе). Мёртвым
+    /// лечение не идёт; полное HP — тоже нет. `true` — лечение произошло.
+    pub fn heal(&mut self, id: u64, amount: u16) -> bool {
+        with_player(&mut self.world, id, |state| {
+            if state.health == 0 || state.health >= MAX_HEALTH {
+                return false;
+            }
+            state.health = state.health.saturating_add(amount).min(MAX_HEALTH);
+            true
+        })
+        .unwrap_or(false)
+    }
+
+    /// Сейф (M5-2): спасает долю `fraction` (по весу) лута из контейнера
+    /// (трупа) — возвращённые стопки уходят в стэш, остаток остаётся в трупе.
+    /// `fraction` ∈ [0, 1]; 0 — труп не тронут. Несуществующий контейнер —
+    /// пустой результат (fail-soft).
+    pub fn salvage_corpse(&mut self, container: u64, fraction: f32) -> Vec<Stack> {
+        let fraction = fraction.clamp(0.0, 1.0);
+        let Some(items) = container_items_copy(&self.world, container) else {
+            return Vec::new();
         };
-        let stack_weight =
-            |stack: &Stack| unit_weight(stack.item).saturating_mul(u64::from(stack.count));
-        let total: u64 = items.iter().map(&stack_weight).sum();
-        let mut budget = (total as f32 * percent) as u64;
-        let mut kept = Vec::new();
-        let mut lost = Vec::new();
-        for stack in items {
-            let weight = stack_weight(&stack);
-            if weight <= budget {
-                budget -= weight;
-                kept.push(stack);
-                continue;
-            }
-            // Граничная стопка: режем по единицам веса, что не влезло — падает.
-            let unit = unit_weight(stack.item);
-            let keep_count = budget
-                .checked_div(unit)
-                .unwrap_or(0)
-                .min(u64::from(stack.count));
-            if keep_count > 0 {
-                budget -= unit * keep_count;
-                kept.push(Stack::new(stack.item, keep_count as u32));
-                let rest = stack.count - keep_count as u32;
-                if rest > 0 {
-                    lost.push(Stack::new(stack.item, rest));
-                }
-            } else {
-                lost.push(stack);
-            }
+        if items.is_empty() || fraction <= 0.0 {
+            return Vec::new();
         }
-        (kept, lost)
+        let (salvaged, rest) = split_by_weight(items, fraction, &catalog_of(&self.world));
+        if !salvaged.is_empty() {
+            set_container_items(&mut self.world, container, rest);
+        }
+        salvaged
     }
 
     /// Выбрасывает стопку на землю в точке (M4d-2: остаток экстракции
@@ -960,6 +951,14 @@ impl Simulation {
             .and_then(|catalog| catalog.0.index_of(key))
     }
 
+    /// Цена продажи торговцу (M5-2) по индексу предмета в каталоге;
+    /// `None` — предмет не из каталога, `0` — хлам.
+    pub fn item_value_rub(&self, item: u16) -> Option<u32> {
+        self.world
+            .get_resource::<LootCatalog>()
+            .and_then(|catalog| catalog.0.get(item).map(|item| item.value_rub))
+    }
+
     /// Отладка (консоль сервера): выдать предмет игроку — сколько влезет.
     /// Возвращает число выданных единиц.
     pub fn debug_give(&mut self, id: u64, item: u16, count: u32) -> u32 {
@@ -979,6 +978,16 @@ impl Simulation {
             push_inventory_update_of(&mut self.world, id);
         }
         moved
+    }
+
+    /// Копия стопки в ячейке инвентаря без изъятия (проверка перед
+    /// продажей торговцу — M5-2).
+    pub fn inventory_slot(&mut self, id: u64, slot: usize) -> Option<Stack> {
+        self.world
+            .query::<&PlayerState>()
+            .iter()
+            .find(|state| state.id == id)
+            .and_then(|state| state.inventory.get(slot).and_then(Option::as_ref).copied())
     }
 
     /// Вынимает стопку из ячейки инвентаря (положить в склад); при успехе
@@ -2184,6 +2193,58 @@ fn item_weight_grams(item: &Item) -> u32 {
     (item.weight_kg * 1000.0).round().max(1.0) as u32
 }
 
+/// Делит стопки по весу: `percent` груза идёт в первую кучу, остаток — во
+/// вторую. Граничная стопка режется по единицам веса — патроны/болты делятся,
+/// артефакты либо влезают, либо остаются. Общая логика экстракции (M4d-2) и
+/// сейфа базы (M5-2).
+fn split_by_weight(
+    items: Vec<Stack>,
+    percent: f32,
+    catalog: &ItemCatalog,
+) -> (Vec<Stack>, Vec<Stack>) {
+    let percent = percent.clamp(0.0, 1.0);
+    if items.is_empty() || percent >= 1.0 {
+        return (items, Vec::new());
+    }
+    let unit_weight = |item: u16| -> u64 {
+        catalog
+            .get(item)
+            .map(|item| u64::from(item_weight_grams(item)))
+            .unwrap_or(0)
+    };
+    let stack_weight =
+        |stack: &Stack| unit_weight(stack.item).saturating_mul(u64::from(stack.count));
+    let total: u64 = items.iter().map(&stack_weight).sum();
+    let mut budget = (total as f32 * percent) as u64;
+    let mut kept = Vec::new();
+    let mut lost = Vec::new();
+    for stack in items {
+        let weight = stack_weight(&stack);
+        if weight <= budget {
+            budget -= weight;
+            kept.push(stack);
+            continue;
+        }
+        // Граничная стопка: режем по единицам веса, что не влезло — падает.
+        let unit = unit_weight(stack.item);
+        let keep_count = budget
+            .checked_div(unit)
+            .unwrap_or(0)
+            .min(u64::from(stack.count));
+        if keep_count > 0 {
+            budget -= unit * keep_count;
+            kept.push(Stack::new(stack.item, keep_count as u32));
+            let rest = stack.count - keep_count as u32;
+            if rest > 0 {
+                lost.push(Stack::new(stack.item, rest));
+            }
+        } else {
+            lost.push(stack);
+        }
+    }
+    (kept, lost)
+}
+
 /// Вес инвентаря в граммах по каталогу.
 pub fn inventory_weight_grams(
     catalog: &ItemCatalog,
@@ -2681,5 +2742,121 @@ mod tests {
         buffer.clear(1);
         assert!(buffer.last(1).is_none());
         assert!(buffer.consume(1).is_none());
+    }
+
+    // ── База между рейдами (M5-2): heal и сейф ──────────────────────────
+
+    /// Каталог для тестов веса: болт 50 г, аптечка 500 г.
+    fn weight_catalog() -> ItemCatalog {
+        ItemCatalog::from_ron(
+            r#"(
+                items: [
+                    (key: "bolt", display_name: "Болт", weight_kg: 0.05, stack_max: 20, value_rub: 5),
+                    (key: "medkit", display_name: "Аптечка", weight_kg: 0.5, stack_max: 3, value_rub: 250),
+                ],
+            )"#,
+        )
+        .unwrap()
+    }
+
+    fn sim_with_weights() -> Simulation {
+        Simulation::with_scene_and_catalog(&Scene::new("test"), weight_catalog())
+    }
+
+    #[test]
+    fn heal_restores_health_and_clamps() {
+        let mut sim = sim_with_weights();
+        let player = sim.spawn_player(Vec3::ZERO);
+        sim.surge_damage(30);
+        assert_eq!(sim.player_state(player).unwrap().health, MAX_HEALTH - 30);
+
+        // Лечение выше остатка — clamp по максимуму.
+        assert!(sim.heal(player, 25));
+        assert_eq!(sim.player_state(player).unwrap().health, MAX_HEALTH - 5);
+        assert!(sim.heal(player, 10));
+        assert_eq!(sim.player_state(player).unwrap().health, MAX_HEALTH);
+        // На полном HP лечение не происходит.
+        assert!(!sim.heal(player, 10));
+        assert_eq!(sim.player_state(player).unwrap().health, MAX_HEALTH);
+    }
+
+    #[test]
+    fn heal_skips_dead_and_missing_players() {
+        let mut sim = sim_with_weights();
+        let player = sim.spawn_player(Vec3::ZERO);
+        // Первый смертельный удар кладёт в нокдаун, второй — добивает.
+        sim.surge_damage(MAX_HEALTH);
+        sim.surge_damage(MAX_HEALTH);
+        assert_eq!(sim.player_state(player).unwrap().health, 0);
+        assert!(!sim.heal(player, 50), "мёртвым медпункт не помогает");
+        assert!(!sim.heal(player + 100, 50), "несуществующий игрок");
+    }
+
+    #[test]
+    fn salvage_corpse_splits_boundary_stack_by_weight() {
+        let mut sim = sim_with_weights();
+        spawn_corpse(
+            &mut sim.world,
+            1,
+            Vec3::ZERO,
+            0.0,
+            vec![Stack::new(0, 10)],
+            0,
+        );
+        let corpse = sim.snapshot_corpses()[0].container;
+
+        // 30 % от 500 г = 150 г → 3 болта в стэш, 7 остаются в трупе.
+        let salvaged = sim.salvage_corpse(corpse, 0.3);
+        assert_eq!(salvaged, vec![Stack::new(0, 3)]);
+        assert_eq!(sim.container_items(corpse), Some(vec![Stack::new(0, 7)]));
+    }
+
+    #[test]
+    fn salvage_corpse_keeps_whole_stack_when_fraction_covers_it() {
+        let mut sim = sim_with_weights();
+        // Аптечка (500 г) + 10 болтов (500 г) = 1000 г.
+        spawn_corpse(
+            &mut sim.world,
+            1,
+            Vec3::ZERO,
+            0.0,
+            vec![Stack::new(1, 1), Stack::new(0, 10)],
+            0,
+        );
+        let corpse = sim.snapshot_corpses()[0].container;
+
+        // 75 % = 750 г: аптечка (500 г) влезает целиком, из болтов влезает
+        // ещё 250 г → 5 штук; остаток (5 болтов) остаётся в трупе.
+        let salvaged = sim.salvage_corpse(corpse, 0.75);
+        assert_eq!(
+            salvaged,
+            vec![Stack::new(1, 1), Stack::new(0, 5)],
+            "стопки делятся по порядку, как в экстракции"
+        );
+        assert_eq!(sim.container_items(corpse), Some(vec![Stack::new(0, 5)]));
+    }
+
+    #[test]
+    fn salvage_corpse_edge_cases() {
+        let mut sim = sim_with_weights();
+        // Несуществующий контейнер — пусто.
+        assert!(sim
+            .salvage_corpse(CORPSE_CONTAINER_BASE + 99, 0.5)
+            .is_empty());
+        // Доля 0 — труп не тронут.
+        spawn_corpse(
+            &mut sim.world,
+            1,
+            Vec3::ZERO,
+            0.0,
+            vec![Stack::new(0, 4)],
+            0,
+        );
+        let corpse = sim.snapshot_corpses()[0].container;
+        assert!(sim.salvage_corpse(corpse, 0.0).is_empty());
+        assert_eq!(sim.container_items(corpse), Some(vec![Stack::new(0, 4)]));
+        // Доля 1 — весь лут в стэш, труп пустеет.
+        assert_eq!(sim.salvage_corpse(corpse, 1.0), vec![Stack::new(0, 4)]);
+        assert_eq!(sim.container_items(corpse), Some(Vec::new()));
     }
 }

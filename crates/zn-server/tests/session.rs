@@ -7,14 +7,15 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use zn_net::{
-    decode_message, encode_message, quantize_pos, ClientInput, GameEvent, InventoryAction, Message,
-    PlayerNetState, RejectReason, StashAction, FLAG_FIRE, FLAG_GROUNDED, PROTOCOL_VERSION,
+    decode_message, encode_message, quantize_pos, AuthHello, BaseActionKind, ClientInput,
+    GameEvent, InventoryAction, Message, PlayerNetState, RejectReason, StashAction, FLAG_FIRE,
+    FLAG_GROUNDED, PROTOCOL_VERSION,
 };
 use zn_scene::{
     world_content_hash, LocationId, LocationRegistry, Scene, LOCATION_BASE, LOCATION_KORDON,
     LOCATION_SVALKA,
 };
-use zn_server::{Session, SessionConfig};
+use zn_server::{Session, SessionConfig, START_WALLET};
 use zn_sim::{crate_container_id, Simulation, Stack, Vec3};
 
 struct TestClient {
@@ -35,17 +36,27 @@ impl TestClient {
     }
 
     fn hello(&self, content_hash: u64) {
-        self.hello_profile(content_hash, None);
-    }
-
-    /// Hello с профилем (M4d-2): ключ персистентного склада.
-    fn hello_profile(&self, content_hash: u64, profile: Option<&str>) {
         self.send(&Message::ClientHello {
             protocol_version: PROTOCOL_VERSION,
             content_hash,
             items_hash: test_items_hash(),
             name: "Тестер".to_string(),
-            profile: profile.map(str::to_string),
+            auth: None,
+        });
+    }
+
+    /// Hello с аккаунтом (M5-1): логин + пароль; по сети уходит только
+    /// sha2-дайджест пароля. Неизвестный аккаунт регистрируется на сервере.
+    fn hello_auth(&self, content_hash: u64, account: &str, password: &str) {
+        self.send(&Message::ClientHello {
+            protocol_version: PROTOCOL_VERSION,
+            content_hash,
+            items_hash: test_items_hash(),
+            name: "Тестер".to_string(),
+            auth: Some(AuthHello {
+                account: account.to_string(),
+                password_digest: zn_net::password_digest(password),
+            }),
         });
     }
 
@@ -60,6 +71,16 @@ impl TestClient {
 
     fn stash_action(&self, tick: u64, action: StashAction) {
         self.send(&Message::StashAction { tick, action });
+    }
+
+    /// Взаимодействие со станцией базы (M5-2): `station` — индекс в сцене.
+    fn base_interact(&self, tick: u64, station: u8) {
+        self.send(&Message::BaseInteract { tick, station });
+    }
+
+    /// Действие в панели станции базы (M5-2).
+    fn base_action(&self, tick: u64, action: BaseActionKind) {
+        self.send(&Message::BaseAction { tick, action });
     }
 
     fn try_recv(&self) -> Option<Message> {
@@ -132,6 +153,41 @@ fn test_world_hash() -> u64 {
     let scenes = Scene::builtin_world();
     let refs: Vec<(LocationId, &Scene)> = scenes.iter().map(|(id, scene)| (*id, scene)).collect();
     world_content_hash(&registry, &refs)
+}
+
+/// Сессия мира с файловой БД аккаунтов (M5-1): склад переживает рестарт
+/// сервера. Легаси-стэши читаются рядом с файлом БД — в tempdir их нет.
+fn test_world_session_db(max_players: usize, db_file: &std::path::Path) -> (Session, SocketAddr) {
+    let registry = LocationRegistry::builtin();
+    let scenes = Scene::builtin_world();
+    let config = SessionConfig {
+        max_players,
+        db_file: Some(db_file.to_path_buf()),
+        ..SessionConfig::default()
+    };
+    let session =
+        Session::bind_world("127.0.0.1:0", &registry, scenes, test_catalog(), config).unwrap();
+    let addr = session.local_addr().unwrap();
+    (session, addr)
+}
+
+/// Сессия с БД и запретом гостевого входа (M5-3, флаг `--auth-required`).
+fn test_world_session_db_auth(
+    max_players: usize,
+    db_file: &std::path::Path,
+) -> (Session, SocketAddr) {
+    let registry = LocationRegistry::builtin();
+    let scenes = Scene::builtin_world();
+    let config = SessionConfig {
+        max_players,
+        db_file: Some(db_file.to_path_buf()),
+        auth_required: true,
+        ..SessionConfig::default()
+    };
+    let session =
+        Session::bind_world("127.0.0.1:0", &registry, scenes, test_catalog(), config).unwrap();
+    let addr = session.local_addr().unwrap();
+    (session, addr)
 }
 
 /// Крутит виртуальное время сессии (по 33 мс), пока условие не выполнится.
@@ -240,7 +296,7 @@ fn wrong_protocol_version_is_rejected() {
         content_hash: Scene::demo_zone().content_hash(),
         items_hash: test_items_hash(),
         name: "Чужак".to_string(),
-        profile: None,
+        auth: None,
     });
     let reply = expect_message(&mut session, &client, |message| {
         matches!(message, Message::ServerReject { .. })
@@ -286,7 +342,7 @@ fn wrong_items_hash_is_rejected() {
         content_hash: Scene::demo_zone().content_hash(),
         items_hash: test_items_hash() ^ 0xFFFF,
         name: "Чужак".to_string(),
-        profile: None,
+        auth: None,
     });
     let reply = expect_message(&mut session, &client, |message| {
         matches!(message, Message::ServerReject { .. })
@@ -1514,14 +1570,16 @@ fn extraction_saves_percent_and_returns_player_to_base() {
 }
 
 #[test]
-fn profile_restores_stash_after_reconnect() {
-    let (mut session, addr) = test_world_session(10);
+fn account_stash_survives_server_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("zona.db");
+    let (mut session, addr) = test_world_session_db(10, &db);
     let client = TestClient::connect(addr);
-    client.hello_profile(test_world_hash(), Some("stalker-1"));
+    client.hello_auth(test_world_hash(), "stalker-1", "pass1");
     let player_id = expect_welcome(&mut session, &client);
     assert_eq!(session.debug_give(player_id, "bolt", 5).unwrap(), 5);
 
-    // Экстракция кругом Кордона: склад профиля наполняется.
+    // Экстракция кругом Кордона: склад аккаунта наполняется.
     walk_to(
         session.simulation(),
         player_id,
@@ -1551,36 +1609,114 @@ fn profile_restores_stash_after_reconnect() {
     // bolt×5 = 0.25 кг; бюджет 75 % = 0.1875 кг → 3 болта в склад, 2 падают.
     assert_eq!(stashed, vec![Stack::new(catalog_index("bolt"), 3)]);
 
-    // Отключение и реконнект с тем же профилем: склад на месте.
+    // Выход и перезапуск сервера на той же БД: склад аккаунта на месте.
     client.send(&Message::ClientBye);
     poll_until(&mut session, 10, |session| session.clients().is_empty());
+    drop(session);
+    let (mut session, addr) = test_world_session_db(10, &db);
+
     let again = TestClient::connect(addr);
-    again.hello_profile(test_world_hash(), Some("stalker-1"));
+    again.hello_auth(test_world_hash(), "stalker-1", "pass1");
     let new_id = expect_welcome(&mut session, &again);
-    assert_ne!(new_id, player_id, "реконнект — новый player_id");
     assert_eq!(
         session.stash_items(new_id),
         &stashed[..],
-        "склад профиля восстановлен"
+        "склад аккаунта восстановлен из БД после рестарта сервера"
     );
 
-    // Без профиля склад не переживает сессию.
-    let other = TestClient::connect(addr);
-    other.hello(test_world_hash());
-    let other_id = expect_welcome(&mut session, &other);
-    assert!(
-        session.stash_items(other_id).is_empty(),
-        "беспрофильный игрок начинает с пустым складом"
-    );
-    other.send(&Message::ClientBye);
+    // Гость без аккаунта склад не получает и не сохраняет.
+    let guest = TestClient::connect(addr);
+    guest.hello(test_world_hash());
+    let guest_id = expect_welcome(&mut session, &guest);
+    assert!(session.stash_items(guest_id).is_empty());
+    guest.send(&Message::ClientBye);
     poll_until(&mut session, 10, |session| session.clients().len() == 1);
     let third = TestClient::connect(addr);
     third.hello(test_world_hash());
     let third_id = expect_welcome(&mut session, &third);
-    assert_ne!(third_id, other_id);
+    assert_ne!(third_id, guest_id);
     assert!(
         session.stash_items(third_id).is_empty(),
-        "склад беспрофильного игрока умер с сессией"
+        "склад гостя умер с сессией"
+    );
+}
+
+#[test]
+fn wrong_password_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("zona.db");
+    let (mut session, addr) = test_world_session_db(10, &db);
+
+    // Аккаунт зарегистрирован первым входом.
+    let first = TestClient::connect(addr);
+    first.hello_auth(test_world_hash(), "stalker-1", "pass1");
+    expect_welcome(&mut session, &first);
+    first.send(&Message::ClientBye);
+    poll_until(&mut session, 10, |session| session.clients().is_empty());
+
+    // Тот же аккаунт с чужим паролем — отказ, игрок не подключается.
+    let thief = TestClient::connect(addr);
+    thief.hello_auth(test_world_hash(), "stalker-1", "wrong-pass");
+    let reply = expect_message(&mut session, &thief, |message| {
+        matches!(message, Message::ServerReject { .. })
+    });
+    assert_eq!(
+        reply,
+        Message::ServerReject {
+            reason: RejectReason::AuthFailed
+        }
+    );
+    assert_eq!(session.player_count(), 0);
+}
+
+#[test]
+fn migrated_account_claims_password_on_first_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("zona.db");
+    // Легаси stashes.ron (M4d-2) рядом с будущей БД: мигрированный склад.
+    let legacy = format!(
+        "(version: 1, stashes: [(profile: \"old-stalker\", items: [({}, 3)])])",
+        catalog_index("bolt")
+    );
+    std::fs::write(dir.path().join("stashes.ron"), legacy).unwrap();
+
+    // Первый вход: пароль ещё не задан — любой подходит, склад из миграции.
+    let (mut session, addr) = test_world_session_db(10, &db);
+    let client = TestClient::connect(addr);
+    client.hello_auth(test_world_hash(), "old-stalker", "new-pass");
+    let player_id = expect_welcome(&mut session, &client);
+    assert_eq!(
+        session.stash_items(player_id),
+        &[Stack::new(catalog_index("bolt"), 3)],
+        "склад мигрированного профиля"
+    );
+    client.send(&Message::ClientBye);
+    poll_until(&mut session, 10, |session| session.clients().is_empty());
+    drop(session);
+
+    // Пароль закреплён в БД: с ним склад на месте…
+    let (mut session, addr) = test_world_session_db(10, &db);
+    let client = TestClient::connect(addr);
+    client.hello_auth(test_world_hash(), "old-stalker", "new-pass");
+    let player_id = expect_welcome(&mut session, &client);
+    assert_eq!(
+        session.stash_items(player_id),
+        &[Stack::new(catalog_index("bolt"), 3)]
+    );
+    client.send(&Message::ClientBye);
+    poll_until(&mut session, 10, |session| session.clients().is_empty());
+
+    // …а с чужим — отказ.
+    let thief = TestClient::connect(addr);
+    thief.hello_auth(test_world_hash(), "old-stalker", "other-pass");
+    let reply = expect_message(&mut session, &thief, |message| {
+        matches!(message, Message::ServerReject { .. })
+    });
+    assert_eq!(
+        reply,
+        Message::ServerReject {
+            reason: RejectReason::AuthFailed
+        }
     );
 }
 
@@ -1662,4 +1798,753 @@ fn blowout_warns_then_damages_raid_locations_only() {
     assert!(hurt, "выброс не ранил игрока в поле");
     let base_health = session.simulation().player_state(base_id).unwrap().health;
     assert_eq!(base_health, 100, "база — безопасная зона");
+}
+
+// --- База между рейдами (M5-2): торговец, апгрейды, медпункт, сейф ---------
+
+#[test]
+fn base_trader_buy_sell_and_refusals_over_udp() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let bandage = catalog.index_of("bandage").unwrap();
+
+    // У торговца: панель открылась с офферами и стартовым кошельком.
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 10.0)));
+    client.base_interact(1, 0);
+    let opened = expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(0),
+                wallet: 200,
+                ..
+            }
+        )
+    });
+    let Message::BaseUpdate {
+        facilities, offers, ..
+    } = opened
+    else {
+        unreachable!("предикат гарантирует BaseUpdate: {opened:?}")
+    };
+    assert_eq!(facilities, [0, 0, 0], "у новичка станции нулевые");
+    assert_eq!(offers.len(), 5, "офферы торговца из сцены");
+    assert!(offers
+        .iter()
+        .any(|stack| stack.item == medkit && stack.count == 1));
+    assert!(offers
+        .iter()
+        .any(|stack| stack.item == bandage && stack.count == 1));
+
+    // Аптечка за 500 RU не по карману: отказ, кошелёк не трогаем.
+    client.base_action(2, BaseActionKind::Buy { offer: 0 });
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("не хватает RU")),
+    );
+
+    // Бинт за 120 RU — покупка: кошелёк 80, стопка в инвентаре.
+    client.base_action(3, BaseActionKind::Buy { offer: 1 });
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("куплено")),
+    );
+    expect_message(&mut session, &client, |message| {
+        matches!(message, Message::BaseUpdate { wallet: 80, .. })
+    });
+
+    // Несуществующий оффер — отказ.
+    client.base_action(4, BaseActionKind::Buy { offer: 99 });
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("не предлагает")),
+    );
+
+    // Продаём бинт обратно: 60 RU возвращаются (80 → 140).
+    client.base_action(
+        5,
+        BaseActionKind::Sell {
+            from_stash: false,
+            slot: 0,
+        },
+    );
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("продано: +60 RU")),
+    );
+    expect_message(&mut session, &client, |message| {
+        matches!(message, Message::BaseUpdate { wallet: 140, .. })
+    });
+
+    // Пустая ячейка и пустой склад — отказы, кошелёк не меняется.
+    client.base_action(
+        6,
+        BaseActionKind::Sell {
+            from_stash: false,
+            slot: 0,
+        },
+    );
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("ячейка пуста")),
+    );
+    client.base_action(
+        7,
+        BaseActionKind::Sell {
+            from_stash: true,
+            slot: 0,
+        },
+    );
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("ячейка пуста")),
+    );
+
+    // Повтор BaseInteract с тем же tick отброшен: панель не закрылась.
+    client.base_interact(1, 0);
+    for _ in 0..20 {
+        session.poll(Duration::from_millis(33));
+    }
+    let mut closed = false;
+    while let Some(message) = client.try_recv() {
+        if matches!(message, Message::BaseUpdate { station: None, .. }) {
+            closed = true;
+        }
+    }
+    assert!(!closed, "дубликат tick не закрывает панель");
+
+    // Новый tick у той же станции — панель закрывается.
+    client.base_interact(8, 0);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: None,
+                wallet: 140,
+                ..
+            }
+        )
+    });
+}
+
+#[test]
+fn base_upgrades_cost_and_cap() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+
+    // Продаём четыре артефакта торговцу: 200 + 4 × 800 = 3400 RU.
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 10.0)));
+    assert_eq!(
+        session
+            .debug_give(player_id, "artifact_gravity", 4)
+            .unwrap(),
+        4
+    );
+    client.base_interact(1, 0);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(0),
+                ..
+            }
+        )
+    });
+    // Слоты с конца: индексы ниже не съезжают при изъятии.
+    for (tick, slot) in (2..=5).zip([3u8, 2, 1, 0]) {
+        client.base_action(
+            tick,
+            BaseActionKind::Sell {
+                from_stash: false,
+                slot,
+            },
+        );
+        expect_message(
+            &mut session,
+            &client,
+            |message| matches!(message, Message::BaseNotice { text } if text.contains("продано: +800 RU")),
+        );
+    }
+
+    // Верстак: 300 → 600 → 900 RU за уровни 1–3, дальше максимум.
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 18.0)));
+    client.base_interact(10, 2);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(2),
+                wallet: 3400,
+                ..
+            }
+        )
+    });
+    client.base_action(11, BaseActionKind::Upgrade);
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("верстак → уровень 1")),
+    );
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 3100,
+                facilities: [1, 0, 0],
+                ..
+            }
+        )
+    });
+    client.base_action(12, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 2500,
+                facilities: [2, 0, 0],
+                ..
+            }
+        )
+    });
+    client.base_action(13, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 1600,
+                facilities: [3, 0, 0],
+                ..
+            }
+        )
+    });
+    // Максимум: отказ, кошелёк и уровни не меняются.
+    client.base_action(14, BaseActionKind::Upgrade);
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("максимальный уровень")),
+    );
+
+    // Медпункт и сейф: улучшаются по очереди, пока хватает RU.
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(8.0, 0.0, 14.0)));
+    client.base_interact(20, 1);
+    client.base_action(21, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 1300,
+                facilities: [3, 1, 0],
+                ..
+            }
+        )
+    });
+
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(8.0, 0.0, 18.0)));
+    client.base_interact(22, 3);
+    client.base_action(23, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 1000,
+                facilities: [3, 1, 1],
+                ..
+            }
+        )
+    });
+
+    // Медпункт второго уровня за 600 RU — по карману (1000 → 400).
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(8.0, 0.0, 14.0)));
+    client.base_interact(24, 1);
+    client.base_action(25, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 400,
+                facilities: [3, 2, 1],
+                ..
+            }
+        )
+    });
+
+    // Сейф второго уровня за 600 RU — не по карману: отказ.
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(8.0, 0.0, 18.0)));
+    client.base_interact(26, 3);
+    client.base_action(27, BaseActionKind::Upgrade);
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("не хватает RU")),
+    );
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 400,
+                facilities: [3, 2, 1],
+                ..
+            }
+        )
+    });
+}
+
+#[test]
+fn base_workbench_raises_extraction_percent() {
+    let (mut session, addr) = test_world_session(10);
+    let (plain, upgraded, watcher) = (
+        TestClient::connect(addr),
+        TestClient::connect(addr),
+        TestClient::connect(addr),
+    );
+    plain.hello(test_world_hash());
+    let plain_id = expect_welcome(&mut session, &plain);
+    upgraded.hello(test_world_hash());
+    let upgraded_id = expect_welcome(&mut session, &upgraded);
+    watcher.hello(test_world_hash());
+    let watcher_id = expect_welcome(&mut session, &watcher);
+    let catalog = test_catalog();
+    let medkit = catalog.index_of("medkit").unwrap();
+    let bolt = catalog.index_of("bolt").unwrap();
+
+    // Второй игрок качает верстак: артефакт торговцу (1000 RU) и апгрейд
+    // за 300 RU — верстак 1 уровня.
+    assert!(session.debug_teleport(upgraded_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 10.0)));
+    assert_eq!(
+        session
+            .debug_give(upgraded_id, "artifact_gravity", 1)
+            .unwrap(),
+        1
+    );
+    upgraded.base_interact(1, 0);
+    expect_message(&mut session, &upgraded, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(0),
+                ..
+            }
+        )
+    });
+    upgraded.base_action(
+        2,
+        BaseActionKind::Sell {
+            from_stash: false,
+            slot: 0,
+        },
+    );
+    expect_message(
+        &mut session,
+        &upgraded,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("продано")),
+    );
+    assert!(session.debug_teleport(upgraded_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 18.0)));
+    upgraded.base_interact(3, 2);
+    upgraded.base_action(4, BaseActionKind::Upgrade);
+    expect_message(&mut session, &upgraded, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 700,
+                facilities: [1, 0, 0],
+                ..
+            }
+        )
+    });
+
+    // Добыча одинаковая: аптечка (0.5 кг) + 6 болтов (0.3 кг) = 0.8 кг.
+    assert_eq!(session.debug_give(plain_id, "medkit", 1).unwrap(), 1);
+    assert_eq!(session.debug_give(plain_id, "bolt", 6).unwrap(), 6);
+    assert_eq!(session.debug_give(upgraded_id, "medkit", 1).unwrap(), 1);
+    assert_eq!(session.debug_give(upgraded_id, "bolt", 6).unwrap(), 6);
+
+    // Наблюдатель стоит на Кордоне — ему адресованы события эвакуации
+    // (сам игрок в том же тике уже перенесён на базу и события не видит).
+    walk_to(
+        session.simulation(),
+        watcher_id,
+        Vec3::new(0.0, 0.0, -20.0),
+        0.5,
+    );
+    assert!(
+        poll_until(&mut session, 40, |session| {
+            session.player_location(watcher_id) == Some(LOCATION_KORDON)
+        }),
+        "наблюдатель не дошёл до Кордона"
+    );
+
+    // Оба игрока уходят на Кордон и встают в круг эвакуации.
+    for player_id in [plain_id, upgraded_id] {
+        walk_to(
+            session.simulation(),
+            player_id,
+            Vec3::new(0.0, 0.0, -20.0),
+            0.5,
+        );
+        assert!(
+            poll_until(&mut session, 40, |session| {
+                session.player_location(player_id) == Some(LOCATION_KORDON)
+            }),
+            "игрок {player_id} не перешёл на Кордон"
+        );
+    }
+    let circle = session.world_scene(LOCATION_KORDON).extractions[0].position;
+    for player_id in [plain_id, upgraded_id] {
+        walk_to(
+            session.simulation_at(LOCATION_KORDON).unwrap(),
+            player_id,
+            circle,
+            0.5,
+        );
+    }
+    // События эвакуации несут процент круга: 75 % и 85 % с верстаком. Оба
+    // события приходят наблюдателю одним снапшотом, поэтому собираем их
+    // пачкой, пока не увидим оба идентификатора игрока.
+    let mut extracted: Vec<(u64, f32)> = Vec::new();
+    for _ in 0..2000 {
+        session.poll(Duration::from_millis(1));
+        while let Some(message) = watcher.try_recv() {
+            if let Message::Snapshot { events, .. } = message {
+                extracted.extend(events.iter().filter_map(|event| match event {
+                    GameEvent::Extracted {
+                        player, percent, ..
+                    } => Some((*player, *percent)),
+                    _ => None,
+                }));
+            }
+        }
+        if extracted.iter().any(|(player, _)| *player == plain_id)
+            && extracted.iter().any(|(player, _)| *player == upgraded_id)
+        {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        extracted
+            .iter()
+            .any(|(player, percent)| *player == plain_id && (*percent - 0.75).abs() < 1e-6),
+        "без верстака 75 %: {extracted:?}"
+    );
+    assert!(
+        extracted
+            .iter()
+            .any(|(player, percent)| *player == upgraded_id && (*percent - 0.85).abs() < 1e-6),
+        "верстак +10 %: {extracted:?}"
+    );
+
+    // Ждём возврата обоих на базу.
+    for player_id in [plain_id, upgraded_id] {
+        assert!(
+            poll_until(&mut session, 40, |session| {
+                session.player_location(player_id) == Some(LOCATION_BASE)
+            }),
+            "игрок {player_id} не экстрактировался"
+        );
+    }
+
+    // 75 % от 0.8 кг = 600 г: аптечка (500 г) + 2 болта (100 г).
+    assert_eq!(
+        session.stash_items(plain_id),
+        &[Stack::new(medkit, 1), Stack::new(bolt, 2)][..],
+        "без верстака сохраняется 75 % добычи"
+    );
+    // Верстак 1 уровня: 75 % + 10 % = 85 % → 680 г: аптечка + 3 болта.
+    assert_eq!(
+        session.stash_items(upgraded_id),
+        &[Stack::new(medkit, 1), Stack::new(bolt, 3)][..],
+        "верстак прибавляет 10 % к доле добычи"
+    );
+}
+
+#[test]
+fn base_medpost_heals_players_on_base() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+
+    // Медпункт 1 уровня за 300 RU: продаём артефакт торговцу.
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 10.0)));
+    assert_eq!(
+        session
+            .debug_give(player_id, "artifact_gravity", 1)
+            .unwrap(),
+        1
+    );
+    client.base_interact(1, 0);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(0),
+                ..
+            }
+        )
+    });
+    client.base_action(
+        2,
+        BaseActionKind::Sell {
+            from_stash: false,
+            slot: 0,
+        },
+    );
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("продано")),
+    );
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(8.0, 0.0, 14.0)));
+    client.base_interact(3, 1);
+    client.base_action(4, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 700,
+                facilities: [0, 1, 0],
+                ..
+            }
+        )
+    });
+
+    // Ранение: 70 HP без нокдауна — медпункт на базе лечит 2 HP/с за уровень.
+    session.simulation().surge_damage(30);
+    let hurt = session.simulation().player_state(player_id).unwrap().health;
+    assert_eq!(hurt, 70, "урон нанесён");
+    let mut healed = hurt;
+    for _ in 0..150 {
+        session.poll(Duration::from_millis(33));
+        healed = session.simulation().player_state(player_id).unwrap().health;
+        if healed >= hurt + 4 {
+            break;
+        }
+    }
+    assert!(
+        healed >= hurt + 4,
+        "медпункт лечит на базе: {hurt} → {healed}"
+    );
+    assert!(healed <= 100, "лечение не выше максимума: {healed}");
+}
+
+#[test]
+fn base_safe_salvages_corpse_on_death() {
+    let (mut session, addr) = test_world_session(10);
+    let client = TestClient::connect(addr);
+    client.hello(test_world_hash());
+    let player_id = expect_welcome(&mut session, &client);
+    let bolt = catalog_index("bolt");
+
+    // Сейф 1 уровня за 300 RU: артефакт торговцу и апгрейд сейфа.
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 10.0)));
+    assert_eq!(
+        session
+            .debug_give(player_id, "artifact_gravity", 1)
+            .unwrap(),
+        1
+    );
+    client.base_interact(1, 0);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(0),
+                ..
+            }
+        )
+    });
+    client.base_action(
+        2,
+        BaseActionKind::Sell {
+            from_stash: false,
+            slot: 0,
+        },
+    );
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("продано")),
+    );
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(8.0, 0.0, 18.0)));
+    client.base_interact(3, 3);
+    client.base_action(4, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                facilities: [0, 0, 1],
+                ..
+            }
+        )
+    });
+
+    // Гибель на Кордоне: 6 болтов (0.3 кг); сейф 25 % → 75 г → 1 болт.
+    assert!(session.debug_teleport(player_id, LOCATION_KORDON, Vec3::new(0.0, 0.0, 22.0)));
+    assert_eq!(session.debug_give(player_id, "bolt", 6).unwrap(), 6);
+    session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .surge_damage(u16::MAX);
+    session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .surge_damage(u16::MAX);
+    let dead = session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .player_state(player_id)
+        .unwrap();
+    assert_eq!(dead.health, 0, "игрок погиб");
+
+    let mut salvaged = false;
+    for _ in 0..60 {
+        session.poll(Duration::from_millis(33));
+        if session.stash_items(player_id) == [Stack::new(bolt, 1)] {
+            salvaged = true;
+            break;
+        }
+    }
+    assert!(
+        salvaged,
+        "сейф спас долю лута с трупа: {:?}",
+        session.stash_items(player_id)
+    );
+    // Остаток остался в трупе — его могут подобрать другие.
+    let corpse = session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .snapshot_corpses()
+        .into_iter()
+        .find(|corpse| corpse.owner == player_id)
+        .expect("труп игрока на Кордоне");
+    let left = session
+        .simulation_at(LOCATION_KORDON)
+        .unwrap()
+        .container_items(corpse.container)
+        .expect("контейнер трупа");
+    assert_eq!(left, vec![Stack::new(bolt, 5)], "в трупе осталось 5 болтов");
+}
+
+#[test]
+fn base_wallet_and_facilities_survive_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("zona.db");
+    let (mut session, addr) = test_world_session_db(10, &db);
+    let client = TestClient::connect(addr);
+    client.hello_auth(test_world_hash(), "trader-1", "pass1");
+    let player_id = expect_welcome(&mut session, &client);
+
+    // Артефакт торговцу (1000 RU) и верстак за 300 RU: кошелёк 700, [1, 0, 0].
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 10.0)));
+    assert_eq!(
+        session
+            .debug_give(player_id, "artifact_gravity", 1)
+            .unwrap(),
+        1
+    );
+    client.base_interact(1, 0);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(0),
+                ..
+            }
+        )
+    });
+    client.base_action(
+        2,
+        BaseActionKind::Sell {
+            from_stash: false,
+            slot: 0,
+        },
+    );
+    expect_message(
+        &mut session,
+        &client,
+        |message| matches!(message, Message::BaseNotice { text } if text.contains("продано")),
+    );
+    assert!(session.debug_teleport(player_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 18.0)));
+    client.base_interact(3, 2);
+    client.base_action(4, BaseActionKind::Upgrade);
+    expect_message(&mut session, &client, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                wallet: 700,
+                facilities: [1, 0, 0],
+                ..
+            }
+        )
+    });
+
+    // Выход и рестарт на той же БД: кошелёк и уровни восстановлены.
+    client.send(&Message::ClientBye);
+    poll_until(&mut session, 10, |session| session.clients().is_empty());
+    drop(session);
+    let (mut session, addr) = test_world_session_db(10, &db);
+
+    let again = TestClient::connect(addr);
+    again.hello_auth(test_world_hash(), "trader-1", "pass1");
+    let new_id = expect_welcome(&mut session, &again);
+    assert!(session.debug_teleport(new_id, LOCATION_BASE, Vec3::new(-8.0, 0.0, 18.0)));
+    again.base_interact(10, 2);
+    expect_message(&mut session, &again, |message| {
+        matches!(
+            message,
+            Message::BaseUpdate {
+                station: Some(2),
+                wallet: 700,
+                facilities: [1, 0, 0],
+                ..
+            }
+        )
+    });
+}
+
+#[test]
+fn guest_rejected_when_auth_required() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("zona.db");
+    let (mut session, addr) = test_world_session_db_auth(10, &db);
+
+    // Гость (auth = None) — отказ, игрок не подключается.
+    let guest = TestClient::connect(addr);
+    guest.hello(test_world_hash());
+    let reply = expect_message(&mut session, &guest, |message| {
+        matches!(message, Message::ServerReject { .. })
+    });
+    assert_eq!(
+        reply,
+        Message::ServerReject {
+            reason: RejectReason::AuthFailed
+        }
+    );
+    assert_eq!(session.player_count(), 0);
+
+    // С аккаунтом — пускаем (неизвестный аккаунт регистрируется).
+    let named = TestClient::connect(addr);
+    named.hello_auth(test_world_hash(), "stalker-1", "pass1");
+    expect_welcome(&mut session, &named);
+    assert_eq!(session.player_count(), 1);
+
+    // Аккаунт виден в сводке консоли `accounts`.
+    let accounts = session.account_summaries();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].name, "stalker-1");
+    assert!(accounts[0].claimed, "авто-регистрация задала пароль");
+    assert_eq!(accounts[0].wallet, START_WALLET);
 }

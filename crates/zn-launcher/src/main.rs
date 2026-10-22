@@ -203,9 +203,10 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    let mut guest = false;
     loop {
         println!(
-            "ZONA [{}] — [1] Играть  [2] Обновить  [q] Выход",
+            "ZONA [{}] — [1] Играть  [2] Обновить  [3] Играть гостем  [q] Выход",
             status_line(&report)
         );
         let choice = read_line();
@@ -219,6 +220,11 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 Err(error) => eprintln!("обновление не удалось: {error}"),
             },
+            // Гость (M5-3): запуск без аккаунта — конфиг не трогаем.
+            "3" => {
+                guest = true;
+                break;
+            }
             "q" | "й" => return Ok(()),
             _ => continue,
         }
@@ -231,7 +237,20 @@ fn run(cli: Cli) -> Result<()> {
     if let Some(warning) = run::server_warning(&server) {
         eprintln!("предупреждение: {warning}");
     }
-    let mut command = run::client_command(&layout.client_exe(), &layout.content_dir(), &server);
+    let credentials = if guest {
+        run::Credentials::default()
+    } else {
+        run::Credentials {
+            account: config.account.as_deref(),
+            password: config.password.as_deref(),
+        }
+    };
+    let mut command = run::client_command(
+        &layout.client_exe(),
+        &layout.content_dir(),
+        &server,
+        &credentials,
+    );
     let status = command
         .status()
         .map_err(|e| Error::Install(format!("не удалось запустить клиента: {e}")))?;
@@ -256,9 +275,14 @@ fn launch_dev(launcher_exe: &Path, keep_console: bool) -> Result<()> {
             client.display()
         )));
     }
-    let status = run::client_command(&client, &content, &ServerChoice::default())
-        .status()
-        .map_err(|e| Error::Install(format!("не удалось запустить dev-клиента: {e}")))?;
+    let status = run::client_command(
+        &client,
+        &content,
+        &ServerChoice::default(),
+        &run::Credentials::default(),
+    )
+    .status()
+    .map_err(|e| Error::Install(format!("не удалось запустить dev-клиента: {e}")))?;
     if !status.success() {
         eprintln!("dev-клиент завершился с кодом {:?}", status.code());
     }

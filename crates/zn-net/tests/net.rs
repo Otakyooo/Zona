@@ -68,6 +68,27 @@ fn stash_actions_roundtrip_through_bincode() {
 }
 
 #[test]
+fn base_actions_roundtrip_through_bincode() {
+    let actions = [
+        BaseActionKind::Sell {
+            from_stash: true,
+            slot: 2,
+        },
+        BaseActionKind::Sell {
+            from_stash: false,
+            slot: 39,
+        },
+        BaseActionKind::Buy { offer: 0 },
+        BaseActionKind::Upgrade,
+    ];
+    for action in actions {
+        let bytes = encode_message(&action).unwrap();
+        let decoded: BaseActionKind = decode_message(&bytes).unwrap();
+        assert_eq!(decoded, action);
+    }
+}
+
+#[test]
 fn all_message_variants_roundtrip_through_bincode() {
     let messages = vec![
         Message::ClientHello {
@@ -75,7 +96,10 @@ fn all_message_variants_roundtrip_through_bincode() {
             content_hash: 0xDEAD_BEEF_CAFE_F00D,
             items_hash: 0x0BAD_F00D_1234_5678,
             name: "Сталкер".to_string(),
-            profile: Some("stalker-1".to_string()),
+            auth: Some(AuthHello {
+                account: "stalker-1".to_string(),
+                password_digest: password_digest("hunter2"),
+            }),
         },
         Message::InputPacket {
             inputs: vec![ClientInput::new(1), ClientInput::new(2)],
@@ -93,6 +117,25 @@ fn all_message_variants_roundtrip_through_bincode() {
             tick: 44,
             action: StashAction::Take { index: 2 },
         },
+        Message::BaseInteract {
+            tick: 45,
+            station: 0,
+        },
+        Message::BaseAction {
+            tick: 46,
+            action: BaseActionKind::Sell {
+                from_stash: true,
+                slot: 1,
+            },
+        },
+        Message::BaseAction {
+            tick: 47,
+            action: BaseActionKind::Buy { offer: 2 },
+        },
+        Message::BaseAction {
+            tick: 48,
+            action: BaseActionKind::Upgrade,
+        },
         Message::Ping { nonce: 9 },
         Message::ClientBye,
         Message::ServerWelcome {
@@ -100,6 +143,7 @@ fn all_message_variants_roundtrip_through_bincode() {
             server_tick: 120,
             spawn: [0.0, 0.0, 14.0],
             location: 0,
+            account_created: false,
         },
         Message::ServerReject {
             reason: RejectReason::VersionMismatch { server: 99 },
@@ -109,6 +153,9 @@ fn all_message_variants_roundtrip_through_bincode() {
         },
         Message::ServerReject {
             reason: RejectReason::SessionFull,
+        },
+        Message::ServerReject {
+            reason: RejectReason::AuthFailed,
         },
         Message::Snapshot {
             server_tick: 50,
@@ -176,6 +223,24 @@ fn all_message_variants_roundtrip_through_bincode() {
         },
         Message::StashUpdate {
             items: vec![ItemStackNet { item: 6, count: 5 }],
+        },
+        Message::BaseUpdate {
+            station: Some(0),
+            wallet: 200,
+            facilities: [1, 0, 0],
+            offers: vec![
+                ItemStackNet { item: 1, count: 1 },
+                ItemStackNet { item: 4, count: 30 },
+            ],
+        },
+        Message::BaseUpdate {
+            station: None,
+            wallet: 1_250,
+            facilities: [2, 1, 0],
+            offers: vec![],
+        },
+        Message::BaseNotice {
+            text: "не хватает RU".to_string(),
         },
     ];
 
@@ -318,7 +383,7 @@ fn position_and_yaw_quantization_roundtrip() {
 
 #[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 8);
+    assert_eq!(PROTOCOL_VERSION, 9);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);
@@ -327,4 +392,22 @@ fn protocol_constants_are_sane() {
     assert_eq!(PING_INTERVAL, std::time::Duration::from_secs(1));
     assert_eq!(SERVER_TIMEOUT, std::time::Duration::from_secs(5));
     assert_eq!(CLIENT_TIMEOUT, std::time::Duration::from_secs(3));
+}
+
+#[test]
+fn password_digest_is_deterministic_and_salted_by_password() {
+    let a = password_digest("zona-2026");
+    let b = password_digest("zona-2026");
+    let c = password_digest("Zona-2026");
+    assert_eq!(a, b, "один пароль — один дайджест");
+    assert_ne!(a, c, "разные пароли — разные дайджесты");
+    // SHA-256("") — эталонный вектор: детерминизм функции.
+    assert_eq!(
+        password_digest(""),
+        [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ]
+    );
 }

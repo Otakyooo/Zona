@@ -1,0 +1,11 @@
+[Unit]
+Description=ZONA nightly DB backup timer (03:30, retention 7 days)
+
+[Timer]
+# Ночь, когда игроков мало: 03:30 локального времени бокса.
+OnCalendar=*-*-* 03:30:00
+# Догнать пропущенный запуск после простоя/перезагрузки бокса.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

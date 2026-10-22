@@ -1,0 +1,8 @@
+[Unit]
+Description=ZONA nightly DB backup (online, retention 7 days)
+
+[Service]
+Type=oneshot
+# bash явно: exec-бит в git не сохраняется (Windows), на боксе = страховка.
+ExecStart=/bin/bash /opt/zona/zona-backup.sh
+# Логи — в journald: journalctl -u zona-backup -n 50

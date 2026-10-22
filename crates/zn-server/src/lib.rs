@@ -1,21 +1,29 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use zn_content::ItemCatalog;
 use zn_net::{
-    check_client_hello, decode_message, encode_message, BoltNet, ClientInput, CorpseNet, GameEvent,
-    GroundItemNet, InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason,
-    StashAction, INPUT_REDUNDANCY, MAX_NAME_LEN, SERVER_TIMEOUT, SIMULATION_HZ, SNAPSHOT_HZ,
+    check_client_hello, decode_message, encode_message, AuthHello, BaseActionKind, BoltNet,
+    ClientInput, CorpseNet, GameEvent, GroundItemNet, InventoryAction, ItemStackNet, Message,
+    PlayerNetState, RejectReason, StashAction, INPUT_REDUNDANCY, MAX_NAME_LEN, SERVER_TIMEOUT,
+    SIMULATION_HZ, SNAPSHOT_HZ,
 };
 use zn_scene::{
     distances_to_base, world_content_hash, LocationId, LocationInfo, LocationRegistry, Scene,
-    LOCATION_BASE,
+    StationKind, LOCATION_BASE,
 };
 use zn_sim::{NetUpdates, PlayerAction, Simulation, Stack, Vec3, ANOMALY_HEART_HEIGHT};
+
+mod db;
+
+pub use db::{AccountSummary, Database, DB_FILE_DEFAULT};
 
 /// Порт по умолчанию для выделенного сервера.
 pub const DEFAULT_PORT: u16 = 7700;
@@ -41,12 +49,31 @@ const BLOWOUT_ACTIVE_TICKS: u64 = 15 * SIMULATION_HZ as u64;
 const BLOWOUT_DAMAGE_INTERVAL_TICKS: u64 = SIMULATION_HZ as u64 / 2;
 const BLOWOUT_DAMAGE_PER_HIT: u16 = 4;
 
-/// Имя файла персиста стэшей по умолчанию (в рабочей директории сервера).
+/// Легаси-файл стэшей (M4d-2): в M5 только читается для миграции в БД.
 pub const STASH_FILE_DEFAULT: &str = "stashes.ron";
-/// Версия схемы файла стэшей (M4d-2): рост ломает совместимость молча.
+/// Версия схемы легаси-файла стэшей (M4d-2).
 const STASH_FILE_VERSION: u32 = 1;
-/// Период автосохранения стэшей профилей (30 с виртуального времени сессии).
+/// Период автосохранения складов аккаунтов (30 с виртуального времени сессии).
 const STASH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// Аккаунты (M5): защита от перебора пароля per-addr — после N отказов
+/// проверка не выполняется, пока не истечёт окно.
+const AUTH_MAX_FAILURES: u32 = 5;
+const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(10);
+
+/// База между рейдами (M5-2): стартовый баланс кошелька нового аккаунта (RU).
+pub const START_WALLET: u32 = 200;
+/// Верстак: прибавка к доле сохраняемой добычи за каждый уровень.
+const WORKBENCH_EXTRACT_BONUS: f32 = 0.1;
+/// Медпункт: лечение игроков на базе — HP в секунду за каждый уровень.
+const MEDPOST_HEAL_PER_SEC: f32 = 2.0;
+/// Сейф: доля вещей, спасённых с трупа при смерти, за каждый уровень.
+const SAFE_SALVAGE_FRACTION: f32 = 0.25;
+/// Торговец: покупает по цене каталога, продаёт офферы с наценкой.
+const TRADER_BUY_MARKUP: u32 = 2;
+/// Максимальный уровень станции (верстак/медпункт/сейф).
+const FACILITY_MAX_LEVEL: u8 = 3;
+/// Цена апгрейда станции на следующий уровень: база × (текущий + 1).
+const UPGRADE_COST_BASE: u32 = 300;
 
 /// Период выбросов по умолчанию (M4d-3b): ожидание → предупреждение → актив.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,9 +104,13 @@ pub struct SessionConfig {
     pub out_loss_pct: f32,
     /// Seed детерминированного генератора потерь (воспроизводимость).
     pub rng_seed: u32,
-    /// Файл персиста стэшей профилей (M4d-2). `None` — склад живёт только в
-    /// памяти сессии (поведение M4d, режим тестов).
-    pub stash_file: Option<PathBuf>,
+    /// Файл БД аккаунтов (M5). `None` — персист выключен: аккаунты живут
+    /// только в памяти сессии (режим тестов).
+    pub db_file: Option<PathBuf>,
+    /// Гостевой вход запрещён (M5-3): `auth = None` → отказ. Для реального
+    /// деплоя персист обязан быть включён — иначе аккаунты не сохраняются
+    /// между перезапусками.
+    pub auth_required: bool,
     /// Тайминги выброса (M4d-3b); в тестах укорачиваются.
     pub blowout: BlowoutTiming,
 }
@@ -91,7 +122,8 @@ impl Default for SessionConfig {
             out_latency: Duration::ZERO,
             out_loss_pct: 0.0,
             rng_seed: 0x9E37_79B9,
-            stash_file: None,
+            db_file: None,
+            auth_required: false,
             blowout: BlowoutTiming::default(),
         }
     }
@@ -806,6 +838,20 @@ fn player_positions(simulation: &mut Simulation) -> Vec<(u64, Vec3)> {
         .collect()
 }
 
+/// Цена апгрейда станции с текущего `level` на следующий (M5-2).
+fn upgrade_cost(level: u8) -> u32 {
+    UPGRADE_COST_BASE * u32::from(level + 1)
+}
+
+/// Название станции по индексу facilities (M5-2): уведомления и логи.
+fn facility_name(facility: usize) -> &'static str {
+    match facility {
+        0 => "верстак",
+        1 => "медпункт",
+        _ => "сейф",
+    }
+}
+
 /// Подставляет имена в события смертей и нокдаунов: симуляция знает только
 /// id, а клиентам нужен килл-фид.
 fn enrich_events(events: Vec<GameEvent>, names: &HashMap<u64, String>) -> Vec<GameEvent> {
@@ -861,9 +907,44 @@ struct ClientState {
     last_interact_tick: u64,
     /// Последний обработанный `InventoryAction`/`StashAction`/`ThrowBolt`.
     last_action_tick: u64,
-    /// Профиль игрока (M4d-2): ключ персистентного склада. `None` — склад
-    /// живёт только в памяти сессии.
-    profile: Option<String>,
+    /// Аккаунт игрока (M5): имя из `AuthHello`. `None` — гостевой вход
+    /// (склад живёт только в памяти сессии).
+    account: Option<String>,
+    /// `id` аккаунта в БД (ключ стэша/кошелька/апгрейдов). `None` — гость
+    /// или персист выключен.
+    account_id: Option<i64>,
+    /// Аккаунт создан этим подключением (M5): уведомление в Welcome.
+    account_created: bool,
+    /// Персональное состояние базы (M5-2): кошелёк и уровни станций.
+    base: BaseState,
+}
+
+/// Персональное состояние базы (M5-2): кошелёк, уровни станций и панель.
+/// У гостей и при выключенном персисте живёт только в памяти сессии.
+#[derive(Clone, Debug)]
+struct BaseState {
+    /// Баланс кошелька аккаунта (RU).
+    wallet: u32,
+    /// Уровни станций: [верстак, медпункт, сейф].
+    facilities: [u8; 3],
+    /// Открытая панель станции (индекс в `Scene::stations`); `None` — закрыта.
+    station: Option<u8>,
+    /// Дробный остаток лечения медпункта (HP < 1) между тиками.
+    heal_debt: f32,
+    /// Контейнеры трупов игрока, с которых сейф уже спас долю (раз за труп).
+    salvaged: HashSet<u64>,
+}
+
+impl BaseState {
+    fn new(wallet: u32, facilities: [u8; 3]) -> Self {
+        Self {
+            wallet,
+            facilities,
+            station: None,
+            heal_debt: 0.0,
+            salvaged: HashSet::new(),
+        }
+    }
 }
 
 /// Состояние локации для рассылки (двухфазный сбор — снапшоты шлются уже
@@ -897,14 +978,14 @@ pub struct Session {
     outbox: VecDeque<(Duration, SocketAddr, Vec<u8>)>,
     rng: u32,
     stats: SessionStats,
-    /// Персист стэшей (M4d-2): склад профилей, загруженный из файла (без
-    /// живой сессии) и ожидающий записи. `None` — персист выключен.
-    stash_path: Option<PathBuf>,
-    /// Склады профилей, загруженные из файла, но не занятые сессией.
-    stashes_disk: HashMap<String, Vec<Stack>>,
-    /// Есть несохранённые изменения склада.
+    /// Персист аккаунтов (M5): БД со стэшами (и в M5-2 — кошельками/апгрейдами).
+    /// `None` — персист выключен (`--no-db`, режим тестов).
+    db: Option<Database>,
+    /// Есть несохранённые изменения складов.
     stash_dirty: bool,
     last_stash_flush: Duration,
+    /// Неудачные попытки входа per-addr: (число отказов, начало окна).
+    auth_failures: HashMap<SocketAddr, (u32, Duration)>,
 }
 
 impl Session {
@@ -999,20 +1080,53 @@ impl Session {
             );
         }
         let rng = config.rng_seed | 1;
-        let (stash_path, stashes_disk) = match config.stash_file.clone() {
+        // Персист аккаунтов (M5): БД + миграция легаси-стэшей (M4d-2).
+        let (db, migrated) = match config.db_file.clone() {
             Some(path) => {
-                let loaded = load_stash_file(&path);
-                if !loaded.is_empty() {
-                    log::info!(
-                        "стэши: загружено профилей из {}: {}",
-                        path.display(),
-                        loaded.len()
-                    );
+                let database = Database::open(&path)
+                    .map_err(|error| io::Error::other(format!("бд {}: {error}", path.display())))?;
+                // Миграция только на пустую БД: повторный старт не двоит.
+                let mut migrated = 0usize;
+                if database.account_count().unwrap_or(0) == 0 {
+                    let legacy_path = path.with_file_name(STASH_FILE_DEFAULT);
+                    let legacy = load_stash_file(&legacy_path);
+                    if !legacy.is_empty() {
+                        match database.import_legacy_stashes(&legacy) {
+                            Ok(count) => {
+                                migrated = count;
+                                let imported = legacy_path.with_extension("ron.imported");
+                                match std::fs::rename(&legacy_path, &imported) {
+                                    Ok(()) => log::info!(
+                                        "бд: миграция — {count} профилей из {} (исходник → {})",
+                                        legacy_path.display(),
+                                        imported.display()
+                                    ),
+                                    Err(error) => log::warn!(
+                                        "бд: миграция — {count} профилей из {}, но переименовать не удалось: {error}",
+                                        legacy_path.display()
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "бд: миграция из {} не удалась: {error}",
+                                    legacy_path.display()
+                                )
+                            }
+                        }
+                    }
                 }
-                (Some(path), loaded)
+                (Some(database), migrated)
             }
-            None => (None, HashMap::new()),
+            None => (None, 0),
         };
+        if let Some(path) = &config.db_file {
+            log::info!(
+                "бд: {} (аккаунтов: {}, миграция: {migrated})",
+                path.display(),
+                db.as_ref().map_or(0, |db| db.account_count().unwrap_or(0))
+            );
+        }
         Ok(Self {
             socket,
             world,
@@ -1027,10 +1141,10 @@ impl Session {
             outbox: VecDeque::new(),
             rng,
             stats: SessionStats::default(),
-            stash_path,
-            stashes_disk,
+            db,
             stash_dirty: false,
             last_stash_flush: Duration::ZERO,
+            auth_failures: HashMap::new(),
         })
     }
 
@@ -1086,6 +1200,21 @@ impl Session {
                 }
             })
             .collect()
+    }
+
+    /// Сводка аккаунтов для консоли `accounts` (M5-3). Персист выключен —
+    /// пустой список: аккаунты живут только в сессиях.
+    pub fn account_summaries(&self) -> Vec<AccountSummary> {
+        let Some(db) = self.db.as_ref() else {
+            return Vec::new();
+        };
+        match db.list_accounts() {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                log::warn!("бд: не удалось выгрузить список аккаунтов: {error}");
+                Vec::new()
+            }
+        }
     }
 
     /// Симуляция базовой локации (диагностика/тесты). В одиночном режиме —
@@ -1237,8 +1366,11 @@ impl Session {
             // Выброс (M4d-3b): смена фаз и поражение вне базы.
             self.world.advance_blowout();
             self.world.apply_blowout_damage();
+            // База между рейдами (M5-2): реген медпункта и страховка сейфа.
+            self.apply_medpost_heal(dt);
+            self.apply_safe_salvage();
         }
-        self.flush_stashes_if_dirty();
+        self.flush_accounts_if_dirty();
         if self.world.tick() - self.last_snapshot_tick >= SNAPSHOT_EVERY_TICKS {
             self.last_snapshot_tick = self.world.tick();
             self.send_snapshots();
@@ -1247,53 +1379,48 @@ impl Session {
         self.flush_outbox();
     }
 
-    /// Пишет стэши профилей на диск, если есть изменения и включён персист.
-    fn flush_stashes_if_dirty(&mut self) {
+    /// Пишет склады аккаунтов в БД, если есть изменения и включён персист.
+    fn flush_accounts_if_dirty(&mut self) {
         if !self.stash_dirty || self.now < self.last_stash_flush + STASH_FLUSH_INTERVAL {
             return;
         }
-        self.flush_stashes();
+        self.flush_accounts();
     }
 
-    /// Принудительно пишет стэши профилей (quit консоли, отключение игрока).
-    pub fn flush_stashes(&mut self) {
+    /// Принудительно пишет склады аккаунтов в БД (quit консоли, отключение).
+    pub fn flush_accounts(&mut self) {
         self.stash_dirty = false;
         self.last_stash_flush = self.now;
-        let Some(path) = self.stash_path.clone() else {
+        let Some(db) = self.db.as_ref() else {
             return;
         };
-        // Живые сессии профилей перекрывают дисковые: склад — у игрока.
-        let mut merged = self.stashes_disk.clone();
         for (player_id, items) in &self.world.stashes {
-            if let Some(profile) = self.profile_of(*player_id) {
-                merged.insert(profile, items.clone());
+            if let Some(account_id) = self.account_id_of(*player_id) {
+                if let Err(error) = db.save_stash(account_id, items) {
+                    log::error!("бд: склад игрока {player_id} не сохранён: {error}");
+                }
             }
-        }
-        if merged.is_empty() && !path.exists() {
-            return;
-        }
-        match save_stash_file(&path, &merged) {
-            Ok(()) => log::info!(
-                "стэши: сохранено {} профилей в {}",
-                merged.len(),
-                path.display()
-            ),
-            Err(error) => log::error!("стэши: не удалось сохранить {}: {error}", path.display()),
         }
     }
 
-    /// Профиль игрока по id (если клиент подключился с профилем).
-    fn profile_of(&self, player_id: u64) -> Option<String> {
+    /// `id` аккаунта в БД по игроку (ключ персиста).
+    fn account_id_of(&self, player_id: u64) -> Option<i64> {
         self.clients
             .values()
             .find(|client| client.player_id == player_id)
-            .and_then(|client| client.profile.clone())
+            .and_then(|client| client.account_id)
     }
 
     /// Экстракция (M4d-2): депозит доли добычи, событие в снапшот локации,
     /// перенос на базу. Круги сцены читает клиент локально — рендер без сети.
+    /// Верстак (M5-2): каждый его уровень прибавляет к доле сохраняемой добычи.
     fn apply_extractions(&mut self, extractions: Vec<Extraction>) {
-        for extraction in extractions {
+        for mut extraction in extractions {
+            let workbench = self.facility_of(extraction.player_id, 0);
+            if workbench > 0 {
+                extraction.percent =
+                    (extraction.percent + f32::from(workbench) * WORKBENCH_EXTRACT_BONUS).min(1.0);
+            }
             let name = self
                 .names
                 .get(&extraction.player_id)
@@ -1364,6 +1491,18 @@ impl Session {
                 }
                 // Даже пустая сдача освежает панель: клиент всегда видит склад.
                 self.send_stash_update(change.player_id);
+                // Кошелёк и уровни станций — тоже актуальны после рейда.
+                self.send_base_update(change.player_id);
+            } else if change.from == self.world.base {
+                // Уход с базы закрывает панель станции: на выезде её нет.
+                let open = self
+                    .clients
+                    .values_mut()
+                    .find(|client| client.player_id == change.player_id)
+                    .is_some_and(|client| client.base.station.take().is_some());
+                if open {
+                    self.send_base_update(change.player_id);
+                }
             }
         }
     }
@@ -1397,15 +1536,8 @@ impl Session {
                 content_hash,
                 items_hash,
                 name,
-                profile,
-            } => self.handle_hello(
-                addr,
-                protocol_version,
-                content_hash,
-                items_hash,
-                name,
-                profile,
-            ),
+                auth,
+            } => self.handle_hello(addr, protocol_version, content_hash, items_hash, name, auth),
             Message::InputPacket { inputs } => self.handle_inputs(addr, inputs),
             Message::Interact { tick } => self.handle_interact(addr, tick),
             Message::InventoryAction { tick, action } => {
@@ -1413,6 +1545,12 @@ impl Session {
             }
             Message::StashAction { tick, action } => {
                 self.handle_stash_action(addr, tick, action);
+            }
+            Message::BaseInteract { tick, station } => {
+                self.handle_base_interact(addr, tick, station);
+            }
+            Message::BaseAction { tick, action } => {
+                self.handle_base_action(addr, tick, action);
             }
             Message::ThrowBolt { tick } => self.handle_throw_bolt(addr, tick),
             Message::Ping { nonce } => {
@@ -1436,7 +1574,7 @@ impl Session {
         content_hash: u64,
         items_hash: u64,
         name: String,
-        profile: Option<String>,
+        auth: Option<AuthHello>,
     ) {
         // Повтор Hello (Welcome мог потеряться) — повторяем Welcome.
         if let Some(client) = self.clients.get_mut(&addr) {
@@ -1470,19 +1608,136 @@ impl Session {
         }
 
         let name = clamp_name(&name);
+
+        // Гостевой вход запрещён (M5-3): `--auth-required` закрывает сервер для
+        // анонимных подключений. Аккаунты при выключенном персисте живут только
+        // в сессии — для реального деплоя БД обязательна.
+        if auth.is_none() && self.config.auth_required {
+            log::info!("отказ {addr}: гостевой вход запрещён (--auth-required)");
+            self.send(
+                addr,
+                Message::ServerReject {
+                    reason: RejectReason::AuthFailed,
+                },
+            );
+            return;
+        }
+
+        // Аккаунты (M5): гость / проверка пароля / claim миграции /
+        // авто-регистрация. БД выключена — аккаунт живёт только в сессии.
+        let mut account = None;
+        let mut account_id = None;
+        let mut account_created = false;
+        let mut stash_from_db = None;
+        if let Some(auth) = &auth {
+            if self.auth_rate_limited(addr) {
+                log::warn!("отказ {addr}: слишком много неудачных входов");
+                self.send(
+                    addr,
+                    Message::ServerReject {
+                        reason: RejectReason::AuthFailed,
+                    },
+                );
+                return;
+            }
+            let found = self
+                .db
+                .as_ref()
+                .and_then(|db| db.find_account(&auth.account));
+            match found {
+                Some(known) => match &known.password_hash {
+                    // Известный аккаунт с паролем — сверяем дайджест.
+                    Some(password_hash) => {
+                        if !verify_password(&auth.password_digest, password_hash) {
+                            self.note_auth_failure(addr);
+                            log::info!("отказ {addr}: неверный пароль '{}'", known.name);
+                            self.send(
+                                addr,
+                                Message::ServerReject {
+                                    reason: RejectReason::AuthFailed,
+                                },
+                            );
+                            return;
+                        }
+                        if let Some(db) = self.db.as_ref() {
+                            let _ = db.touch(&known.name);
+                            stash_from_db = db.load_stash(known.id).ok();
+                        }
+                        account = Some(known.name);
+                        account_id = Some(known.id);
+                    }
+                    // Мигрированный из stashes.ron: первый вход задаёт пароль.
+                    None => {
+                        let claimed = self
+                            .db
+                            .as_ref()
+                            .and_then(|db| hash_password(&auth.password_digest).map(|h| (db, h)))
+                            .and_then(|(db, hash)| db.set_password(&auth.account, &hash).ok());
+                        if claimed.is_some() {
+                            log::info!("аккаунт '{}': пароль задан (миграция)", auth.account);
+                            if let Some(db) = self.db.as_ref() {
+                                stash_from_db = db.load_stash(known.id).ok();
+                            }
+                        } else {
+                            log::error!("бд: не удалось задать пароль аккаунту '{}'", auth.account);
+                        }
+                        account = Some(auth.account.clone());
+                        account_id = Some(known.id);
+                    }
+                },
+                // Неизвестный аккаунт — авто-регистрация (как профили в M4d-2).
+                None => match self.db.as_ref() {
+                    Some(db) => {
+                        let hash = hash_password(&auth.password_digest);
+                        match db.insert_account(&auth.account, hash.as_deref()) {
+                            Ok(id) => {
+                                log::info!("аккаунт '{}' создан", auth.account);
+                                account = Some(auth.account.clone());
+                                account_id = Some(id);
+                                account_created = true;
+                            }
+                            Err(error) => {
+                                log::error!("бд: аккаунт '{}' не создан: {error}", auth.account);
+                                account = Some(auth.account.clone());
+                            }
+                        }
+                    }
+                    None => {
+                        log::info!(
+                            "персист выключен — '{}' подключается без сохранения",
+                            auth.account
+                        );
+                        account = Some(auth.account.clone());
+                    }
+                },
+            }
+        }
+
+        // Кошелёк и уровни станций (M5-2): из БД аккаунта; гость/выключенный
+        // персист — стартовый баланс и нули (живут в памяти сессии).
+        let mut wallet = START_WALLET;
+        let mut facilities = [0u8; 3];
+        if let (Some(db), Some(id)) = (self.db.as_ref(), account_id) {
+            wallet = db.load_wallet(id).unwrap_or(START_WALLET);
+            facilities = db.load_facilities(id).unwrap_or_default();
+        }
+
         let (player_id, _) = self.world.spawn_on_base();
-        // Профиль (M4d-2): склад с прошлых сессий едет с игроком.
-        if let Some(profile) = &profile {
-            if let Some(items) = self.stashes_disk.remove(profile) {
+        // Склад с прошлых сессий едет с игроком.
+        if let Some(items) = stash_from_db {
+            if !items.is_empty() {
                 self.world.stashes.insert(player_id, items);
-                log::info!("стэши: профиль '{profile}' восстановил склад игрока {player_id}");
+                log::info!(
+                    "стэши: аккаунт '{}' восстановил склад игрока {player_id}",
+                    account.as_deref().unwrap_or("?")
+                );
             }
         }
         log::info!(
             "игрок '{name}' (id {player_id}{}) подключился с {addr} в '{}' [{} игроков]",
-            profile
+            account
                 .as_ref()
-                .map(|profile| format!(", профиль '{profile}'"))
+                .map(|account| format!(", аккаунт '{account}'"))
                 .unwrap_or_default(),
             self.world.location_name(self.world.base),
             self.clients.len() + 1
@@ -1497,13 +1752,39 @@ impl Session {
                 last_seen: self.now,
                 last_interact_tick: 0,
                 last_action_tick: 0,
-                profile,
+                account,
+                account_id,
+                account_created,
+                base: BaseState::new(wallet, facilities),
             },
         );
         self.send_welcome(addr, player_id);
+        // Кошелёк и уровни станций — сразу: HUD не ждёт первой панели.
+        self.send_base_update(player_id);
+    }
+
+    /// Превышен ли лимит неудачных входов с адреса (окно `AUTH_FAIL_WINDOW`).
+    fn auth_rate_limited(&self, addr: SocketAddr) -> bool {
+        self.auth_failures.get(&addr).is_some_and(|(count, since)| {
+            *count >= AUTH_MAX_FAILURES && self.now.saturating_sub(*since) < AUTH_FAIL_WINDOW
+        })
+    }
+
+    /// Учитывает неудачный вход: окно сбрасывает счётчик.
+    fn note_auth_failure(&mut self, addr: SocketAddr) {
+        let entry = self.auth_failures.entry(addr).or_insert((0, self.now));
+        if self.now.saturating_sub(entry.1) >= AUTH_FAIL_WINDOW {
+            *entry = (1, self.now);
+        } else {
+            entry.0 += 1;
+        }
     }
 
     fn send_welcome(&mut self, addr: SocketAddr, player_id: u64) {
+        let account_created = self
+            .clients
+            .get(&addr)
+            .is_some_and(|client| client.account_created);
         let server_tick = self.world.tick();
         let location = self
             .world
@@ -1523,6 +1804,7 @@ impl Session {
                 server_tick,
                 spawn,
                 location,
+                account_created,
             },
         );
     }
@@ -1687,6 +1969,506 @@ impl Session {
         }
     }
 
+    // --- База между рейдами (M5-2): станции, торговец, апгрейды -------------
+
+    /// Уровень станции игрока: 0 — верстак, 1 — медпункт, 2 — сейф.
+    /// Неизвестный игрок (отключился между тиками) — 0.
+    fn facility_of(&self, player_id: u64, facility: usize) -> u8 {
+        self.clients
+            .values()
+            .find(|client| client.player_id == player_id)
+            .map_or(0, |client| client.base.facilities[facility])
+    }
+
+    /// Вид станции базы по индексу в `Scene::stations` (сцена базы).
+    fn station_kind_at(&self, station: u8) -> Option<StationKind> {
+        let base = self.world.base;
+        self.world
+            .locations
+            .get(&base)
+            .and_then(|runtime| runtime.scene.stations.get(usize::from(station)))
+            .map(|station| station.kind)
+    }
+
+    /// Офферы торговца станции: (индекс предмета в каталоге, количество).
+    fn trader_offers(&self, station: u8) -> Vec<ItemStackNet> {
+        let base = self.world.base;
+        let Some(runtime) = self.world.locations.get(&base) else {
+            return Vec::new();
+        };
+        let Some(scene_station) = runtime.scene.stations.get(usize::from(station)) else {
+            return Vec::new();
+        };
+        scene_station
+            .offers
+            .iter()
+            .filter_map(|offer| {
+                let item = runtime.simulation.catalog_index_of(&offer.item)?;
+                Some(ItemStackNet {
+                    item,
+                    count: u16::try_from(offer.count).unwrap_or(u16::MAX),
+                })
+            })
+            .collect()
+    }
+
+    /// Открытие/закрытие панели станции (M5-2): E внутри круга. Повторное
+    /// взаимодействие с той же станцией закрывает панель. Дедупликация по
+    /// `tick` — общим счётчиком с прочими действиями.
+    fn handle_base_interact(&mut self, addr: SocketAddr, tick: u64, station: u8) {
+        let Some(client) = self.clients.get_mut(&addr) else {
+            return;
+        };
+        client.last_seen = self.now;
+        if tick <= client.last_action_tick {
+            return;
+        }
+        client.last_action_tick = tick;
+        let player_id = client.player_id;
+        let was_open = client.base.station;
+        // Вне базы станций нет: панель не открывается.
+        if self.world.player_location(player_id) != Some(self.world.base) {
+            log::debug!("база: игрок {player_id} не на базе — панель не открыта");
+            return;
+        }
+        // Станция должна существовать в сцене, а игрок — стоять в её круге.
+        let base = self.world.base;
+        let position = self
+            .world
+            .locations
+            .get_mut(&base)
+            .and_then(|runtime| runtime.simulation.player_state(player_id))
+            .map(|state| state.position);
+        let near_station = position.is_some_and(|position| {
+            self.world
+                .locations
+                .get(&base)
+                .and_then(|runtime| runtime.scene.stations.get(usize::from(station)))
+                .is_some_and(|scene_station| scene_station.contains(position))
+        });
+        if !near_station {
+            self.send_base_notice(player_id, "подойди к станции ближе");
+            return;
+        }
+        // Тумблер: повторное E у той же станции закрывает панель.
+        let open = if was_open == Some(station) {
+            None
+        } else {
+            Some(station)
+        };
+        if let Some(client) = self.clients.get_mut(&addr) {
+            client.base.station = open;
+        }
+        self.send_base_update(player_id);
+    }
+
+    /// Действие в панели станции (M5-2): продажа/покупка у торговца, апгрейд
+    /// верстака/медпункта/сейфа. Дедупликация по `tick`, как у stash-действий.
+    fn handle_base_action(&mut self, addr: SocketAddr, tick: u64, action: BaseActionKind) {
+        let Some(client) = self.clients.get_mut(&addr) else {
+            return;
+        };
+        client.last_seen = self.now;
+        if tick <= client.last_action_tick {
+            return;
+        }
+        client.last_action_tick = tick;
+        let player_id = client.player_id;
+        let Some(station) = client.base.station else {
+            self.send_base_notice(player_id, "панель станции закрыта");
+            return;
+        };
+        if self.world.player_location(player_id) != Some(self.world.base) {
+            return;
+        }
+        let kind = self.station_kind_at(station);
+        match action {
+            BaseActionKind::Sell { from_stash, slot } => {
+                if kind != Some(StationKind::Trader) {
+                    self.send_base_notice(player_id, "продаёт только торговец");
+                    return;
+                }
+                self.trader_sell(player_id, from_stash, slot);
+            }
+            BaseActionKind::Buy { offer } => {
+                if kind != Some(StationKind::Trader) {
+                    self.send_base_notice(player_id, "продаёт только торговец");
+                    return;
+                }
+                self.trader_buy(player_id, station, offer);
+            }
+            BaseActionKind::Upgrade => self.upgrade_facility(player_id, kind),
+        }
+        // Панель освежается после любого действия: кошелёк/уровни могли
+        // измениться, офферы остались те же.
+        self.send_base_update(player_id);
+    }
+
+    /// Продажа торговцу: стопка из склада или инвентаря по цене каталога.
+    fn trader_sell(&mut self, player_id: u64, from_stash: bool, slot: u8) {
+        let slot = usize::from(slot);
+        // Стопка и её цена читаются без изменений: отказ по пустой ячейке
+        // или нулевой цене не должен ничего трогать.
+        let stash_stack = if from_stash {
+            self.world
+                .stashes
+                .get(&player_id)
+                .and_then(|stash| stash.get(slot))
+                .copied()
+        } else {
+            None
+        };
+        let base = self.world.base;
+        let peeked = self.world.locations.get_mut(&base).and_then(|runtime| {
+            let stack =
+                stash_stack.or_else(|| runtime.simulation.inventory_slot(player_id, slot))?;
+            let value = runtime.simulation.item_value_rub(stack.item).unwrap_or(0);
+            Some((stack, value))
+        });
+        let Some((stack, value)) = peeked else {
+            self.send_base_notice(player_id, "ячейка пуста");
+            return;
+        };
+        if value == 0 {
+            self.send_base_notice(player_id, "торговец не берёт этот хлам");
+            return;
+        }
+        let price = u64::from(value) * u64::from(stack.count);
+
+        // Забираем стопку: склад — из списка, инвентарь — из ячейки.
+        let taken = if from_stash {
+            self.world.stashes.get_mut(&player_id).is_some_and(|stash| {
+                slot < stash.len() && {
+                    stash.remove(slot);
+                    true
+                }
+            })
+        } else {
+            self.world
+                .locations
+                .get_mut(&base)
+                .and_then(|runtime| runtime.simulation.take_inventory_slot(player_id, slot))
+                .is_some()
+        };
+        if !taken {
+            return;
+        }
+
+        self.add_wallet(player_id, price);
+        if from_stash {
+            self.send_stash_update(player_id);
+        }
+        self.send_base_notice(player_id, &format!("продано: +{price} RU"));
+        log::info!("торговец: игрок {player_id} продал стопку за {price} RU");
+    }
+
+    /// Покупка оффера торговца: цена каталога × наценка × количество.
+    /// Что не влезло в инвентарь — уходит на склад базы.
+    fn trader_buy(&mut self, player_id: u64, station: u8, offer: u8) {
+        // Оффер и его цена читаются без изменений: отказ ничего не трогает.
+        let base = self.world.base;
+        let goods = self.world.locations.get(&base).and_then(|runtime| {
+            let scene_station = runtime.scene.stations.get(usize::from(station))?;
+            let scene_offer = scene_station.offers.get(usize::from(offer))?;
+            let item = runtime.simulation.catalog_index_of(&scene_offer.item)?;
+            let value = runtime.simulation.item_value_rub(item).unwrap_or(0);
+            Some((item, scene_offer.count, value))
+        });
+        let Some((item, count, value)) = goods else {
+            self.send_base_notice(player_id, "торговец не предлагает этого");
+            return;
+        };
+        let price = u64::from(value) * u64::from(TRADER_BUY_MARKUP) * u64::from(count);
+        if price == 0 {
+            self.send_base_notice(player_id, "торговец не продаёт хлам");
+            return;
+        }
+        let wallet = self
+            .clients
+            .values()
+            .find(|client| client.player_id == player_id)
+            .map_or(0, |client| client.base.wallet);
+        if u64::from(wallet) < price {
+            self.send_base_notice(player_id, "не хватает RU");
+            return;
+        }
+
+        let base = self.world.base;
+        let moved = self
+            .world
+            .locations
+            .get_mut(&base)
+            .map(|runtime| {
+                runtime
+                    .simulation
+                    .give_stack(player_id, Stack::new(item, count))
+            })
+            .unwrap_or(0);
+        if moved == 0 {
+            self.send_base_notice(player_id, "инвентарь полон");
+            return;
+        }
+        // Остаток партии — на склад: покупка на базе, склад под рукой.
+        if moved < count {
+            self.world
+                .stashes
+                .entry(player_id)
+                .or_default()
+                .push(Stack::new(item, count - moved));
+            self.stash_dirty = true;
+            self.send_stash_update(player_id);
+        }
+        self.spend_wallet(player_id, price);
+        self.send_base_notice(player_id, &format!("куплено: {} шт", moved));
+        log::info!("торговец: игрок {player_id} купил {moved} шт за {price} RU");
+    }
+
+    /// Апгрейд станции базы: уровень +1 за RU. Торговец не улучшается.
+    fn upgrade_facility(&mut self, player_id: u64, kind: Option<StationKind>) {
+        let facility = match kind {
+            Some(StationKind::Workbench) => 0,
+            Some(StationKind::Medpost) => 1,
+            Some(StationKind::Safe) => 2,
+            _ => {
+                self.send_base_notice(player_id, "тут нечего улучшать");
+                return;
+            }
+        };
+        let (level, wallet) = self
+            .clients
+            .values()
+            .find(|client| client.player_id == player_id)
+            .map_or((0, 0), |client| {
+                (client.base.facilities[facility], client.base.wallet)
+            });
+        if level >= FACILITY_MAX_LEVEL {
+            self.send_base_notice(player_id, "уже максимальный уровень");
+            return;
+        }
+        let cost = upgrade_cost(level);
+        if u64::from(wallet) < u64::from(cost) {
+            self.send_base_notice(player_id, "не хватает RU");
+            return;
+        }
+        if let Some(client) = self
+            .clients
+            .values_mut()
+            .find(|client| client.player_id == player_id)
+        {
+            client.base.facilities[facility] = level + 1;
+        }
+        self.spend_wallet(player_id, u64::from(cost));
+        self.save_facilities(player_id);
+        let name = facility_name(facility);
+        self.send_base_notice(player_id, &format!("{name} → уровень {}", level + 1));
+        log::info!(
+            "база: игрок {player_id} улучшил {name} до уровня {}",
+            level + 1
+        );
+    }
+
+    /// Медпункт (M5-2): лечение игроков на базе — HP/с за уровень станции.
+    fn apply_medpost_heal(&mut self, dt: Duration) {
+        let base = self.world.base;
+        let seconds = dt.as_secs_f32();
+        // Кого лечим: подключённые игроки на базе (дробный остаток копится
+        // в `heal_debt` — лечение называется реже раза в тик).
+        let mut jobs: Vec<(u64, u16)> = Vec::new();
+        for client in self.clients.values_mut() {
+            if self.world.player_location(client.player_id) != Some(base) {
+                client.base.heal_debt = 0.0;
+                continue;
+            }
+            let medpost = client.base.facilities[1];
+            if medpost == 0 {
+                continue;
+            }
+            client.base.heal_debt += f32::from(medpost) * MEDPOST_HEAL_PER_SEC * seconds;
+            let amount = client.base.heal_debt.floor();
+            if amount >= 1.0 {
+                client.base.heal_debt -= amount;
+                jobs.push((client.player_id, amount as u16));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        if let Some(runtime) = self.world.locations.get_mut(&base) {
+            for (player_id, amount) in jobs {
+                runtime.simulation.heal(player_id, amount);
+            }
+        }
+    }
+
+    /// Сейф (M5-2): при смерти игрока доля вещей с трупа уходит в склад
+    /// страховки — раз за труп, сила спасения — уровень станции.
+    fn apply_safe_salvage(&mut self) {
+        let mut jobs: Vec<(LocationId, u64, u64)> = Vec::new();
+        for (id, runtime) in &self.world.locations {
+            for corpse in runtime.simulation.snapshot_corpses() {
+                if corpse.owner == 0 {
+                    continue;
+                }
+                let already = self
+                    .clients
+                    .values()
+                    .find(|client| client.player_id == corpse.owner)
+                    .is_some_and(|client| client.base.salvaged.contains(&corpse.container));
+                if !already {
+                    jobs.push((*id, corpse.container, corpse.owner));
+                }
+            }
+        }
+        for (location, container, owner) in jobs {
+            let fraction = f32::from(self.facility_of(owner, 2)) * SAFE_SALVAGE_FRACTION;
+            let salvaged = self
+                .world
+                .locations
+                .get_mut(&location)
+                .map(|runtime| runtime.simulation.salvage_corpse(container, fraction))
+                .unwrap_or_default();
+            // Трупом занялись всё равно: даже без сейфа второй раз не
+            // обрабатываем — иначе уровень, купленный позже, спасёт дважды.
+            if let Some(client) = self
+                .clients
+                .values_mut()
+                .find(|client| client.player_id == owner)
+            {
+                client.base.salvaged.insert(container);
+            }
+            if salvaged.is_empty() {
+                continue;
+            }
+            let count = salvaged.len();
+            self.world
+                .stashes
+                .entry(owner)
+                .or_default()
+                .extend(salvaged);
+            self.stash_dirty = true;
+            self.send_stash_update(owner);
+            self.send_base_notice(owner, &format!("сейф: сохранено {count} стопок"));
+            log::info!(
+                "сейф: игрок {owner} спас со трупа {count} стопок (уровень {})",
+                self.facility_of(owner, 2)
+            );
+        }
+    }
+
+    /// Полное состояние базы игроку: панель (или её закрытие), кошелёк,
+    /// уровни станций и офферы торговца.
+    fn send_base_update(&mut self, player_id: u64) {
+        let Some(addr) = self.addr_of(player_id) else {
+            return;
+        };
+        let Some(client) = self.clients.get(&addr) else {
+            return;
+        };
+        let station = client.base.station;
+        let wallet = client.base.wallet;
+        let facilities = client.base.facilities;
+        // Офферы — только у торговца: у прочих станций панель без товара.
+        let offers = match station {
+            Some(station) if self.station_kind_at(station) == Some(StationKind::Trader) => {
+                self.trader_offers(station)
+            }
+            _ => Vec::new(),
+        };
+        self.send(
+            addr,
+            Message::BaseUpdate {
+                station,
+                wallet,
+                facilities,
+                offers,
+            },
+        );
+    }
+
+    /// Всплывающее уведомление базы: отказ или итог действия.
+    fn send_base_notice(&mut self, player_id: u64, text: &str) {
+        if let Some(addr) = self.addr_of(player_id) {
+            self.send(
+                addr,
+                Message::BaseNotice {
+                    text: text.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Зачисление на кошелёк (продажа) с немедленным сохранением в БД.
+    fn add_wallet(&mut self, player_id: u64, amount: u64) {
+        let Some(client) = self
+            .clients
+            .values_mut()
+            .find(|client| client.player_id == player_id)
+        else {
+            return;
+        };
+        client.base.wallet = client
+            .base
+            .wallet
+            .saturating_add(u32::try_from(amount).unwrap_or(u32::MAX));
+        self.save_wallet(player_id);
+    }
+
+    /// Списание с кошелька (покупка/апгрейд) с немедленным сохранением.
+    fn spend_wallet(&mut self, player_id: u64, amount: u64) {
+        let Some(client) = self
+            .clients
+            .values_mut()
+            .find(|client| client.player_id == player_id)
+        else {
+            return;
+        };
+        client.base.wallet = client
+            .base
+            .wallet
+            .saturating_sub(u32::try_from(amount).unwrap_or(u32::MAX));
+        self.save_wallet(player_id);
+    }
+
+    /// Пишет кошелёк игрока в БД (если есть аккаунт и персист включён).
+    fn save_wallet(&self, player_id: u64) {
+        let Some(account_id) = self.account_id_of(player_id) else {
+            return;
+        };
+        let Some(wallet) = self
+            .clients
+            .values()
+            .find(|client| client.player_id == player_id)
+            .map(|client| client.base.wallet)
+        else {
+            return;
+        };
+        if let Some(db) = self.db.as_ref() {
+            if let Err(error) = db.save_wallet(account_id, wallet) {
+                log::error!("бд: кошелёк игрока {player_id} не сохранён: {error}");
+            }
+        }
+    }
+
+    /// Пишет уровни станций игрока в БД (если есть аккаунт и персист).
+    fn save_facilities(&self, player_id: u64) {
+        let Some(account_id) = self.account_id_of(player_id) else {
+            return;
+        };
+        let Some(facilities) = self
+            .clients
+            .values()
+            .find(|client| client.player_id == player_id)
+            .map(|client| client.base.facilities)
+        else {
+            return;
+        };
+        if let Some(db) = self.db.as_ref() {
+            if let Err(error) = db.save_facilities(account_id, facilities) {
+                log::error!("бд: станции игрока {player_id} не сохранены: {error}");
+            }
+        }
+    }
+
     /// Бросок болта (G): дедупликация по `tick`, общий счётчик с действиями.
     fn handle_throw_bolt(&mut self, addr: SocketAddr, tick: u64) {
         let Some(client) = self.clients.get_mut(&addr) else {
@@ -1837,18 +2619,46 @@ impl Session {
 
     fn remove_client(&mut self, addr: SocketAddr, reason: &str) {
         if let Some(client) = self.clients.remove(&addr) {
-            // Персист (M4d-2): склад профиля переезжает из сессии на диск.
-            if let Some(profile) = &client.profile {
+            // Персист (M5): склад аккаунта уезжает из сессии в БД.
+            if let Some(account_id) = client.account_id {
                 if let Some(items) = self.world.stashes.remove(&client.player_id) {
-                    self.stashes_disk.insert(profile.clone(), items);
-                    self.stash_dirty = true;
+                    if let Some(db) = self.db.as_ref() {
+                        if let Err(error) = db.save_stash(account_id, &items) {
+                            log::error!(
+                                "бд: склад игрока {} не сохранён: {error}",
+                                client.player_id
+                            );
+                        }
+                    }
+                }
+                // Кошелёк и уровни станций (M5-2): страховка на отключении —
+                // в обычной игре они пишутся сразу при тратах.
+                if let Some(db) = self.db.as_ref() {
+                    if let Err(error) = db.save_wallet(account_id, client.base.wallet) {
+                        log::error!(
+                            "бд: кошелёк игрока {} не сохранён: {error}",
+                            client.player_id
+                        );
+                    }
+                    if let Err(error) = db.save_facilities(account_id, client.base.facilities) {
+                        log::error!(
+                            "бд: станции игрока {} не сохранены: {error}",
+                            client.player_id
+                        );
+                    }
                 }
             }
+            self.auth_failures.remove(&addr);
             self.world.remove_player(client.player_id);
             log::info!(
-                "игрок '{}' (id {}) удалён: {reason}, в сессии {}",
+                "игрок '{}' (id {}{}) удалён: {reason}, в сессии {}",
                 client.name,
                 client.player_id,
+                client
+                    .account
+                    .as_ref()
+                    .map(|account| format!(", аккаунт '{account}'"))
+                    .unwrap_or_default(),
                 self.clients.len()
             );
         }
@@ -1945,10 +2755,10 @@ fn clamp_name(name: &str) -> String {
     name[..end].to_string()
 }
 
-// ─── персист стэшей профилей (M4d-2) ───────────────────────────────────────
+// ─── легаси-стэши (M4d-2): только чтение для миграции в БД ──────────────
 
 /// Файл стэшей: версия схемы и записи по профилям. Профиль — ключ игрока
-/// (`ZN_PROFILE` клиента); без профиля склад живёт только в памяти сессии.
+/// (`ZN_PROFILE` клиента); в M5 файл читается один раз для миграции.
 #[derive(Serialize, Deserialize)]
 struct StashFile {
     version: u32,
@@ -1999,27 +2809,29 @@ fn load_stash_file(path: &Path) -> HashMap<String, Vec<Stack>> {
     }
 }
 
-/// Пишет файл стэшей атомарно (временный файл + rename): битый файл после
-/// сбоя питания не потеряет всё.
-fn save_stash_file(path: &Path, stashes: &HashMap<String, Vec<Stack>>) -> io::Result<()> {
-    let file = StashFile {
-        version: STASH_FILE_VERSION,
-        stashes: stashes
-            .iter()
-            .map(|(profile, items)| StashRecord {
-                profile: profile.clone(),
-                items: items
-                    .iter()
-                    .map(|stack| (stack.item, stack.count))
-                    .collect(),
-            })
-            .collect(),
-    };
-    let pretty = ron::ser::to_string_pretty(&file, ron::ser::PrettyConfig::default())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let temp = path.with_extension("ron.tmp");
-    std::fs::write(&temp, pretty)?;
-    std::fs::rename(&temp, path)
+// ─── пароли аккаунтов (M5) ──────────────────────────────────────────────
+
+/// argon2id-хэш дайджеста пароля. Соль случайная на аккаунт; результат —
+/// PHC-строка. `None` — argon2 недоступен (не должно случаться).
+fn hash_password(digest: &[u8; 32]) -> Option<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    match Argon2::default().hash_password(digest, &salt) {
+        Ok(hash) => Some(hash.to_string()),
+        Err(error) => {
+            log::error!("argon2: не удалось захэшировать пароль: {error}");
+            None
+        }
+    }
+}
+
+/// Проверка дайджеста против PHC-строки. Пустая/битая строка — отказ.
+fn verify_password(digest: &[u8; 32], password_hash: &str) -> bool {
+    if password_hash.is_empty() {
+        return false;
+    }
+    PasswordHash::new(password_hash)
+        .and_then(|hash| Argon2::default().verify_password(digest, &hash))
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -2254,19 +3066,22 @@ mod tests {
     }
 
     #[test]
-    fn stash_file_roundtrip_and_fail_soft() {
+    fn legacy_stash_file_reads_and_fails_soft() {
         let dir = std::env::temp_dir().join(format!("zn_stash_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stashes.ron");
 
-        let mut stashes = HashMap::new();
-        stashes.insert("alpha".to_string(), vec![Stack::new(3, 30)]);
-        save_stash_file(&path, &stashes).unwrap();
+        // Валидный легаси-файл читается (миграция в M5-1).
+        std::fs::write(
+            &path,
+            "(version: 1, stashes: [(profile: \"alpha\", items: [(3, 30)])])",
+        )
+        .unwrap();
         let loaded = load_stash_file(&path);
         assert_eq!(
             loaded.get("alpha"),
             Some(&vec![Stack::new(3, 30)]),
-            "round-trip сохраняет стопки"
+            "легаси-запись читается"
         );
 
         // Битый файл — предупреждение и пустой склад, без паники.
@@ -2279,5 +3094,23 @@ mod tests {
         assert!(load_stash_file(&dir.join("nope.ron")).is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn password_hash_verifies_and_rejects() {
+        let digest = zn_net::password_digest("zona-2026");
+        let wrong = zn_net::password_digest("Zona-2026");
+
+        let hash = hash_password(&digest).expect("argon2 доступен");
+        assert!(hash.starts_with("$argon2"), "PHC-строка argon2id: {hash}");
+        assert!(verify_password(&digest, &hash), "свой дайджест проходит");
+        assert!(!verify_password(&wrong, &hash), "чужой дайджест — отказ");
+        // Соль случайна: два хэша одного пароля differ.
+        let other = hash_password(&digest).unwrap();
+        assert_ne!(hash, other, "соль случайна на аккаунт");
+        assert!(verify_password(&digest, &other));
+        // Мусор и пустая строка — отказ, без паники.
+        assert!(!verify_password(&digest, ""));
+        assert!(!verify_password(&digest, "not-a-phc-string"));
     }
 }

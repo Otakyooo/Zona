@@ -15,15 +15,18 @@ use zn_content::ItemCatalog;
 use zn_core::{FixedStep, SIMULATION_HZ};
 use zn_input::InputState;
 use zn_net::{
-    dequantize_pos, dequantize_yaw, BoltNet, CorpseNet, GameEvent, GroundItemNet, InventoryAction,
-    ItemStackNet, PlayerNetState, StashAction, CLIENT_TIMEOUT, INPUT_REDUNDANCY,
+    dequantize_pos, dequantize_yaw, AuthHello, BaseActionKind, BoltNet, CorpseNet, GameEvent,
+    GroundItemNet, InventoryAction, ItemStackNet, PlayerNetState, RejectReason, StashAction,
+    CLIENT_TIMEOUT, INPUT_REDUNDANCY,
 };
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
     cull::visible_instances, Camera, DrawList, InstanceRaw, MaterialId, MaterialSpec, MeshId,
     PostSettings, Renderer,
 };
-use zn_scene::{AnomalyKind, LocationId, Scene, SceneObject, LOCATION_BASE};
+use zn_scene::{
+    AnomalyKind, LocationId, Scene, SceneObject, SceneStation, StationKind, LOCATION_BASE,
+};
 use zn_sim::{
     is_downed, ClientInput, PlayerAction, Simulation, FIRE_INTERVAL_TICKS, FLAG_FIRE,
     FLAG_SPRINTING, INTERACT_MIN_DOT, INTERACT_RANGE_M, INVENTORY_COLS, INVENTORY_ROWS,
@@ -253,10 +256,11 @@ struct OpenContainer {
 }
 
 /// Фокус панелей, когда открыто больше одной: ↑/↓ и Enter работают с ним.
-/// Порядок фокуса слева направо: контейнер, склад, инвентарь.
+/// Порядок фокуса слева направо: контейнер, станция, склад, инвентарь.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PanelFocus {
     Container,
+    Station,
     Stash,
     Inventory,
 }
@@ -273,6 +277,51 @@ struct HealingView {
 struct ExtractionNotice {
     text: String,
     until: Instant,
+}
+
+/// Время жизни уведомления аккаунта/отказа (M5-1).
+const ACCOUNT_NOTICE_TTL: Duration = Duration::from_secs(5);
+
+/// Наценка торговца при покупке (M5-2): цена партии =
+/// `value_rub × TRADER_BUY_MARKUP × count`. Дубль серверной константы для
+/// показа цены в UI — экономическую истину решает сервер.
+const TRADER_BUY_MARKUP: u32 = 2;
+/// Базовая цена улучшения станции (M5-2): уровень N стоит
+/// `UPGRADE_COST_BASE × (N + 1)` RU. Тоже дубль для UI.
+const UPGRADE_COST_BASE: u32 = 300;
+/// Предел уровня станций базы (M5-2): [верстак, медпункт, сейф].
+const FACILITY_MAX_LEVEL: u8 = 3;
+
+/// Данные для входа из переменных окружения (M5-1): `ZN_PROFILE` — имя
+/// аккаунта, `ZN_PASSWORD` — пароль (в Hello уходит только sha2-дайджест).
+/// Без пары переменных клиент подключается гостем — склад не сохраняется.
+fn auth_from_env() -> Option<AuthHello> {
+    let account = std::env::var("ZN_PROFILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let password = std::env::var("ZN_PASSWORD")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    Some(AuthHello {
+        account,
+        password_digest: zn_net::password_digest(&password),
+    })
+}
+
+/// Текст отказа сервера для HUD (M5-1).
+fn reject_text(reason: RejectReason) -> String {
+    match reason {
+        RejectReason::VersionMismatch { server } => {
+            format!("сервер протокола v{server} — клиент новее, offline")
+        }
+        RejectReason::ContentMismatch => {
+            "контент клиента не совпал с серверным — offline".to_string()
+        }
+        RejectReason::SessionFull => "сервер полон — offline".to_string(),
+        RejectReason::AuthFailed => "сервер отклонил вход: неверный аккаунт или пароль".to_string(),
+    }
 }
 
 /// Стек предмета для панелей HUD: имя/количество/цвет из каталога.
@@ -306,6 +355,47 @@ struct ContainerHud {
     hint: Option<String>,
 }
 
+/// Строка оффера торговца в панели станции (M5-2): предмет партии и цена.
+struct StationOfferHud {
+    name: String,
+    count: u16,
+    color: [f32; 3],
+    /// Цена партии, RU (каталог × наценка × количество).
+    price_rub: u32,
+}
+
+/// Данные панели станции базы (M5-2): торговец (офферы) или станция
+/// апгрейда (верстак/медпункт/сейф). Источник — `BaseUpdate` сервера.
+struct StationHud {
+    /// Заголовок — подпись станции («Торговец», «Верстак»…).
+    title: String,
+    kind: StationKind,
+    /// Баланс кошелька, RU.
+    wallet: u32,
+    /// Уровни станций [верстак, медпункт, сейф].
+    facilities: [u8; 3],
+    /// Офферы торговца (пусто у станций апгрейда).
+    offers: Vec<StationOfferHud>,
+    /// Выделенная строка (оффер торговца).
+    select: usize,
+    /// Фокус ввода на панели (когда открыто больше одной: ←/→).
+    focused: bool,
+    /// Подсказка клавиш внизу панели.
+    hint: Option<String>,
+}
+
+impl StationHud {
+    /// Сколько строк занимает панель: офферы торговца или две строки
+    /// апгрейда (текущий уровень и стоимость следующего).
+    fn rows(&self) -> usize {
+        if self.kind == StationKind::Trader {
+            self.offers.len()
+        } else {
+            2
+        }
+    }
+}
+
 /// Срез состояния для отрисовки HUD (собирается до заимствования renderer).
 struct HudData {
     health: u16,
@@ -326,6 +416,10 @@ struct HudData {
     inventory: Option<InventoryHud>,
     /// Панель обыска (сервер держит контейнер открытым).
     container: Option<ContainerHud>,
+    /// Панель станции базы (M5-2): торговец или апгрейд-станция.
+    station: Option<StationHud>,
+    /// Кошелёк аккаунта, RU (M5-2): только на базе в сети.
+    wallet_rub: Option<u32>,
     /// Панель склада базы (открыта клавишей H на базе).
     stash: Option<ContainerHud>,
     /// Полоска лечения: доля оставшегося времени (1.0 — только началась).
@@ -334,6 +428,8 @@ struct HudData {
     flash: Option<f32>,
     /// Своё уведомление об экстракции (M4d-2), пока свежее.
     extraction: Option<String>,
+    /// Уведомление аккаунта/отказа сервера (M5-1), пока свежее.
+    notice: Option<String>,
     /// Патроны винтовки (M4d-3a); `None` — в каталоге нет патрона.
     ammo: Option<u32>,
     /// Эффект сильнейшего артефакта ношения (M4d-3a).
@@ -354,6 +450,8 @@ pub struct ClientApp {
     /// id игрока на сервере (снапшоты); `None` — offline/ещё не принят.
     net_player_id: Option<u64>,
     net: Option<NetClient>,
+    /// Имя аккаунта из ZN_PROFILE (M5-1); `None` — гость/offline.
+    login_account: Option<String>,
     /// Связь оборвалась (таймаут снапшотов) — заголовок показывает «нет связи».
     connection_lost: bool,
     /// Инпуты, отправленные «серверу» (реальные или виртуальные) — для реплея.
@@ -422,6 +520,8 @@ pub struct ClientApp {
     anomaly_material: Option<MaterialId>,
     /// Уведомление о своей экстракции (M4d-2): панель результата.
     extraction_flash: Option<ExtractionNotice>,
+    /// Уведомление аккаунта/отказа (M5-1): текст и до какого мгновения живо.
+    notice: Option<(String, Instant)>,
     /// Нокдаун (M4d-3b, сеть): до какого момента лежим. Offline берётся из
     /// локальной симуляции.
     knockdown_until: Option<Instant>,
@@ -462,6 +562,19 @@ pub struct ClientApp {
     stash_open: bool,
     /// Выбранная строка склада.
     stash_select: usize,
+    /// Кошелёк аккаунта, RU (M5-2): из `BaseUpdate`, живёт и вне панели.
+    base_wallet: u32,
+    /// Уровни станций [верстак, медпункт, сейф] из `BaseUpdate` (M5-2).
+    base_facilities: [u8; 3],
+    /// Открытая станция базы (M5-2): индекс в `Scene::stations`;
+    /// `None` — панель закрыта.
+    station_open: Option<u8>,
+    /// Офферы открытой станции-торговца (индекс предмета, количество).
+    station_offers: Vec<ItemStackNet>,
+    /// Выбранная строка офферов торговца.
+    station_select: usize,
+    /// Подсказка станции под прицелом («[E] Торговец», M5-2).
+    station_hint: Option<String>,
 }
 
 impl ClientApp {
@@ -538,14 +651,22 @@ impl ClientApp {
             16.0 / 9.0,
         );
 
+        let mut login_account = None;
         let net = server.and_then(|addr| {
-            let profile = std::env::var("ZN_PROFILE")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty());
-            match NetClient::connect(&addr, content_hash, items_hash, CLIENT_NAME, profile) {
+            // Вход из окружения (M5-1): ZN_PROFILE + ZN_PASSWORD. Без пары —
+            // гостевое подключение: играем, но склад/прогресс не сохраняются.
+            let auth = auth_from_env();
+            if let Some(auth) = &auth {
+                log::info!("вход в аккаунт «{}» (ZN_PROFILE)", auth.account);
+                login_account = Some(auth.account.clone());
+            }
+            match NetClient::connect(&addr, content_hash, items_hash, CLIENT_NAME, auth) {
                 Ok(net) => {
-                    log::info!("подключаемся к серверу {addr}");
+                    let local = net
+                        .local_addr()
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|_| "?".to_string());
+                    log::info!("подключаемся к серверу {addr} (локальный адрес {local})");
                     Some(net)
                 }
                 Err(error) => {
@@ -591,6 +712,7 @@ impl ClientApp {
             player_id,
             net_player_id: None,
             net,
+            login_account,
             connection_lost: false,
             history: InputHistory::new(),
             smoother: ErrorSmoother::default(),
@@ -630,6 +752,7 @@ impl ClientApp {
             anomaly_flashes: Vec::new(),
             anomaly_material: None,
             extraction_flash: None,
+            notice: None,
             knockdown_until: None,
             blowout: None,
             inventory: Vec::new(),
@@ -649,6 +772,12 @@ impl ClientApp {
             stash_items: Vec::new(),
             stash_open: false,
             stash_select: 0,
+            base_wallet: 0,
+            base_facilities: [0; 3],
+            station_open: None,
+            station_offers: Vec::new(),
+            station_select: 0,
+            station_hint: None,
         }
     }
 
@@ -687,11 +816,60 @@ impl ClientApp {
         self.net.is_some() && self.location == LOCATION_BASE
     }
 
+    /// Станции базы доступны только в сети и только на базе (M5-2).
+    fn station_available(&self) -> bool {
+        self.net.is_some() && self.location == LOCATION_BASE
+    }
+
+    /// Индекс станции, в круге которой стоит локальный игрок (M5-2);
+    /// `None` — вне всех кругов, не на базе или без сети. Сервер проверяет
+    /// позицию ещё раз — клиентская проверка только для подсказки и E.
+    fn station_at_player(&mut self) -> Option<u8> {
+        if !self.station_available() {
+            return None;
+        }
+        let position = self.simulation.player_state(self.player_id)?.position;
+        self.scene
+            .stations
+            .iter()
+            .position(|station| station.contains(position))
+            .map(|index| index as u8)
+    }
+
+    /// Открытая станция текущей сцены (M5-2): подпись и вид; `None` —
+    /// панель закрыта, вне базы/без сети либо сцена сменилась (сервер
+    /// присылает `station = None`, уходя с базы).
+    fn open_station(&self) -> Option<(StationKind, String)> {
+        if !self.station_available() {
+            return None;
+        }
+        let station = self.scene.stations.get(usize::from(self.station_open?))?;
+        Some((station.kind, Self::station_title(station)))
+    }
+
+    /// Подпись станции для UI: `label` сцены или имя вида.
+    fn station_title(station: &SceneStation) -> String {
+        if station.label.is_empty() {
+            match station.kind {
+                StationKind::Trader => "Торговец",
+                StationKind::Workbench => "Верстак",
+                StationKind::Medpost => "Медпункт",
+                StationKind::Safe => "Сейф",
+            }
+            .to_string()
+        } else {
+            station.label.clone()
+        }
+    }
+
     /// Открытые панели в порядке фокуса слева направо.
     fn open_panels(&self) -> Vec<PanelFocus> {
-        let mut panels = Vec::with_capacity(3);
+        let mut panels = Vec::with_capacity(4);
         if self.open_container.is_some() {
             panels.push(PanelFocus::Container);
+        }
+        if self.open_station().is_some() {
+            panels.push(PanelFocus::Station);
         }
         if self.stash_open && self.stash_available() {
             panels.push(PanelFocus::Stash);
@@ -737,6 +915,13 @@ impl ClientApp {
         self.tp_flash = Some(Instant::now() + TP_FLASH_TTL);
         if !self.stash_available() {
             self.stash_open = false;
+        }
+        if !self.station_available() {
+            // Панель станции живёт на базе; сервер тоже закрывает её
+            // `BaseUpdate { station: None }` при уходе — чистим и у себя.
+            self.station_open = None;
+            self.station_offers.clear();
+            self.station_select = 0;
         }
         self.sync_camera_from_simulation();
         log::info!(
@@ -1633,7 +1818,13 @@ impl ClientApp {
     /// (постобработка), F9/F10 (звук). Панели passive — курсор остаётся в игре.
     fn handle_action_keys(&mut self) {
         if self.input.just_pressed(KeyCode::KeyE) {
-            self.send_action(PlayerAction::Interact);
+            // У станции базы E открывает/закрывает её панель (M5-2);
+            // вне кругов — обычный обыск.
+            if let Some(station) = self.station_at_player() {
+                self.send_base_interact(station);
+            } else {
+                self.send_action(PlayerAction::Interact);
+            }
             self.audio.play(SoundId::Panel);
         }
         if self.input.just_pressed(KeyCode::KeyG) {
@@ -1650,6 +1841,9 @@ impl ClientApp {
                 self.panel_focus = PanelFocus::Stash;
             }
             self.audio.play(SoundId::Panel);
+        }
+        if self.input.just_pressed(KeyCode::KeyR) {
+            self.press_sell();
         }
         if self.input.just_pressed(KeyCode::KeyT) {
             if let Some(container) = self.open_container.as_ref().map(|open| open.container) {
@@ -1768,9 +1962,50 @@ impl ClientApp {
         }
     }
 
-    /// Enter: взять выбранную строку контейнера (фокус на контейнере), взять
-    /// стопку со склада или сдать туда ячейку инвентаря (склад открыт),
-    /// иначе — использовать предмет инвентаря.
+    /// Отправляет взаимодействие со станцией базы (M5-2) с тем же повтором.
+    fn send_base_interact(&mut self, station: u8) {
+        self.action_seq += 1;
+        let tick = self.action_seq;
+        if let Some(net) = self.net.as_mut() {
+            net.send_base_interact(tick, station);
+        }
+    }
+
+    /// Отправляет действие в панели станции (M5-2) с тем же повтором.
+    fn send_base_action(&mut self, action: BaseActionKind) {
+        self.action_seq += 1;
+        let tick = self.action_seq;
+        if let Some(net) = self.net.as_mut() {
+            net.send_base_action(tick, action);
+        }
+    }
+
+    /// R (M5-2): продать выделенное торговцу. Со склада — когда фокус на
+    /// панели склада, иначе — выделенная ячейка инвентаря. Панель станции
+    /// должна быть открыта на торговце; сервер перепроверит всё сам.
+    fn press_sell(&mut self) {
+        let Some((kind, _)) = self.open_station() else {
+            return;
+        };
+        if kind != StationKind::Trader {
+            return;
+        }
+        let from_stash = self.effective_focus() == Some(PanelFocus::Stash);
+        let slot = if from_stash {
+            self.stash_select
+        } else {
+            self.inventory_select.min(INVENTORY_SLOTS - 1)
+        };
+        self.send_base_action(BaseActionKind::Sell {
+            from_stash,
+            slot: slot as u8,
+        });
+    }
+
+    /// Enter: взять выбранную строку контейнера (фокус на контейнере),
+    /// купить оффер/улучшить станцию (фокус на станции), взять стопку со
+    /// склада или сдать туда ячейку инвентаря (склад открыт), иначе —
+    /// использовать предмет инвентаря.
     fn press_enter(&mut self) {
         match self.effective_focus() {
             Some(PanelFocus::Container) => {
@@ -1786,6 +2021,23 @@ impl ClientApp {
                     container,
                     index,
                 }));
+            }
+            Some(PanelFocus::Station) => {
+                let Some((kind, _)) = self.open_station() else {
+                    return;
+                };
+                match kind {
+                    // Торговец: Enter покупает выделенный оффер.
+                    StationKind::Trader => {
+                        if self.station_select < self.station_offers.len() {
+                            self.send_base_action(BaseActionKind::Buy {
+                                offer: self.station_select as u8,
+                            });
+                        }
+                    }
+                    // Верстак/медпункт/сейф: Enter улучшает станцию.
+                    _ => self.send_base_action(BaseActionKind::Upgrade),
+                }
             }
             Some(PanelFocus::Stash) => {
                 if self.stash_select >= self.stash_items.len() {
@@ -1857,7 +2109,7 @@ impl ClientApp {
 
     /// Стрелки: ↑/↓ — выделение внутри панели фокуса; ←/→ при нескольких
     /// открытых панелях — переключение фокуса (слева направо: контейнер,
-    /// склад, инвентарь), иначе ←/→ двигают по сетке инвентаря.
+    /// станция, склад, инвентарь), иначе ←/→ двигают по сетке инвентаря.
     fn handle_panel_navigation(&mut self) {
         let up = self.input.just_pressed(KeyCode::ArrowUp);
         let down = self.input.just_pressed(KeyCode::ArrowDown);
@@ -1905,6 +2157,16 @@ impl ClientApp {
                     self.stash_select += 1;
                 }
             }
+            Some(PanelFocus::Station) => {
+                // У торговца ↑/↓ выбирают оффер; у станций апгрейда строк нет.
+                let rows = self.station_offers.len();
+                if up {
+                    self.station_select = self.station_select.saturating_sub(1);
+                }
+                if down && rows > 0 && self.station_select + 1 < rows {
+                    self.station_select += 1;
+                }
+            }
             Some(PanelFocus::Inventory) => {
                 let mut col = self.inventory_select % INVENTORY_COLS;
                 let mut row = self.inventory_select / INVENTORY_COLS;
@@ -1941,6 +2203,29 @@ impl ClientApp {
             self.container_select = self.container_select.min(items.len().saturating_sub(1));
         }
         self.open_container = Some(OpenContainer { container, items });
+    }
+
+    /// Состояние базы из `BaseUpdate` (M5-2): сервер присылает его после
+    /// каждого действия станции. `station = None` — панель закрыта.
+    fn apply_base_update(
+        &mut self,
+        station: Option<u8>,
+        wallet: u32,
+        facilities: [u8; 3],
+        offers: Vec<ItemStackNet>,
+    ) {
+        self.base_wallet = wallet;
+        self.base_facilities = facilities;
+        self.station_offers = offers;
+        self.station_open = station;
+        if station.is_none() {
+            self.station_select = 0;
+        } else {
+            // После продажи/покупки выделение может выйти за список офферов.
+            self.station_select = self
+                .station_select
+                .min(self.station_offers.len().saturating_sub(1));
+        }
     }
 
     /// Персональные апдейты локальной симуляции (offline): инвентарь и
@@ -1996,6 +2281,16 @@ impl ClientApp {
             &containers,
             &items,
         );
+        // Станция базы (M5-2): круг на полу без прицеливания — подсказка
+        // «[E] Торговец» и цель для E. Прицельная цель приоритетнее.
+        self.station_hint = None;
+        if self.interact_hint.is_none() {
+            if let Some(station) = self.station_at_player() {
+                if let Some(scene_station) = self.scene.stations.get(usize::from(station)) {
+                    self.station_hint = Some(format!("[E] {}", Self::station_title(scene_station)));
+                }
+            }
+        }
     }
 
     /// Стек для панелей HUD: имя/цвет из каталога; неизвестный предмет
@@ -2060,12 +2355,29 @@ impl ClientApp {
                     server_tick,
                     spawn,
                     location,
+                    account_created,
                 } => {
                     log::info!(
                         "сервер принял игрока: net id {player_id}, tick {server_tick}, \
                          локация {location}, спавн {spawn:?}"
                     );
                     self.net_player_id = Some(player_id);
+                    if account_created {
+                        // Первый вход по ZN_PROFILE: аккаунт зарегистрирован на
+                        // сервере, склад между рейдами теперь сохраняется.
+                        let who = self.login_account.as_deref().unwrap_or("аккаунт");
+                        self.notice = Some((
+                            format!("«{who}» создан — склад сохраняется между рейдами"),
+                            Instant::now() + ACCOUNT_NOTICE_TTL,
+                        ));
+                    } else if self.login_account.is_none() {
+                        // Гость (M5-3): вход без аккаунта — склад, кошелёк и
+                        // уровни станций живут только в текущей сессии.
+                        self.notice = Some((
+                            "Гостевой режим: склад и кошелёк не сохраняются".to_string(),
+                            Instant::now() + ACCOUNT_NOTICE_TTL,
+                        ));
+                    }
                     if !self.scenes.is_empty() && location != self.location {
                         // Мир: Welcome уточняет стартовую локацию (обычно база).
                         self.enter_location(location, spawn, None);
@@ -2073,6 +2385,7 @@ impl ClientApp {
                 }
                 NetEvent::Reject(reason) => {
                     log::warn!("сервер отклонил подключение: {reason:?} — offline-режим");
+                    self.notice = Some((reject_text(reason), Instant::now() + ACCOUNT_NOTICE_TTL));
                     self.drop_connection();
                 }
                 NetEvent::Snapshot {
@@ -2110,6 +2423,17 @@ impl ClientApp {
                     self.stash_select = self
                         .stash_select
                         .min(self.stash_items.len().saturating_sub(1));
+                }
+                NetEvent::BaseUpdate {
+                    station,
+                    wallet,
+                    facilities,
+                    offers,
+                } => {
+                    self.apply_base_update(station, wallet, facilities, offers);
+                }
+                NetEvent::BaseNotice { text } => {
+                    self.notice = Some((text, now + ACCOUNT_NOTICE_TTL));
                 }
             }
         }
@@ -2157,6 +2481,13 @@ impl ClientApp {
         // Склад существует только на сервере.
         self.stash_items.clear();
         self.stash_open = false;
+        // Станции и кошелёк базы — тоже только на сервере (M5-2).
+        self.station_open = None;
+        self.station_offers.clear();
+        self.station_select = 0;
+        self.station_hint = None;
+        self.base_wallet = 0;
+        self.base_facilities = [0; 3];
     }
 
     /// Болты из снапшота: список замещается, но позиции обновляются с
@@ -2319,10 +2650,13 @@ impl ClientApp {
             (left / heal.total_secs).clamp(0.0, 1.0)
         });
 
-        let hint = self.interact_hint.map(|kind| match kind {
-            HintKind::Container => "[E] Обыскать".to_string(),
-            HintKind::Item => "[E] Подобрать".to_string(),
-        });
+        let hint = self
+            .interact_hint
+            .map(|kind| match kind {
+                HintKind::Container => "[E] Обыскать".to_string(),
+                HintKind::Item => "[E] Подобрать".to_string(),
+            })
+            .or_else(|| self.station_hint.clone());
 
         let inventory = self.inventory_open.then(|| {
             let select = self.inventory_select.min(INVENTORY_SLOTS - 1);
@@ -2398,6 +2732,35 @@ impl ClientApp {
             hint: Some("↑/↓ — выбор · Enter — взять (инвентарь: сдать) · H — закрыть".to_string()),
         });
 
+        // Панель станции базы (M5-2): состояние пришло в `BaseUpdate`.
+        let station = self.open_station().map(|(kind, title)| {
+            let offers: Vec<StationOfferHud> = self
+                .station_offers
+                .iter()
+                .map(|stack| {
+                    let hud = self.hud_stack_or_placeholder(*stack);
+                    StationOfferHud {
+                        name: hud.name,
+                        count: hud.count,
+                        color: hud.color,
+                        price_rub: offer_price_rub(&self.catalog, *stack),
+                    }
+                })
+                .collect();
+            StationHud {
+                title,
+                kind,
+                wallet: self.base_wallet,
+                facilities: self.base_facilities,
+                select: self.station_select.min(offers.len().saturating_sub(1)),
+                offers,
+                focused: self.effective_focus() == Some(PanelFocus::Station),
+                hint: Some(station_hint(kind)),
+            }
+        });
+        // Кошелёк показываем на базе в сети — там же, где станции.
+        let wallet_rub = self.station_available().then_some(self.base_wallet);
+
         // Вспышка смены локации гаснет линейно.
         if self.tp_flash.is_some_and(|until| until <= now) {
             self.tp_flash = None;
@@ -2419,6 +2782,12 @@ impl ClientApp {
             .extraction_flash
             .as_ref()
             .map(|notice| notice.text.clone());
+
+        // Уведомление аккаунта/отказа (M5-1) живёт ACCOUNT_NOTICE_TTL.
+        if self.notice.as_ref().is_some_and(|(_, until)| *until <= now) {
+            self.notice = None;
+        }
+        let notice = self.notice.as_ref().map(|(text, _)| text.clone());
 
         // Патроны и эффекты ношения (M4d-3a): сеть — персональные апдейты,
         // offline — локальная симуляция; без патрона в каталоге — не показываем.
@@ -2483,6 +2852,7 @@ impl ClientApp {
             feed,
             post_hint: self.post_hint.as_ref().map(|hint| hint.text.clone()),
             extraction,
+            notice,
             ammo,
             carry,
             knockdown,
@@ -2491,6 +2861,8 @@ impl ClientApp {
             hint,
             inventory,
             container,
+            station,
+            wallet_rub,
             stash,
             healing,
             flash,
@@ -2522,7 +2894,13 @@ impl ClientApp {
             None if self.connection_lost => "нет связи".to_string(),
             None => "offline".to_string(),
         };
-        let title = format!("{base}{separator}{status}");
+        // Аккаунт (M5-3): виден в заголовке — окна разных игроков различимы.
+        let account = self
+            .login_account
+            .as_deref()
+            .map(|name| format!("{name} · "))
+            .unwrap_or_default();
+        let title = format!("{base}{separator}{account}{status}");
         if title == self.window_title {
             return;
         }
@@ -2862,10 +3240,27 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         egui::Color32::from_white_alpha(230),
     );
 
-    // Патроны винтовки (M4d-3a) — под HP; пустой магазин красный.
-    if let Some(ammo) = hud.ammo {
+    // Кошелёк аккаунта (M5-2) — под HP рядом с патронами; только на базе.
+    if let Some(wallet) = hud.wallet_rub {
         painter.text(
             egui::pos2(bar_pos.x, bar_pos.y + bar_size.y + 6.0),
+            egui::Align2::LEFT_TOP,
+            format!("Кошелёк: {wallet} RU"),
+            egui::FontId::proportional(16.0),
+            egui::Color32::from_rgb(240, 214, 120),
+        );
+    }
+
+    // Патроны винтовки (M4d-3a) — под HP; пустой магазин красный. С кошельком
+    // на базе (M5-2) патроны уходят строкой ниже.
+    if let Some(ammo) = hud.ammo {
+        let ammo_y = if hud.wallet_rub.is_some() {
+            bar_pos.y + bar_size.y + 28.0
+        } else {
+            bar_pos.y + bar_size.y + 6.0
+        };
+        painter.text(
+            egui::pos2(bar_pos.x, ammo_y),
             egui::Align2::LEFT_TOP,
             format!("Патроны: {ammo}"),
             egui::FontId::proportional(16.0),
@@ -2879,8 +3274,13 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
 
     // Эффект артефакта ношения (M4d-3a) — под патронами.
     if let Some(carry) = &hud.carry {
+        let carry_y = if hud.wallet_rub.is_some() {
+            bar_pos.y + bar_size.y + 50.0
+        } else {
+            bar_pos.y + bar_size.y + 28.0
+        };
         painter.text(
-            egui::pos2(bar_pos.x, bar_pos.y + bar_size.y + 28.0),
+            egui::pos2(bar_pos.x, carry_y),
             egui::Align2::LEFT_TOP,
             carry,
             egui::FontId::proportional(14.0),
@@ -2904,8 +3304,8 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         );
     }
 
-    // Панели (M4b/M4d): инвентарь справа снизу; левее — обыск и склад
-    // (слева направо: склад, обыск, инвентарь).
+    // Панели (M4b/M4d/M5-2): инвентарь справа снизу; левее — обыск, склад
+    // и станция базы (слева направо: станция, склад, обыск, инвентарь).
     let inventory_rect = hud.inventory.as_ref().map(|inventory| {
         let size = inventory_panel_size();
         let min = egui::pos2(
@@ -2924,13 +3324,24 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
         draw_container_panel(&painter, container, rect);
         rect
     });
-    if let Some(stash) = &hud.stash {
+    let stash_rect = hud.stash.as_ref().map(|stash| {
         let size = list_panel_size(stash.items.len(), stash.hint.is_some());
         let right = container_rect
             .or(inventory_rect)
             .map_or(screen.right() - 14.0, |rect| rect.left() - 12.0);
         let min = egui::pos2(right - size.x, screen.bottom() - 14.0 - size.y);
-        draw_container_panel(&painter, stash, egui::Rect::from_min_size(min, size));
+        let rect = egui::Rect::from_min_size(min, size);
+        draw_container_panel(&painter, stash, rect);
+        rect
+    });
+    if let Some(station) = &hud.station {
+        let size = station_panel_size(station.rows());
+        let right = stash_rect
+            .or(container_rect)
+            .or(inventory_rect)
+            .map_or(screen.right() - 14.0, |rect| rect.left() - 12.0);
+        let min = egui::pos2(right - size.x, screen.bottom() - 14.0 - size.y);
+        draw_station_panel(&painter, station, egui::Rect::from_min_size(min, size));
     }
 
     // Вспышка смены локации — поверх панелей, под экраном смерти.
@@ -2966,6 +3377,18 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
             "добыча в складе базы — H",
             egui::FontId::proportional(15.0),
             egui::Color32::from_white_alpha(180),
+        );
+    }
+
+    // Уведомление аккаунта/отказа (M5-1) — по центру сверху.
+    if let Some(text) = &hud.notice {
+        let center = screen.center();
+        painter.text(
+            center - egui::vec2(0.0, screen.height() * 0.22),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::proportional(18.0),
+            egui::Color32::from_rgb(255, 214, 120),
         );
     }
 
@@ -3097,6 +3520,35 @@ fn list_panel_size(rows: usize, hint: bool) -> egui::Vec2 {
         280.0,
         46.0 + rows.max(1) as f32 * 24.0 + if hint { 20.0 } else { 0.0 },
     )
+}
+
+/// Размер панели станции (M5-2): заголовок, кошелёк, строки и подсказка.
+fn station_panel_size(rows: usize) -> egui::Vec2 {
+    egui::vec2(300.0, 78.0 + rows.max(1) as f32 * 24.0)
+}
+
+/// Цена оффера торговца, RU (M5-2): каталог × наценка × количество.
+/// Дубль серверной экономики для показа — истина серверная.
+fn offer_price_rub(catalog: &ItemCatalog, stack: ItemStackNet) -> u32 {
+    catalog
+        .get(stack.item)
+        .map_or(0, |item| item.value_rub)
+        .saturating_mul(TRADER_BUY_MARKUP)
+        .saturating_mul(u32::from(stack.count))
+}
+
+/// Стоимость улучшения станции уровня `level` (M5-2), RU — дубль серверной.
+fn upgrade_cost(level: u8) -> u32 {
+    UPGRADE_COST_BASE * u32::from(level + 1)
+}
+
+/// Подсказка клавиш панели станции (M5-2).
+fn station_hint(kind: StationKind) -> String {
+    match kind {
+        StationKind::Trader => "↑/↓ — оффер · Enter — купить · R — продать · E — закрыть",
+        _ => "Enter — улучшить · E — закрыть",
+    }
+    .to_string()
 }
 
 /// Цвет предмета из каталога для egui.
@@ -3251,6 +3703,126 @@ fn draw_container_panel(painter: &egui::Painter, panel: &ContainerHud, rect: egu
             egui::Color32::from_white_alpha(230),
         );
     }
+}
+
+/// Панель станции базы (M5-2): заголовок, кошелёк, офферы торговца с
+/// ценами либо строка апгрейда, выделение ↑/↓ у офферов.
+fn draw_station_panel(painter: &egui::Painter, panel: &StationHud, rect: egui::Rect) {
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(170));
+    panel_frame(painter, rect, panel.focused);
+
+    painter.text(
+        egui::pos2(rect.left() + 10.0, rect.top() + 8.0),
+        egui::Align2::LEFT_TOP,
+        &panel.title,
+        egui::FontId::proportional(17.0),
+        egui::Color32::from_white_alpha(235),
+    );
+    painter.text(
+        egui::pos2(rect.left() + 10.0, rect.top() + 32.0),
+        egui::Align2::LEFT_TOP,
+        format!("Кошелёк: {} RU", panel.wallet),
+        egui::FontId::proportional(15.0),
+        egui::Color32::from_rgb(240, 214, 120),
+    );
+
+    if let Some(hint) = &panel.hint {
+        painter.text(
+            egui::pos2(rect.left() + 10.0, rect.bottom() - 20.0),
+            egui::Align2::LEFT_TOP,
+            hint,
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_white_alpha(140),
+        );
+    }
+
+    if panel.kind == StationKind::Trader {
+        if panel.offers.is_empty() {
+            painter.text(
+                egui::pos2(rect.left() + 10.0, rect.top() + 58.0),
+                egui::Align2::LEFT_TOP,
+                "— нечего предложить —",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_white_alpha(150),
+            );
+            return;
+        }
+        for (index, offer) in panel.offers.iter().enumerate() {
+            let y = rect.top() + 56.0 + index as f32 * 24.0;
+            if index == panel.select {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + 6.0, y - 2.0),
+                        egui::vec2(rect.width() - 12.0, 22.0),
+                    ),
+                    3.0,
+                    egui::Color32::from_white_alpha(36),
+                );
+            }
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 10.0, y + 3.0),
+                    egui::vec2(12.0, 12.0),
+                ),
+                2.0,
+                item_color(offer.color),
+            );
+            painter.text(
+                egui::pos2(rect.left() + 30.0, y + 1.0),
+                egui::Align2::LEFT_TOP,
+                format!("{} ×{}", offer.name, offer.count),
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_white_alpha(230),
+            );
+            // Цена партии справа: своим цветом — хватает кошелька или нет.
+            let affordable = panel.wallet >= offer.price_rub;
+            painter.text(
+                egui::pos2(rect.right() - 10.0, y + 1.0),
+                egui::Align2::RIGHT_TOP,
+                format!("{} RU", offer.price_rub),
+                egui::FontId::proportional(15.0),
+                if affordable {
+                    egui::Color32::from_rgb(240, 214, 120)
+                } else {
+                    egui::Color32::from_rgb(214, 78, 66)
+                },
+            );
+        }
+        return;
+    }
+
+    // Станция апгрейда: текущий уровень и стоимость следующего.
+    let facility = match panel.kind {
+        StationKind::Workbench => 0,
+        StationKind::Medpost => 1,
+        _ => 2,
+    };
+    let level = panel.facilities[facility];
+    let y = rect.top() + 56.0;
+    painter.text(
+        egui::pos2(rect.left() + 10.0, y),
+        egui::Align2::LEFT_TOP,
+        format!("Уровень: {level}"),
+        egui::FontId::proportional(15.0),
+        egui::Color32::from_white_alpha(230),
+    );
+    let upgrade_text = if level >= FACILITY_MAX_LEVEL {
+        ("Максимальный уровень".to_string(), false)
+    } else {
+        let cost = upgrade_cost(level);
+        (format!("Улучшение: {cost} RU"), panel.wallet >= cost)
+    };
+    painter.text(
+        egui::pos2(rect.left() + 10.0, y + 24.0),
+        egui::Align2::LEFT_TOP,
+        upgrade_text.0,
+        egui::FontId::proportional(15.0),
+        if upgrade_text.1 {
+            egui::Color32::from_rgb(240, 214, 120)
+        } else {
+            egui::Color32::from_white_alpha(150)
+        },
+    );
 }
 
 /// Локальный выбор цели наведения для подсказки: те же правила, что в
@@ -3487,6 +4059,21 @@ mod tests {
         );
         app.update_window_title();
         assert_eq!(app.window_title, "ZONA — подключение…");
+    }
+
+    #[test]
+    fn window_title_shows_account() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        app.update_window_title();
+        assert_eq!(
+            app.window_title, "ZONA — offline",
+            "без аккаунта — как раньше"
+        );
+
+        // Аккаунт (M5-3) встраивается перед статусом.
+        app.login_account = Some("stalker-1".to_string());
+        app.update_window_title();
+        assert_eq!(app.window_title, "ZONA — stalker-1 · offline");
     }
 
     #[test]
@@ -4149,6 +4736,7 @@ mod tests {
                 server_tick: 10,
                 spawn: [0.0, 0.0, 14.0],
                 location: 0,
+                account_created: false,
             })
             .unwrap();
             server.send_to(&welcome, from).unwrap();
@@ -4213,6 +4801,136 @@ mod tests {
         app.inventory_select = 5;
         app.press_enter();
         assert!(drain_stash_actions(&server).is_empty());
+    }
+
+    // ── Аккаунты (M5-1) ─────────────────────────────────────────────────
+
+    /// Мок-сервер: принимает Hello и отвечает переданным сообщением.
+    fn reply_to_hello(server: &std::net::UdpSocket, reply: &zn_net::Message) {
+        let mut buf = [0u8; 2048];
+        let mut from = None;
+        for _ in 0..1000 {
+            if let Ok((len, addr)) = server.recv_from(&mut buf) {
+                let message: zn_net::Message = zn_net::decode_message(&buf[..len]).unwrap();
+                assert!(matches!(message, zn_net::Message::ClientHello { .. }));
+                from = Some(addr);
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let from = from.expect("ClientHello дошёл до сервера");
+        server
+            .send_to(&zn_net::encode_message(reply).unwrap(), from)
+            .unwrap();
+    }
+
+    #[test]
+    fn auth_failed_reject_shows_notice_and_drops_to_offline() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        app.net = Some(
+            NetClient::connect(
+                &server.local_addr().unwrap().to_string(),
+                0,
+                0,
+                "Тест",
+                None,
+            )
+            .unwrap(),
+        );
+
+        app.process_net(Instant::now());
+        reply_to_hello(
+            &server,
+            &zn_net::Message::ServerReject {
+                reason: zn_net::RejectReason::AuthFailed,
+            },
+        );
+        app.process_net(Instant::now());
+
+        assert!(app.net.is_none(), "отказ сервера роняет подключение");
+        let notice = app
+            .collect_hud_data()
+            .notice
+            .expect("уведомление об отказе входа");
+        assert!(notice.contains("неверный аккаунт или пароль"), "{notice}");
+    }
+
+    #[test]
+    fn welcome_with_new_account_shows_created_notice() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        app.login_account = Some("Тестер".to_string());
+        app.net = Some(
+            NetClient::connect(
+                &server.local_addr().unwrap().to_string(),
+                0,
+                0,
+                "Тест",
+                None,
+            )
+            .unwrap(),
+        );
+
+        app.process_net(Instant::now());
+        reply_to_hello(
+            &server,
+            &zn_net::Message::ServerWelcome {
+                player_id: 1,
+                server_tick: 10,
+                spawn: [0.0, 0.0, 0.0],
+                location: 0,
+                account_created: true,
+            },
+        );
+        app.process_net(Instant::now());
+
+        let notice = app
+            .collect_hud_data()
+            .notice
+            .expect("уведомление о создании аккаунта");
+        assert!(notice.contains("Тестер"), "{notice}");
+        assert!(notice.contains("склад сохраняется"), "{notice}");
+    }
+
+    #[test]
+    fn guest_welcome_shows_no_persistence_notice() {
+        let mut app = ClientApp::with_content("game/content", "demo_zone");
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        // Гость: ZN_PROFILE не задан — login_account остаётся None.
+        app.net = Some(
+            NetClient::connect(
+                &server.local_addr().unwrap().to_string(),
+                0,
+                0,
+                "Тест",
+                None,
+            )
+            .unwrap(),
+        );
+
+        app.process_net(Instant::now());
+        reply_to_hello(
+            &server,
+            &zn_net::Message::ServerWelcome {
+                player_id: 1,
+                server_tick: 10,
+                spawn: [0.0, 0.0, 0.0],
+                location: 0,
+                account_created: false,
+            },
+        );
+        app.process_net(Instant::now());
+
+        let notice = app
+            .collect_hud_data()
+            .notice
+            .expect("предупреждение о гостевом режиме");
+        assert!(notice.contains("Гостевой режим"), "{notice}");
+        assert!(notice.contains("не сохраняются"), "{notice}");
     }
 
     // ── Постобработка (M4g-G3) ──────────────────────────────────────────
@@ -4452,6 +5170,7 @@ mod tests {
             use_effect: None,
             carry_effect: None,
             color: [0.95, 0.72, 0.15],
+            value_rub: 600,
         };
         let ammo = zn_content::Item {
             key: "ammo_545".to_string(),
@@ -4468,6 +5187,301 @@ mod tests {
             ground_item_color(&ammo),
             Vec4::new(0.95, 0.72, 0.15, 1.0),
             "обычный лут остаётся в LDR"
+        );
+    }
+
+    // ── Станции базы (M5-2) ─────────────────────────────────────────────
+
+    /// Мир-клиент с подключением к мок-серверу: Welcome уже получен (действия
+    /// станций уходят на сервер), сокет сервера — читать действия клиента и
+    /// присылать сообщения базы. Третий элемент — адрес клиента на сервере.
+    fn connected_world_app() -> (ClientApp, std::net::UdpSocket, std::net::SocketAddr) {
+        let mut app = world_app();
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        app.net = Some(
+            NetClient::connect(
+                &server.local_addr().unwrap().to_string(),
+                0,
+                0,
+                "Тест",
+                None,
+            )
+            .unwrap(),
+        );
+
+        // Hello → Welcome: без Connected действия не уходят на сервер.
+        {
+            let net = app.net.as_mut().unwrap();
+            net.poll(Instant::now());
+            let mut buf = [0u8; 2048];
+            let mut from = None;
+            for _ in 0..1000 {
+                if let Ok((len, addr)) = server.recv_from(&mut buf) {
+                    let message: zn_net::Message = zn_net::decode_message(&buf[..len]).unwrap();
+                    assert!(matches!(message, zn_net::Message::ClientHello { .. }));
+                    from = Some(addr);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let from = from.expect("ClientHello дошёл до сервера");
+            let welcome = zn_net::encode_message(&zn_net::Message::ServerWelcome {
+                player_id: 1,
+                server_tick: 10,
+                spawn: [0.0, 0.0, 14.0],
+                location: 0,
+                account_created: false,
+            })
+            .unwrap();
+            server.send_to(&welcome, from).unwrap();
+            let events = net.poll(Instant::now());
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, NetEvent::Welcome { .. })),
+                "ожидался Welcome: {events:?}"
+            );
+        }
+        let client = app
+            .net
+            .as_ref()
+            .expect("подключение живо")
+            .local_addr()
+            .unwrap();
+        (app, server, client)
+    }
+
+    /// Вычитывает действия станции из датаграмм (прочие пакеты пропускает).
+    fn drain_base_actions(server: &std::net::UdpSocket) -> Vec<(u64, BaseActionKind)> {
+        let mut actions = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((len, _)) = server.recv_from(&mut buf) {
+            let message: zn_net::Message = zn_net::decode_message(&buf[..len]).unwrap();
+            if let zn_net::Message::BaseAction { tick, action } = message {
+                actions.push((tick, action));
+            }
+        }
+        actions
+    }
+
+    /// Вычитывает взаимодействия со станциями из датаграмм.
+    fn drain_base_interacts(server: &std::net::UdpSocket) -> Vec<(u64, u8)> {
+        let mut interacts = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok((len, _)) = server.recv_from(&mut buf) {
+            let message: zn_net::Message = zn_net::decode_message(&buf[..len]).unwrap();
+            if let zn_net::Message::BaseInteract { tick, station } = message {
+                interacts.push((tick, station));
+            }
+        }
+        interacts
+    }
+
+    #[test]
+    fn station_panel_opens_from_base_update_and_hud_shows_wallet() {
+        let (mut app, _server, _client) = connected_world_app();
+        let medkit = app.catalog.index_of("medkit").unwrap();
+        let bandage = app.catalog.index_of("bandage").unwrap();
+
+        // До BaseUpdate панели нет; кошелёк на базе в сети показывается.
+        assert!(app.collect_hud_data().station.is_none());
+        assert_eq!(app.collect_hud_data().wallet_rub, Some(0));
+
+        // Сервер открыл панель торговца (станция 0 сцены базы).
+        app.apply_base_update(
+            Some(0),
+            700,
+            [1, 0, 0],
+            vec![
+                ItemStackNet {
+                    item: medkit,
+                    count: 1,
+                },
+                ItemStackNet {
+                    item: bandage,
+                    count: 1,
+                },
+            ],
+        );
+
+        let hud = app.collect_hud_data();
+        let panel = hud.station.as_ref().expect("панель станции в HUD");
+        assert_eq!(panel.title, "Торговец");
+        assert_eq!(panel.kind, StationKind::Trader);
+        assert_eq!(panel.wallet, 700);
+        assert_eq!(panel.facilities, [1, 0, 0]);
+        assert_eq!(panel.offers.len(), 2);
+        assert_eq!(panel.offers[0].name, "Аптечка");
+        assert_eq!(panel.offers[0].price_rub, 500, "250 × наценка 2");
+        assert_eq!(panel.offers[1].price_rub, 120, "60 × наценка 2");
+        assert!(panel.focused, "одна панель — фокус на ней");
+        assert!(panel.hint.is_some(), "подсказка клавиш у станции");
+        assert_eq!(hud.wallet_rub, Some(700));
+
+        // Закрытие панели: station = None.
+        app.apply_base_update(None, 700, [1, 0, 0], Vec::new());
+        assert!(app.collect_hud_data().station.is_none());
+    }
+
+    #[test]
+    fn station_enter_buys_offer_and_r_sells_selected() {
+        let (mut app, server, _client) = connected_world_app();
+        let medkit = app.catalog.index_of("medkit").unwrap();
+        let bolt = app.catalog.index_of("bolt").unwrap();
+        app.apply_base_update(
+            Some(0),
+            700,
+            [0, 0, 0],
+            vec![
+                ItemStackNet {
+                    item: medkit,
+                    count: 1,
+                },
+                ItemStackNet {
+                    item: bolt,
+                    count: 60,
+                },
+            ],
+        );
+        app.inventory = vec![None; INVENTORY_SLOTS];
+        app.inventory[3] = Some(ItemStackNet {
+            item: bolt,
+            count: 5,
+        });
+        app.inventory_select = 3;
+
+        // Enter у торговца покупает выделенный оффер (с повтором).
+        app.station_select = 1;
+        app.press_enter();
+        let actions = drain_base_actions(&server);
+        assert_eq!(actions.len(), INPUT_REDUNDANCY, "{actions:?}");
+        assert!(
+            actions
+                .iter()
+                .all(|(tick, action)| *tick == 1 && *action == BaseActionKind::Buy { offer: 1 }),
+            "купили оффер 1: {actions:?}"
+        );
+
+        // R продаёт выделенную ячейку инвентаря.
+        app.press_sell();
+        let actions = drain_base_actions(&server);
+        assert!(
+            actions.iter().all(|(tick, action)| *tick == 2
+                && *action
+                    == BaseActionKind::Sell {
+                        from_stash: false,
+                        slot: 3
+                    }),
+            "продали ячейку 3: {actions:?}"
+        );
+
+        // С открытым складом и фокусом на нём R продаёт строку склада.
+        app.stash_open = true;
+        app.stash_items = vec![ItemStackNet {
+            item: bolt,
+            count: 2,
+        }];
+        app.panel_focus = PanelFocus::Stash;
+        app.stash_select = 0;
+        app.press_sell();
+        let actions = drain_base_actions(&server);
+        assert!(
+            actions.iter().all(|(tick, action)| *tick == 3
+                && *action
+                    == BaseActionKind::Sell {
+                        from_stash: true,
+                        slot: 0
+                    }),
+            "продали строку склада 0: {actions:?}"
+        );
+
+        // На не-торговце R молчит.
+        app.apply_base_update(Some(2), 700, [0, 0, 0], Vec::new());
+        app.press_sell();
+        assert!(drain_base_actions(&server).is_empty());
+    }
+
+    #[test]
+    fn station_enter_upgrades_workbench() {
+        let (mut app, server, _client) = connected_world_app();
+        // Верстак — станция 2 сцены базы.
+        app.apply_base_update(Some(2), 900, [0, 0, 0], Vec::new());
+
+        app.press_enter();
+        let actions = drain_base_actions(&server);
+        assert_eq!(actions.len(), INPUT_REDUNDANCY, "{actions:?}");
+        assert!(
+            actions
+                .iter()
+                .all(|(tick, action)| *tick == 1 && *action == BaseActionKind::Upgrade),
+            "апгрейд верстака: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn e_near_station_sends_base_interact_and_hint() {
+        let (mut app, server, _client) = connected_world_app();
+
+        // Игрок встаёт в круг медпункта (станция 1 сцены базы, (8, 0, 14)).
+        let mut state = app
+            .simulation
+            .player_state(app.player_id)
+            .unwrap()
+            .net_state();
+        state.position = [8.0, 0.0, 14.0];
+        assert!(app.simulation.restore_player(app.player_id, &state));
+        app.update_interact_hint();
+        assert_eq!(
+            app.collect_hud_data().hint.as_deref(),
+            Some("[E] Медпункт"),
+            "подсказка станции вместо прицельной цели"
+        );
+
+        app.input.press_key(KeyCode::KeyE);
+        app.simulate(std::time::Duration::from_millis(17));
+        app.input.release_key(KeyCode::KeyE);
+        let interacts = drain_base_interacts(&server);
+        assert_eq!(interacts.len(), INPUT_REDUNDANCY, "{interacts:?}");
+        assert!(
+            interacts
+                .iter()
+                .all(|(tick, station)| *tick == 1 && *station == 1),
+            "E у медпункта шлёт BaseInteract: {interacts:?}"
+        );
+    }
+
+    #[test]
+    fn base_notice_shows_in_hud() {
+        let (mut app, server, client) = connected_world_app();
+        let notice = zn_net::encode_message(&zn_net::Message::BaseNotice {
+            text: "не хватает RU".to_string(),
+        })
+        .unwrap();
+        server.send_to(&notice, client).unwrap();
+
+        app.process_net(Instant::now());
+        let text = app
+            .collect_hud_data()
+            .notice
+            .expect("уведомление базы в HUD");
+        assert!(text.contains("не хватает RU"), "{text}");
+    }
+
+    #[test]
+    fn station_panel_closes_when_leaving_base() {
+        let (mut app, _server, _client) = connected_world_app();
+        app.apply_base_update(Some(0), 700, [0, 0, 0], Vec::new());
+        assert!(app.collect_hud_data().station.is_some());
+
+        app.enter_location(zn_scene::LOCATION_KORDON, [0.0, 0.0, 22.0], None);
+        assert!(
+            app.collect_hud_data().station.is_none(),
+            "вне базы панели станции нет"
+        );
+        assert!(
+            app.collect_hud_data().wallet_rub.is_none(),
+            "вне базы кошелёк не показываем"
         );
     }
 }

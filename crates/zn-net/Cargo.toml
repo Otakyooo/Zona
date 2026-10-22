@@ -10,3 +10,5 @@ description = "ZONA wire protocol: shared client/server message types and codecs
 [dependencies]
 bincode = { workspace = true }
 serde = { workspace = true }
+# дайджест пароля (M5): SHA-256 на клиенте — пароль не пересекает сеть
+sha2 = { workspace = true }

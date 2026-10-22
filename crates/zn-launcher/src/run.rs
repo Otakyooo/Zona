@@ -46,15 +46,51 @@ pub fn is_host_port(addr: &str) -> bool {
 }
 
 /// Команда запуска клиента: абсолютный `--content-root`, `--server` при
-/// валидном адресе (иначе offline), профиль через `ZN_PROFILE`.
-pub fn client_command(exe: &Path, content_dir: &Path, server: &ServerChoice<'_>) -> Command {
+/// валидном адресе (иначе offline), вход в аккаунт через `ZN_PROFILE` /
+/// `ZN_PASSWORD` (M5-1).
+pub fn client_command(
+    exe: &Path,
+    content_dir: &Path,
+    server: &ServerChoice<'_>,
+    credentials: &Credentials<'_>,
+) -> Command {
     let mut command = Command::new(exe);
     command.arg("--content-root").arg(content_dir);
     if let Some(addr) = server.resolve() {
         command.arg("--server").arg(addr);
     }
-    command.env("ZN_PROFILE", profile_name());
+    let account = credentials
+        .account
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    command.env(
+        "ZN_PROFILE",
+        account.map(str::to_string).unwrap_or_else(profile_name),
+    );
+    match credentials
+        .password
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(password) => {
+            command.env("ZN_PASSWORD", password);
+        }
+        // Лаунчер — источник правды: без пароля в полях клиент подключается
+        // гостем, даже если в окружении лаунчера остался ZN_PASSWORD.
+        None => {
+            command.env_remove("ZN_PASSWORD");
+        }
+    }
     command
+}
+
+/// Логин/пароль аккаунта (M5-1): лаунчер прокидывает их в клиент
+/// переменными окружения. Без пароля клиент — гость: играет, но склад
+/// между рейдами не сохраняется.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Credentials<'a> {
+    pub account: Option<&'a str>,
+    pub password: Option<&'a str>,
 }
 
 /// Профиль игрока: `ZN_PROFILE`, иначе имя пользователя ОС — стэши не теряются.
@@ -204,6 +240,7 @@ mod tests {
                 manual: Some("10.0.0.5:7700"),
                 manifest: Some("zona.playit.gg:7700"),
             },
+            &Credentials::default(),
         );
         assert_eq!(command.get_program(), exe.as_os_str());
         let args: Vec<String> = command
@@ -230,7 +267,12 @@ mod tests {
     fn client_command_offline_without_server() {
         let exe = Path::new("/opt/zona/game/zn-client");
         let content = Path::new("/opt/zona/game/content");
-        let command = client_command(exe, content, &ServerChoice::default());
+        let command = client_command(
+            exe,
+            content,
+            &ServerChoice::default(),
+            &Credentials::default(),
+        );
         let args: Vec<String> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -243,6 +285,52 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|arg| arg == "--server"));
+    }
+
+    #[test]
+    fn client_command_passes_credentials_and_removes_stale_password() {
+        let exe = Path::new("/opt/zona/game/zn-client");
+        let content = Path::new("/opt/zona/game/content");
+        let env_of = |command: &Command| -> Vec<(String, Option<String>)> {
+            command
+                .get_envs()
+                .filter_map(|(key, value)| {
+                    let key = key.to_string_lossy().into_owned();
+                    if key != "ZN_PROFILE" && key != "ZN_PASSWORD" {
+                        return None;
+                    }
+                    Some((key, value.map(|v| v.to_string_lossy().into_owned())))
+                })
+                .collect()
+        };
+
+        // Пара логин/пароль уходит в окружение клиента.
+        let command = client_command(
+            exe,
+            content,
+            &ServerChoice::default(),
+            &Credentials {
+                account: Some("  stalker  "),
+                password: Some("s3cret"),
+            },
+        );
+        let env = env_of(&command);
+        assert!(env.contains(&("ZN_PROFILE".to_string(), Some("stalker".to_string()))));
+        assert!(env.contains(&("ZN_PASSWORD".to_string(), Some("s3cret".to_string()))));
+
+        // Без пароля — ZN_PASSWORD явно убран (клиент гость).
+        let command = client_command(
+            exe,
+            content,
+            &ServerChoice::default(),
+            &Credentials {
+                account: Some("stalker"),
+                password: Some("   "),
+            },
+        );
+        let env = env_of(&command);
+        assert!(env.contains(&("ZN_PROFILE".to_string(), Some("stalker".to_string()))));
+        assert!(env.contains(&("ZN_PASSWORD".to_string(), None)), "{env:?}");
     }
 
     #[test]

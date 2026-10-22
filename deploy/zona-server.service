@@ -8,8 +8,9 @@ Type=simple
 WorkingDirectory=/opt/zona
 # Вход для игроков — playit-туннель на 127.0.0.1:7700 (см. deploy/playit.env),
 # поэтому слушаем только локалхост: снаружи бокс напрямую не виден.
-# Контент и стэши — в /opt/zona (свои каталоги, anicast не трогаем).
-ExecStart=/opt/zona/zn-server --bind 127.0.0.1 --port 7700 --content-root /opt/zona/content --stash-file /opt/zona/data/stashes.ron
+# Контент и БД аккаунтов (M5) — в /opt/zona (свои каталоги, anicast не трогаем).
+# Легаси stashes.ron (M4d-2) рядом с БД мигрируется один раз автоматически.
+ExecStart=/opt/zona/zn-server --bind 127.0.0.1 --port 7700 --content-root /opt/zona/content --db-file /opt/zona/data/zona.db
 Restart=always
 RestartSec=5
 # Ограничений ресурсов намеренно НЕТ: ZONA — второй жилец рядом с anicast.

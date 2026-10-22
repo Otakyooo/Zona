@@ -47,6 +47,14 @@ pub struct Config {
     /// «Свой сервер» (`host:port`) из GUI — приоритетнее манифеста.
     #[serde(default)]
     pub server_override: Option<String>,
+    /// Логин аккаунта (M5-1) из GUI; `None` — гость (склад не сохраняется).
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Пароль аккаунта (M5-1). Лежит в локальном `launcher-config.json`
+    /// открыто — это файл игрока на его машине; сервер хранит только
+    /// argon2-хэш sha2-дайджеста, сам пароль по сети не идёт.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 fn default_channel() -> String {
@@ -59,6 +67,8 @@ impl Default for Config {
             channel: default_channel(),
             install_dir: None,
             server_override: None,
+            account: None,
+            password: None,
         }
     }
 }
@@ -301,11 +311,15 @@ mod tests {
         assert_eq!(cfg.channel, "dev");
         assert!(cfg.install_dir.is_none());
         assert!(cfg.server_override.is_none());
+        assert!(cfg.account.is_none());
+        assert!(cfg.password.is_none());
         // запись и чтение обратно
         let cfg = Config {
             channel: "dev".into(),
             install_dir: Some(dir.path().join("D:/Games/ZONA")),
             server_override: Some("10.0.0.5:7700".into()),
+            account: Some("stalker".into()),
+            password: Some("s3cret".into()),
         };
         cfg.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), cfg);
@@ -337,6 +351,8 @@ mod tests {
             channel: "dev".into(),
             install_dir: Some(home.path().join("from-config")),
             server_override: None,
+            account: None,
+            password: None,
         };
         let flag = home.path().join("from-flag");
         // флаг бьёт конфиг

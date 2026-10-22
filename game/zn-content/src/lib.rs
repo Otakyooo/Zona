@@ -48,6 +48,9 @@ pub struct Item {
     /// `None` — артефакт без свойств (заготовка).
     #[serde(default)]
     pub carry_effect: Option<CarryEffect>,
+    /// Цена продажи торговцу в рублях (M5-2); `0` — хлам без цены.
+    #[serde(default)]
+    pub value_rub: u32,
     /// Цвет для рендера предметов на земле и ячеек инвентаря.
     #[serde(default = "default_item_color")]
     pub color: [f32; 3],
@@ -376,6 +379,7 @@ mod tests {
                 .unwrap();
         assert_eq!(item.use_effect, None);
         assert_eq!(item.color, default_item_color());
+        assert_eq!(item.value_rub, 0, "цена по умолчанию — 0 (хлам)");
     }
 
     #[test]
@@ -440,6 +444,12 @@ mod tests {
         let canned = catalog.get_by_key("canned_food").unwrap();
         let effect = canned.use_effect.as_ref().expect("консервы лечат");
         assert_eq!((effect.heal, effect.duration_secs), (10, 4.0));
+        // Цены торговца (M5-2): болт — 5, тягун — 800.
+        assert_eq!(catalog.get_by_key("bolt").unwrap().value_rub, 5);
+        assert_eq!(
+            catalog.get_by_key("artifact_gravity").unwrap().value_rub,
+            800
+        );
     }
 
     #[test]

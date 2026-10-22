@@ -52,6 +52,12 @@ serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
 ureq = "3"
+# аккаунты и БД (M5): argon2id-хэш дайджеста пароля, SQLite с встроенным
+# движком (bundled — без системной libsqlite на CI-раннерах); backup —
+# Online Backup API для ночных бэкапов БД (M5-3)
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # GUI лаунчера (M6-4); 0.36 пинован из-за совместимости с egui 0.36
