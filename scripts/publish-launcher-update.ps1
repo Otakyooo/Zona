@@ -88,12 +88,9 @@ try {
   #    publish-dev-build.ps1 ловит их по маске zona-launcher*x64.zip.
   Invoke-Checked gh @('release', 'upload', $ReleaseTag, $LauncherZip, '--clobber')
 
-  # 3. API-URL ассета.
+  # 3. Прямой web-URL скачивания ассета (без лимитов api.github.com).
   $launcherName = Split-Path $LauncherZip -Leaf
-  $launcherUrl = gh api "repos/$Repo/releases/tags/$ReleaseTag" --jq ".assets[] | select(.name==`"$launcherName`") | .url"
-  if ($LASTEXITCODE -ne 0) { throw "gh api releases/tags failed ($LASTEXITCODE)" }
-  if (-not $launcherUrl) { throw "asset '$launcherName' не найден в релизе после upload" }
-  $launcherUrl = $launcherUrl.Trim()
+  $launcherUrl = "https://github.com/$Repo/releases/download/$ReleaseTag/$launcherName"
 
   # 4. Правим ТОЛЬКО блок launcher{}.
   $launcherBlock = [ordered]@{

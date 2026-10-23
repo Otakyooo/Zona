@@ -82,9 +82,12 @@ if ($LauncherZip) {
   Invoke-Checked gh @('release', 'upload', $ReleaseTag, $LauncherZip, '--clobber')
 }
 
-$clientUrl = Get-AssetApiUrl $clientName
-$serverUrl = Get-AssetApiUrl $serverName
-$launcherUrl = if ($LauncherZip) { Get-AssetApiUrl $launcherName } else { "" }
+$repo = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { "Otakyooo/Zona" }
+# Прямые web-URL скачивания релиза: для публичного репо они отдаются через CDN
+# без анонимного лимита api.github.com (60 req/hr -> HTTP 403).
+$clientUrl = "https://github.com/$repo/releases/download/$ReleaseTag/$clientName"
+$serverUrl = "https://github.com/$repo/releases/download/$ReleaseTag/$serverName"
+$launcherUrl = if ($LauncherZip) { "https://github.com/$repo/releases/download/$ReleaseTag/$launcherName" } else { "" }
 
 # 3. manifest.json
 $runNumber = 0

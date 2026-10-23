@@ -203,9 +203,32 @@ pub fn is_sha256_hex(value: &str) -> bool {
     value.len() == SHA256_HEX_LEN && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Нормализует URL ассета: если передан API-URL вида
+/// `https://api.github.com/repos/{owner}/{repo}/releases/assets/{id}`,
+/// преобразует его в прямой web-URL скачивания релиза
+/// `https://github.com/{owner}/{repo}/releases/download/dev/{filename}`.
+/// На прямых web-URL нет лимита API (60 req/hr -> HTTP 403), они отдаются через CDN.
+fn normalize_download_url(url: &str, default_filename: &str) -> String {
+    if url.starts_with("https://api.github.com/repos/") && url.contains("/releases/assets/") {
+        format!(
+            "https://github.com/{}/releases/download/{RELEASE_TAG}/{default_filename}",
+            repo_slug()
+        )
+    } else {
+        url.to_string()
+    }
+}
+
 /// Разбор и валидация манифеста из JSON.
 pub fn parse(json: &str) -> Result<Manifest> {
     let mut manifest: Manifest = serde_json::from_str(json)?;
+    manifest.url = normalize_download_url(&manifest.url, "zona-dev-win-x64.zip");
+    if let Some(server) = &mut manifest.server {
+        server.url = normalize_download_url(&server.url, "zona-server-linux-x64.tar.gz");
+    }
+    if let Some(launcher) = &mut manifest.launcher {
+        launcher.url = normalize_download_url(&launcher.url, "zona-launcher-x64.zip");
+    }
     // Края адреса подчищаем: `server_addr` уезжает в манифест из переменной
     // репозитория, а вставка в UI GitHub нередко приносит `\r\n` —
     // `traded-convenient.tun.ply.gg:11114\r\n` не проходит проверку host:port,
@@ -235,14 +258,43 @@ pub fn api_base() -> String {
 
 /// Качает и разбирает манифест тега [`RELEASE_TAG`] (API-база — [`api_base`]).
 pub fn fetch_manifest(token: Option<&str>) -> Result<Manifest> {
-    fetch_manifest_from(&api_base(), token)
+    let env_token = token
+        .map(String::from)
+        .or_else(|| std::env::var("GH_TOKEN").ok())
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+    fetch_manifest_from(&api_base(), env_token.as_deref())
 }
 
 /// То же, но с произвольным базовым URL API (тесты, зеркала).
 ///
-/// Два хопа: JSON релиза по тегу → API-URL ассета `manifest.json`.
+/// Для публичного репозитория без токена качает manifest.json напрямую с
+/// `https://github.com/{owner}/{repo}/releases/download/dev/manifest.json`.
+/// Это полностью устраняет зависимость от анонимного лимита api.github.com
+/// (60 запросов/час на IP -> HTTP 403). При ошибке или наличии токена/зеркала
+/// работает через GitHub Releases API.
 pub fn fetch_manifest_from(api_base: &str, token: Option<&str>) -> Result<Manifest> {
     let base = api_base.trim_end_matches('/');
+    // Для публичного репозитория по умолчанию без токена — прямой веб-скач:
+    if token.is_none() && base == API_BASE {
+        let direct_url = format!(
+            "https://github.com/{}/releases/download/{RELEASE_TAG}/{MANIFEST_ASSET}",
+            repo_slug()
+        );
+        match http_get_retried(&direct_url, None, "application/octet-stream") {
+            Ok(body) => match parse(&body) {
+                Ok(manifest) => return Ok(manifest),
+                Err(e) => {
+                    log::warn!("прямой манифест {direct_url} не разобран: {e}, фолбэк на API")
+                }
+            },
+            Err(e) => {
+                log::debug!(
+                    "прямое скачивание манифеста {direct_url} не удалось: {e}, фолбэк на API"
+                )
+            }
+        }
+    }
+
     let release_url = format!("{base}/repos/{}/releases/tags/{RELEASE_TAG}", repo_slug());
     let release_json = http_get_retried(&release_url, token, "application/vnd.github+json")?;
     let asset_url = manifest_asset_url(&release_json, &release_url)?;
@@ -574,6 +626,43 @@ mod tests {
         assert!(!manifest.is_update_over(Some(&newer)).unwrap());
         assert!(!manifest.is_update_over(Some(&newer_minor)).unwrap());
         assert!(manifest.is_update_over(Some(&older_minor)).unwrap());
+    }
+
+    #[test]
+    fn parse_normalizes_api_asset_urls_to_direct_cdn() {
+        let json = format!(
+            r#"{{
+              "channel": "dev",
+              "version": "0.1.40",
+              "url": "https://api.github.com/repos/Otakyooo/Zona/releases/assets/12345",
+              "sha256": "{SHA_A}",
+              "size": 1000,
+              "launcher": {{
+                "version": "0.1.40",
+                "url": "https://api.github.com/repos/Otakyooo/Zona/releases/assets/67890",
+                "sha256": "{SHA_B}",
+                "size": 500
+              }},
+              "server": {{
+                "url": "https://api.github.com/repos/Otakyooo/Zona/releases/assets/11111",
+                "sha256": "{SHA_B}",
+                "size": 600
+              }}
+            }}"#
+        );
+        let manifest = parse(&json).unwrap();
+        assert_eq!(
+            manifest.url,
+            "https://github.com/Otakyooo/Zona/releases/download/dev/zona-dev-win-x64.zip"
+        );
+        assert_eq!(
+            manifest.launcher.as_ref().unwrap().url,
+            "https://github.com/Otakyooo/Zona/releases/download/dev/zona-launcher-x64.zip"
+        );
+        assert_eq!(
+            manifest.server.as_ref().unwrap().url,
+            "https://github.com/Otakyooo/Zona/releases/download/dev/zona-server-linux-x64.tar.gz"
+        );
     }
 
     #[test]

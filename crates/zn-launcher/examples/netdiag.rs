@@ -108,8 +108,24 @@ fn ureq_mode() {
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "raw".into());
     match mode.as_str() {
+        "direct" => {
+            let url = "https://github.com/Otakyooo/Zona/releases/download/dev/manifest.json";
+            println!("== testing direct: {url}");
+            let agent = zn_launcher::manifest::agent();
+            match agent.get(url).call() {
+                Ok(mut resp) => {
+                    println!("== status: {}", resp.status());
+                    let body = resp.body_mut().read_to_string().unwrap();
+                    println!(
+                        "== body (first 200 chars):\n{}",
+                        &body[..body.len().min(200)]
+                    );
+                }
+                Err(e) => println!("== ERROR: {e}"),
+            }
+        }
         "raw" => raw_mode(std::env::args().nth(2)),
         "ureq" => ureq_mode(),
-        other => eprintln!("неизвестный режим: {other} (raw|ureq)"),
+        other => eprintln!("неизвестный режим: {other} (raw|ureq|direct)"),
     }
 }
