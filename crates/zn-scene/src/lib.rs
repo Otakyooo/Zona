@@ -1095,17 +1095,17 @@ impl Scene {
         let mut scene = Scene::new("base");
         scene.spawn = Vec3::new(0.0, 0.0, 14.0);
         scene.spawn_yaw = std::f32::consts::PI;
-        // Ясный день (безопасная зона): выше солнце, синее небо, дымка слабая.
+        // Атмосфера сталкерского лагеря: чистый воздух стоянки, тёплый свет костра и фонарей.
         scene.environment = SceneEnvironment {
-            sun_direction: Vec3::new(-0.35, 0.75, 0.45),
-            sun_color: Vec3::new(1.0, 0.95, 0.86),
-            sun_intensity: 1.1,
-            ambient_color: Vec3::new(0.28, 0.30, 0.36),
+            sun_direction: Vec3::new(-0.35, 0.65, 0.45),
+            sun_color: Vec3::new(1.0, 0.94, 0.82),
+            sun_intensity: 0.95,
+            ambient_color: Vec3::new(0.28, 0.30, 0.35),
             ambient_intensity: 1.0,
-            fog_color: Vec3::new(0.60, 0.66, 0.75),
+            fog_color: Vec3::new(0.55, 0.60, 0.68),
             fog_density: 0.006,
-            sky_top: Vec3::new(0.12, 0.26, 0.55),
-            sky_horizon: Vec3::new(0.60, 0.70, 0.80),
+            sky_top: Vec3::new(0.12, 0.22, 0.45),
+            sky_horizon: Vec3::new(0.55, 0.62, 0.72),
         };
 
         // Площадка, периметр и постройки — текстуры бетона и асфальта (M4g, G5).
@@ -1239,8 +1239,65 @@ impl Scene {
             2.0,
         ));
 
-        // Склад (декор): контейнер у спавна — ржавый металл; склад-панель —
-        // по действию игрока.
+        // Центральное сталкерское кострище (металлическая бочка с горящими углями):
+        scene.add(
+            textured_cube(
+                Vec3::new(0.0, 0.45, 4.0),
+                Vec3::new(0.9, 0.9, 0.9),
+                metal,
+                TEXTURE_METAL,
+                0.3,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(0.0, 0.95, 4.0),
+            Vec3::new(2.4, 0.85, 0.15),
+            3.5,
+        ));
+        // Деревянные лавки и ящики вокруг костра:
+        scene.add(
+            textured_cube(
+                Vec3::new(-1.8, 0.25, 4.0),
+                Vec3::new(0.5, 0.4, 1.8),
+                Vec4::new(0.45, 0.35, 0.22, 1.0),
+                TEXTURE_DIRT,
+                0.3,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(1.8, 0.25, 4.0),
+                Vec3::new(0.5, 0.4, 1.8),
+                Vec4::new(0.45, 0.35, 0.22, 1.0),
+                TEXTURE_DIRT,
+                0.3,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(0.0, 0.25, 2.2),
+                Vec3::new(1.8, 0.4, 0.5),
+                Vec4::new(0.45, 0.35, 0.22, 1.0),
+                TEXTURE_DIRT,
+                0.3,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(0.0, 0.25, 5.8),
+                Vec3::new(1.8, 0.4, 0.5),
+                Vec4::new(0.45, 0.35, 0.22, 1.0),
+                TEXTURE_DIRT,
+                0.3,
+            )
+            .invulnerable(),
+        );
+
+        // Склад (декор): армейский контейнер у спавна — ржавый металл.
         scene.add(textured_cube(
             Vec3::new(4.0, 0.6, 10.0),
             Vec3::new(1.6, 1.2, 1.6),
@@ -1249,7 +1306,7 @@ impl Scene {
             0.5,
         ));
 
-        // Антураж станций (декорации с invulnerable(), чтобы не мешать навигации игроков):
+        // 1. Торговец (лавка с навесом, полками и тёплым фонарём):
         scene.add(
             textured_cube(
                 Vec3::new(-8.0, 0.5, 7.8),
@@ -1272,17 +1329,18 @@ impl Scene {
         );
         scene.add(lamp_object(
             Vec3::new(-8.0, 2.4, 8.8),
-            Vec3::new(1.2, 1.0, 0.5),
-            1.5,
+            Vec3::new(1.4, 1.0, 0.4),
+            2.0,
         ));
 
+        // 2. Медпункт (полевой санитарный отсек в ангаре):
         scene.add(
             textured_cube(
-                Vec3::new(8.0, 0.5, 11.8),
-                Vec3::new(2.2, 1.0, 0.8),
+                Vec3::new(8.0, 0.35, 12.0),
+                Vec3::new(1.0, 0.5, 2.2),
                 building,
                 TEXTURE_CONCRETE,
-                0.5,
+                0.4,
             )
             .invulnerable(),
         );
@@ -1298,10 +1356,11 @@ impl Scene {
         );
         scene.add(lamp_object(
             Vec3::new(8.0, 2.4, 13.8),
-            Vec3::new(0.4, 1.1, 1.1),
-            1.6,
+            Vec3::new(0.3, 1.2, 0.5),
+            1.8,
         ));
 
+        // 3. Верстак (мастерская со слесарным столом):
         scene.add(
             textured_cube(
                 Vec3::new(-8.0, 0.5, 15.8),
@@ -1315,9 +1374,10 @@ impl Scene {
         scene.add(lamp_object(
             Vec3::new(-8.0, 2.2, 17.0),
             Vec3::new(1.1, 0.95, 0.7),
-            1.4,
+            1.6,
         ));
 
+        // 4. Сейф (бронированный шкаф-сейф базы):
         scene.add(
             textured_cube(
                 Vec3::new(8.0, 1.0, 20.4),
@@ -1334,12 +1394,44 @@ impl Scene {
             1.7,
         ));
 
-        // Ворота на Кордон (у северной стены).
-        scene.add(pad(0.0, -20.0, 5.0, Vec4::new(0.20, 0.55, 0.25, 1.0)));
+        // Северный КПП на Кордон (мешки с песком и дорожный проезд):
+        scene.add(
+            textured_cube(
+                Vec3::new(-2.8, 0.45, -18.5),
+                Vec3::new(2.0, 0.9, 1.2),
+                Vec4::new(0.65, 0.60, 0.45, 1.0),
+                TEXTURE_DIRT,
+                0.4,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(2.8, 0.45, -18.5),
+                Vec3::new(2.0, 0.9, 1.2),
+                Vec4::new(0.65, 0.60, 0.45, 1.0),
+                TEXTURE_DIRT,
+                0.4,
+            )
+            .invulnerable(),
+        );
+        scene.add(textured_cube(
+            Vec3::new(0.0, -0.47, -20.0),
+            Vec3::new(5.0, 0.5, 8.0),
+            Vec4::new(0.35, 0.35, 0.36, 1.0),
+            TEXTURE_ASPHALT,
+            0.3,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(0.0, 5.2, -22.5),
+            Vec3::new(1.8, 0.2, 0.2),
+            2.5,
+        ));
+
         scene.add_transition(
             SceneTransition::new(
                 Vec3::new(0.0, 0.0, -20.0),
-                2.5,
+                3.0,
                 LOCATION_KORDON,
                 Vec3::new(0.0, 0.0, 22.0),
             )
@@ -1347,8 +1439,7 @@ impl Scene {
             .with_label("Кордон"),
         );
 
-        // Станции базы (M5-2): четыре круга у спавна. Торговец несёт офферы
-        // (покупка по двойной цене каталога), остальные — уровни из аккаунта.
+        // Станции базы (M5-2): четыре круга у спавна.
         scene.add_station(
             SceneStation::new(Vec3::new(-8.0, 0.0, 10.0), 2.0, StationKind::Trader)
                 .with_label("Торговец")
@@ -1387,8 +1478,42 @@ impl Scene {
             SceneStation::new(Vec3::new(8.0, 0.0, 18.0), 2.0, StationKind::Safe).with_label("Сейф"),
         );
 
-        // Ворота на Полигон (G5: испытательный полигон у западной стены).
-        scene.add(pad(-20.0, 0.0, 5.0, Vec4::new(0.25, 0.45, 0.65, 1.0)));
+        // Служебный туннель у западной стены (проход на Полигон оформлен как бетонный портал бункера):
+        scene.add(
+            textured_cube(
+                Vec3::new(-22.0, 2.0, -2.5),
+                Vec3::new(1.5, 4.0, 1.2),
+                wall,
+                TEXTURE_CONCRETE,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(-22.0, 2.0, 2.5),
+                Vec3::new(1.5, 4.0, 1.2),
+                wall,
+                TEXTURE_CONCRETE,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(-22.0, 3.8, 0.0),
+                Vec3::new(1.5, 1.0, 6.0),
+                metal,
+                TEXTURE_METAL,
+                0.4,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(-21.0, 3.2, 0.0),
+            Vec3::new(1.6, 0.9, 0.15),
+            2.2,
+        ));
         scene.add_transition(
             SceneTransition::new(
                 Vec3::new(-20.0, 0.0, 0.0),
@@ -1397,7 +1522,7 @@ impl Scene {
                 Vec3::new(0.0, 0.0, 16.0),
             )
             .with_yaw(std::f32::consts::PI)
-            .with_label("Полигон"),
+            .with_label("Служебный туннель"),
         );
 
         scene

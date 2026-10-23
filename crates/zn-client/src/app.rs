@@ -540,6 +540,8 @@ pub struct ClientApp {
     damage_flash_until: Option<Instant>,
     /// Накопленная дистанция шагов для звуков ходьбы.
     step_distance_accum: f32,
+    /// Время последнего перехода между локациями (для защиты от повторного триггера в offline).
+    last_transition_time: Option<Instant>,
     /// Уведомление о своей экстракции (M4d-2): панель результата.
     extraction_flash: Option<ExtractionNotice>,
     /// Уведомление аккаунта/отказа (M5-1): текст и до какого мгновения живо.
@@ -778,6 +780,7 @@ impl ClientApp {
             hitmarker_headshot: false,
             damage_flash_until: None,
             step_distance_accum: 0.0,
+            last_transition_time: None,
             extraction_flash: None,
             notice: None,
             knockdown_until: None,
@@ -1625,6 +1628,33 @@ impl ClientApp {
             // Online: локальные апдейты предсказания не нужны — истина в сети.
             let _ = self.simulation.take_net_updates();
         }
+
+        if self.net.is_none() {
+            // Переходы между локациями в offline-режиме:
+            if let Some(state) = self.simulation.player_state(self.player_id) {
+                let now = Instant::now();
+                let can_transition = self
+                    .last_transition_time
+                    .is_none_or(|t| now.duration_since(t) > Duration::from_millis(1000));
+                if can_transition {
+                    if let Some(transition) = self
+                        .scene
+                        .transitions
+                        .iter()
+                        .find(|t| t.contains(state.position))
+                    {
+                        self.last_transition_time = Some(now);
+                        self.enter_location(
+                            transition.target,
+                            transition.target_position.to_array(),
+                            Some(transition.target_yaw),
+                        );
+                        self.audio.play(SoundId::Transition);
+                    }
+                }
+            }
+        }
+
         // Шаги (Combat Feel): звук шагов по поверхности при передвижении
         if let Some(state) = self.simulation.player_state(self.player_id) {
             let h_vel = glam::Vec2::new(state.velocity.x, state.velocity.z);
@@ -2413,6 +2443,24 @@ impl ClientApp {
             if let Some(station) = self.station_at_player() {
                 if let Some(scene_station) = self.scene.stations.get(usize::from(station)) {
                     self.station_hint = Some(format!("[E] {}", Self::station_title(scene_station)));
+                }
+            } else if let Some(state) = self.simulation.player_state(self.player_id) {
+                // Подсказка зоны перехода между локациями (на полу)
+                for transition in &self.scene.transitions {
+                    let delta = Vec3::new(
+                        state.position.x - transition.position.x,
+                        0.0,
+                        state.position.z - transition.position.z,
+                    );
+                    if delta.length() <= transition.radius + 1.2 {
+                        let label = if transition.label.is_empty() {
+                            self.location_name(transition.target)
+                        } else {
+                            transition.label.as_str()
+                        };
+                        self.station_hint = Some(format!("Переход: {label}"));
+                        break;
+                    }
                 }
             }
         }

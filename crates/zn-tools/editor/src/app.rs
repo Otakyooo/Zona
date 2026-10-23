@@ -1697,15 +1697,15 @@ fn environment_preset(name: &str) -> Option<SceneEnvironment> {
     Some(match name {
         // База: ясный день, синее небо, слабая дымка.
         "clear" => SceneEnvironment {
-            sun_direction: Vec3::new(-0.35, 0.75, 0.45),
-            sun_color: Vec3::new(1.0, 0.95, 0.86),
-            sun_intensity: 1.1,
-            ambient_color: Vec3::new(0.28, 0.30, 0.36),
+            sun_direction: Vec3::new(-0.35, 0.65, 0.45),
+            sun_color: Vec3::new(1.0, 0.94, 0.82),
+            sun_intensity: 0.95,
+            ambient_color: Vec3::new(0.28, 0.30, 0.35),
             ambient_intensity: 1.0,
-            fog_color: Vec3::new(0.60, 0.66, 0.75),
+            fog_color: Vec3::new(0.55, 0.60, 0.68),
             fog_density: 0.006,
-            sky_top: Vec3::new(0.12, 0.26, 0.55),
-            sky_horizon: Vec3::new(0.60, 0.70, 0.80),
+            sky_top: Vec3::new(0.12, 0.22, 0.45),
+            sky_horizon: Vec3::new(0.55, 0.62, 0.72),
         },
         // Свалка: низкое пыльное солнце, рыжая мгла, тяжёлый туман.
         "dust" => SceneEnvironment {

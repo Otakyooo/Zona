@@ -55,10 +55,17 @@ fn synth(sound: SoundId) -> Vec<f32> {
             0.5 * rng.next_f32() * (-30.0 * phase).exp()
                 + 0.4 * (TAU * 760.0 * t).sin() * (-25.0 * phase).exp()
         }),
-        // Подтверждение попадания (хитмаркер): звонкий металлический щелчок.
-        SoundId::HitConfirm => render(0.05, |t, phase, rng| {
-            0.4 * rng.next_f32() * (-45.0 * phase).exp()
-                + 0.5 * (TAU * 1850.0 * t).sin() * (-35.0 * phase).exp()
+        // Подтверждение попадания (хитмаркер): короткий чёткий тактильный щелчок (двойной микро-клик).
+        SoundId::HitConfirm => render(0.04, |t, phase, rng| {
+            let t2 = (t - 0.012).max(0.0);
+            let click1 = (TAU * 1150.0 * t).sin() * (-65.0 * phase).exp() * 0.35;
+            let click2 = if t >= 0.012 {
+                (TAU * 1420.0 * t2).sin() * (-80.0 * (phase - 0.3).max(0.0)).exp() * 0.3
+            } else {
+                0.0
+            };
+            let snap = rng.next_f32() * 0.15 * (-50.0 * phase).exp();
+            click1 + click2 + snap
         }),
         // Подбор: два восходящих бlipа.
         SoundId::Pickup => render(0.15, |t, phase, _rng| {
@@ -107,39 +114,46 @@ fn synth(sound: SoundId) -> Vec<f32> {
             0.6 * rng.next_f32() * (-25.0 * phase).exp()
                 + 0.3 * (TAU * 1400.0 * t).sin() * (-30.0 * phase).exp()
         }),
-        // Переход между локациями: восходящий свист.
-        SoundId::Transition => render(0.30, |t, phase, rng| {
-            let freq = 300.0 + 600.0 * phase;
-            0.4 * (TAU * freq * t).sin() * (std::f32::consts::PI * phase).sin()
-                + 0.2 * rng.next_f32() * (-6.0 * phase).exp()
+        // Переход между локациями: глубокий пространственный гул и шелест искажения пространства.
+        SoundId::Transition => render(0.35, |t, phase, rng| {
+            let hum = (TAU * (65.0 + 35.0 * (std::f32::consts::PI * phase).sin()) * t).sin()
+                * 0.45
+                * (std::f32::consts::PI * phase).sin();
+            let air = rng.next_f32() * 0.18 * (std::f32::consts::PI * phase).sin();
+            hum + air
         }),
-        // Шаг по бетону: сухой резкий стук с быстрым затуханием.
-        SoundId::StepConcrete => render(0.08, |t, phase, rng| {
-            0.4 * rng.next_f32() * (-30.0 * phase).exp()
-                + 0.3 * (TAU * 260.0 * t).sin() * (-25.0 * phase).exp()
+        // Шаг по бетону: естественный глухой стук армейского берца с мягким трением.
+        SoundId::StepConcrete => render(0.07, |t, phase, rng| {
+            let thud = (TAU * (85.0 - 45.0 * phase) * t).sin() * 0.22 * (-35.0 * phase).exp();
+            let grit = rng.next_f32() * 0.14 * (-40.0 * phase).exp();
+            thud + grit
         }),
-        // Шаг по земле/траве: глухой мягкий шлепок с низкочастотным спадом.
-        SoundId::StepDirt => render(0.09, |t, phase, rng| {
-            0.5 * rng.next_f32() * (-20.0 * phase).exp()
-                + 0.25 * (TAU * 110.0 * t).sin() * (-18.0 * phase).exp()
+        // Шаг по земле/траве: мягкий приглушённый шлепок без звонких частот.
+        SoundId::StepDirt => render(0.08, |t, phase, rng| {
+            let thud = (TAU * (60.0 - 30.0 * phase) * t).sin() * 0.24 * (-28.0 * phase).exp();
+            let rustle = rng.next_f32() * 0.10 * (-25.0 * phase).exp();
+            thud + rustle
         }),
-        // Шаг по металлу: звонкий лязг с характерным резонансом.
-        SoundId::StepMetal => render(0.10, |t, phase, rng| {
-            0.3 * rng.next_f32() * (-22.0 * phase).exp()
-                + 0.4 * (TAU * 780.0 * t).sin() * (-16.0 * phase).exp()
-                + 0.2 * (TAU * 1240.0 * t).sin() * (-20.0 * phase).exp()
+        // Шаг по металлу: глухой удар по железному настилу с коротким резонансом.
+        SoundId::StepMetal => render(0.09, |t, phase, rng| {
+            let thud = (TAU * 90.0 * t).sin() * 0.20 * (-30.0 * phase).exp();
+            let ring = (TAU * 340.0 * t).sin() * 0.18 * (-22.0 * phase).exp();
+            let tap = rng.next_f32() * 0.12 * (-45.0 * phase).exp();
+            thud + ring + tap
         }),
-        // Шаг по асфальту: мелкий гравийный щелчок.
-        SoundId::StepAsphalt => render(0.08, |t, phase, rng| {
-            0.45 * rng.next_f32() * (-28.0 * phase).exp()
-                + 0.25 * (TAU * 380.0 * t).sin() * (-22.0 * phase).exp()
+        // Шаг по асфальту: плотный шаг берца по старому потрескавшемуся асфальту.
+        SoundId::StepAsphalt => render(0.07, |t, phase, rng| {
+            let thud = (TAU * (75.0 - 40.0 * phase) * t).sin() * 0.22 * (-35.0 * phase).exp();
+            let grit = rng.next_f32() * 0.16 * (-35.0 * phase).exp();
+            thud + grit
         }),
         // Рычание мутанта: низкий хриплый горловой рокот с модуляцией.
-        SoundId::MutantGrowl => render(0.40, |t, phase, rng| {
-            let tremolo = 1.0 + 0.35 * (TAU * 22.0 * t).sin();
-            let freq = 95.0 + 30.0 * (TAU * 4.0 * t).sin();
-            0.5 * (TAU * freq * t).sin() * (-3.0 * phase).exp() * tremolo
-                + 0.25 * rng.next_f32() * (-4.0 * phase).exp()
+        SoundId::MutantGrowl => render(0.45, |t, phase, rng| {
+            let tremolo = 1.0 + 0.4 * (TAU * 18.0 * t).sin();
+            let freq = 55.0 + 15.0 * (TAU * 6.0 * t).sin();
+            let roar = (TAU * freq * t).sin() * 0.45 * tremolo * (-2.5 * phase).exp();
+            let rasp = rng.next_f32() * 0.20 * (-3.0 * phase).exp();
+            roar + rasp
         }),
         // Укус мутанта: резкий щелчок челюстей.
         SoundId::MutantBite => render(0.12, |t, phase, rng| {
