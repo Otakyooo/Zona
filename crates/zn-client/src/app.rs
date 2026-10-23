@@ -4593,7 +4593,7 @@ mod tests {
     #[test]
     fn world_client_loads_all_locations_and_starts_on_base() {
         let mut app = world_app();
-        assert_eq!(app.scenes.len(), 4, "все локации мира загружены");
+        assert_eq!(app.scenes.len(), 5, "все локации мира загружены");
         assert_eq!(app.location, zn_scene::LOCATION_BASE);
         assert_eq!(app.scene.name, "base");
         assert_eq!(app.location_name(app.location), "База");

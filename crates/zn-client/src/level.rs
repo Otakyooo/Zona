@@ -200,8 +200,8 @@ mod tests {
     fn load_world_falls_back_to_builtin_scenes() {
         let root = std::env::temp_dir().join("zn-client-no-such-world-root");
         let (registry, scenes) = load_world(&root);
-        assert_eq!(registry.locations.len(), 4);
-        assert_eq!(scenes.len(), 4);
+        assert_eq!(registry.locations.len(), 5);
+        assert_eq!(scenes.len(), 5);
         assert_eq!(scenes[&zn_scene::LOCATION_BASE].name, "base");
         assert!(!scenes[&zn_scene::LOCATION_SVALKA].is_empty());
     }

@@ -24,5 +24,11 @@
             scene: "podzemka",
             base: false,
         ),
+        (
+            id: 4,
+            name: "Полигон",
+            scene: "polygon",
+            base: false,
+        ),
     ],
 )

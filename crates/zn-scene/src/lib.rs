@@ -185,6 +185,8 @@ pub const LOCATION_KORDON: LocationId = 1;
 pub const LOCATION_SVALKA: LocationId = 2;
 /// Локация встроенного мира: Подземка.
 pub const LOCATION_PODZEMKA: LocationId = 3;
+/// Локация встроенного мира: Полигон (G5: испытательный полигон всех систем).
+pub const LOCATION_POLYGON: LocationId = 4;
 
 /// Точка пузыря (M4d): сфера-телепорт. `position` — якорь на полу (центр —
 /// `position + (0, radius, 0)`), вход игрока уносит его в ближайшую к базе
@@ -414,6 +416,12 @@ impl LocationRegistry {
                     id: LOCATION_PODZEMKA,
                     name: "Подземка".to_string(),
                     scene: "podzemka".to_string(),
+                    base: false,
+                },
+                LocationInfo {
+                    id: LOCATION_POLYGON,
+                    name: "Полигон".to_string(),
+                    scene: "polygon".to_string(),
                     base: false,
                 },
             ],
@@ -1077,11 +1085,13 @@ impl Scene {
             sky_horizon: Vec3::new(0.60, 0.70, 0.80),
         };
 
-        // Площадка, периметр и постройки — текстуры бетона (M4g).
+        // Площадка, периметр и постройки — текстуры бетона и асфальта (M4g, G5).
         let ground = Vec4::new(0.62, 0.64, 0.60, 1.0);
         let wall = Vec4::new(0.45, 0.46, 0.45, 1.0);
         let building = Vec4::new(0.78, 0.78, 0.75, 1.0);
+        let metal = Vec4::new(0.55, 0.52, 0.50, 1.0);
 
+        // Периметр базы (бетонные плиты).
         scene.add(textured_cube(
             Vec3::new(0.0, -0.5, 0.0),
             Vec3::new(48.0, 0.5, 48.0),
@@ -1089,6 +1099,16 @@ impl Scene {
             TEXTURE_CONCRETE,
             0.25,
         ));
+        // Центральный асфальтовый плац.
+        scene.add(textured_cube(
+            Vec3::new(0.0, -0.48, 4.0),
+            Vec3::new(28.0, 0.5, 30.0),
+            Vec4::new(0.35, 0.35, 0.36, 1.0),
+            TEXTURE_ASPHALT,
+            0.3,
+        ));
+
+        // Внешние стены базы по периметру (удерживают игрока на уровне).
         for (position, scale) in [
             (Vec3::new(0.0, 2.5, -24.0), Vec3::new(49.0, 3.0, 1.0)),
             (Vec3::new(0.0, 2.5, 24.0), Vec3::new(49.0, 3.0, 1.0)),
@@ -1098,7 +1118,59 @@ impl Scene {
             scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
         }
 
-        // Постройки: казарма и ангар — бетонные блоки.
+        // КПП / Северные ворота на Кордон (декоративное оформление проезда):
+        scene.add(
+            textured_cube(
+                Vec3::new(-4.5, 2.5, -22.5),
+                Vec3::new(1.5, 5.0, 1.6),
+                wall,
+                TEXTURE_CONCRETE,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(4.5, 2.5, -22.5),
+                Vec3::new(1.5, 5.0, 1.6),
+                wall,
+                TEXTURE_CONCRETE,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(0.0, 4.5, -22.5),
+                Vec3::new(10.5, 1.0, 1.2),
+                metal,
+                TEXTURE_METAL,
+                0.4,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(-4.5, 4.8, -21.5),
+            Vec3::new(1.2, 1.0, 0.6),
+            1.8,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(4.5, 4.8, -21.5),
+            Vec3::new(1.2, 1.0, 0.6),
+            1.8,
+        ));
+        scene.add(
+            textured_cube(
+                Vec3::new(9.0, 1.8, -20.0),
+                Vec3::new(3.5, 3.6, 4.0),
+                building,
+                TEXTURE_CONCRETE,
+                0.4,
+            )
+            .invulnerable(),
+        );
+
+        // Постройки: казарма и ангар.
         for (position, scale) in [
             (Vec3::new(-12.0, 2.5, -8.0), Vec3::new(12.0, 5.0, 10.0)),
             (Vec3::new(10.0, 2.0, 6.0), Vec3::new(8.0, 4.0, 8.0)),
@@ -1112,6 +1184,38 @@ impl Scene {
             ));
         }
 
+        // Осветительные мачты плаца:
+        scene.add(
+            textured_cube(
+                Vec3::new(-11.0, 3.0, 2.0),
+                Vec3::new(0.3, 6.0, 0.3),
+                metal,
+                TEXTURE_METAL,
+                0.2,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(-11.0, 6.1, 2.0),
+            Vec3::new(1.1, 1.0, 0.8),
+            2.0,
+        ));
+        scene.add(
+            textured_cube(
+                Vec3::new(11.0, 3.0, 2.0),
+                Vec3::new(0.3, 6.0, 0.3),
+                metal,
+                TEXTURE_METAL,
+                0.2,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(11.0, 6.1, 2.0),
+            Vec3::new(1.1, 1.0, 0.8),
+            2.0,
+        ));
+
         // Склад (декор): контейнер у спавна — ржавый металл; склад-панель —
         // по действию игрока.
         scene.add(textured_cube(
@@ -1120,6 +1224,91 @@ impl Scene {
             Vec4::new(0.90, 0.66, 0.36, 1.0),
             TEXTURE_METAL,
             0.5,
+        ));
+
+        // Антураж станций (декорации с invulnerable(), чтобы не мешать навигации игроков):
+        scene.add(
+            textured_cube(
+                Vec3::new(-8.0, 0.5, 7.8),
+                Vec3::new(2.4, 1.0, 0.8),
+                metal,
+                TEXTURE_METAL,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(-8.0, 1.5, 12.4),
+                Vec3::new(2.8, 3.0, 0.6),
+                wall,
+                TEXTURE_CONCRETE,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(-8.0, 2.4, 8.8),
+            Vec3::new(1.2, 1.0, 0.5),
+            1.5,
+        ));
+
+        scene.add(
+            textured_cube(
+                Vec3::new(8.0, 0.5, 11.8),
+                Vec3::new(2.2, 1.0, 0.8),
+                building,
+                TEXTURE_CONCRETE,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(
+            textured_cube(
+                Vec3::new(8.0, 1.5, 16.4),
+                Vec3::new(2.4, 3.0, 0.6),
+                metal,
+                TEXTURE_METAL,
+                0.5,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(8.0, 2.4, 13.8),
+            Vec3::new(0.4, 1.1, 1.1),
+            1.6,
+        ));
+
+        scene.add(
+            textured_cube(
+                Vec3::new(-8.0, 0.5, 15.8),
+                Vec3::new(2.2, 1.0, 0.8),
+                metal,
+                TEXTURE_METAL,
+                0.4,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(-8.0, 2.2, 17.0),
+            Vec3::new(1.1, 0.95, 0.7),
+            1.4,
+        ));
+
+        scene.add(
+            textured_cube(
+                Vec3::new(8.0, 1.0, 20.4),
+                Vec3::new(1.6, 2.0, 0.8),
+                Vec4::new(0.2, 0.2, 0.22, 1.0),
+                TEXTURE_METAL,
+                0.3,
+            )
+            .invulnerable(),
+        );
+        scene.add(lamp_object(
+            Vec3::new(8.0, 2.2, 19.8),
+            Vec3::new(1.2, 0.7, 0.2),
+            1.7,
         ));
 
         // Ворота на Кордон (у северной стены).
@@ -1175,14 +1364,141 @@ impl Scene {
             SceneStation::new(Vec3::new(8.0, 0.0, 18.0), 2.0, StationKind::Safe).with_label("Сейф"),
         );
 
+        // Ворота на Полигон (G5: испытательный полигон у западной стены).
+        scene.add(pad(-20.0, 0.0, 5.0, Vec4::new(0.25, 0.45, 0.65, 1.0)));
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(-20.0, 0.0, 0.0),
+                2.5,
+                LOCATION_POLYGON,
+                Vec3::new(0.0, 0.0, 16.0),
+            )
+            .with_yaw(std::f32::consts::PI)
+            .with_label("Полигон"),
+        );
+
         scene
     }
 
-    /// Кордон (M4d): нынешний demo_zone с переходами (База/Свалка/Подземка),
-    /// кандидатами пузырей и точками прибытия у ворот базы.
+    /// Кордон (M4d, G5): открытая локация с дорогой, КПП у ворот Базы, переходам
+    /// на Свалку и в Подземку, радиомачтой эвакуации, пузырями и аномалиями.
     pub fn kordon() -> Self {
         let mut scene = Self::demo_zone();
         scene.name = "kordon".to_string();
+
+        let ground = Vec4::new(0.62, 0.64, 0.60, 1.0);
+        let wall = Vec4::new(0.45, 0.46, 0.45, 1.0);
+        let metal = Vec4::new(0.55, 0.52, 0.50, 1.0);
+
+        // Главная дорога Кордона: асфальтовое полотно с севера (от ворот Базы) на юг.
+        scene.add(textured_cube(
+            Vec3::new(0.0, -0.47, 0.0),
+            Vec3::new(6.0, 0.5, 54.0),
+            ground,
+            TEXTURE_ASPHALT,
+            0.25,
+        ));
+
+        // Северный КПП перед воротами Базы (z = 24..26):
+        scene.add(textured_cube(
+            Vec3::new(-4.5, 1.2, 24.0),
+            Vec3::new(1.2, 2.4, 3.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+        scene.add(textured_cube(
+            Vec3::new(4.5, 1.2, 24.0),
+            Vec3::new(1.2, 2.4, 3.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+        // Фонари на КПП:
+        scene.add(lamp_object(
+            Vec3::new(-4.5, 2.6, 24.0),
+            Vec3::new(1.2, 1.0, 0.6),
+            1.6,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(4.5, 2.6, 24.0),
+            Vec3::new(1.2, 1.0, 0.6),
+            1.6,
+        ));
+
+        // Западная дорога к переходу на Свалку (x = -26, z = 0):
+        scene.add(textured_cube(
+            Vec3::new(-13.0, -0.48, 0.0),
+            Vec3::new(20.0, 0.5, 5.0),
+            ground,
+            TEXTURE_DIRT,
+            0.3,
+        ));
+        // Разрушенное укрытие / блокпост у перехода на Свалку:
+        scene.add(textured_cube(
+            Vec3::new(-24.0, 1.5, 4.0),
+            Vec3::new(2.0, 3.0, 5.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.4,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(-24.0, 3.2, 4.0),
+            Vec3::new(1.1, 0.8, 0.4),
+            1.5,
+        ));
+
+        // Восточный вход в Подземку (x = 26, z = 0):
+        scene.add(textured_cube(
+            Vec3::new(13.0, -0.48, 0.0),
+            Vec3::new(20.0, 0.5, 5.0),
+            ground,
+            TEXTURE_CONCRETE,
+            0.3,
+        ));
+        // Бункерный портал вокруг перехода в Подземку:
+        scene.add(textured_cube(
+            Vec3::new(26.0, 2.0, -4.0),
+            Vec3::new(3.0, 4.0, 2.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+        scene.add(textured_cube(
+            Vec3::new(26.0, 2.0, 4.0),
+            Vec3::new(3.0, 4.0, 2.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+        scene.add(textured_cube(
+            Vec3::new(26.0, 4.2, 0.0),
+            Vec3::new(3.0, 1.0, 6.0),
+            metal,
+            TEXTURE_METAL,
+            0.4,
+        ));
+        // Янтарный аварийный фонарь над порталом Подземки:
+        scene.add(lamp_object(
+            Vec3::new(24.2, 3.2, 0.0),
+            Vec3::new(1.3, 0.7, 0.2),
+            1.8,
+        ));
+
+        // Маяк аварийной экстракции (у границы круга эвакуации (-24, -24)):
+        // Высокая металлическая мачта с ярким пульсирующим красным огнём:
+        scene.add(textured_cube(
+            Vec3::new(-26.5, 2.5, -26.5),
+            Vec3::new(0.35, 5.0, 0.35),
+            metal,
+            TEXTURE_METAL,
+            0.2,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(-26.5, 5.2, -26.5),
+            Vec3::new(1.5, 0.25, 0.25),
+            2.5,
+        ));
 
         scene.add(pad(0.0, 26.0, 5.0, Vec4::new(0.20, 0.55, 0.25, 1.0)));
         scene.add(pad(-26.0, 0.0, 5.0, Vec4::new(0.25, 0.35, 0.60, 1.0)));
@@ -1278,7 +1594,8 @@ impl Scene {
             scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
         }
 
-        // Завалы: башни и разбросанные блоки — ржавый металл.
+        // Башни и завалы: на вершинах ключевых башен — сигнальные маяки,
+        // служащие визуальными ориентирами в густом тумане Свалки.
         let piles = [
             (Vec3::new(-10.0, 4.0, -12.0), Vec3::new(6.0, 8.0, 6.0)),
             (Vec3::new(12.0, 3.0, 14.0), Vec3::new(5.0, 6.0, 5.0)),
@@ -1289,6 +1606,24 @@ impl Scene {
         for (position, scale) in piles {
             scene.add(textured_cube(position, scale, pile, TEXTURE_METAL, 0.35));
         }
+
+        // Габаритные огни-маяки на вершинах главных свальных башен:
+        scene.add(lamp_object(
+            Vec3::new(-10.0, 8.2, -12.0),
+            Vec3::new(1.3, 0.7, 0.1),
+            2.0,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(12.0, 6.2, 14.0),
+            Vec3::new(1.4, 0.25, 0.1),
+            2.0,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(26.0, 4.2, -26.0),
+            Vec3::new(1.3, 0.7, 0.1),
+            2.0,
+        ));
+
         let debris = [
             (Vec3::new(4.0, 0.75, -20.0), Vec3::new(3.0, 1.5, 2.0)),
             (Vec3::new(-18.0, 1.0, 2.0), Vec3::new(2.0, 2.0, 3.0)),
@@ -1296,6 +1631,10 @@ impl Scene {
             (Vec3::new(-6.0, 0.9, 26.0), Vec3::new(2.5, 1.8, 2.5)),
             (Vec3::new(30.0, 1.2, 8.0), Vec3::new(3.0, 2.4, 3.0)),
             (Vec3::new(-28.0, 0.7, -8.0), Vec3::new(2.0, 1.4, 4.0)),
+            // Лабиринт контейнеров и обломков в центрально-северной зоне:
+            (Vec3::new(-2.0, 1.2, 12.0), Vec3::new(5.0, 2.4, 2.4)),
+            (Vec3::new(8.0, 1.2, -8.0), Vec3::new(2.4, 2.4, 5.0)),
+            (Vec3::new(-14.0, 1.0, -22.0), Vec3::new(4.0, 2.0, 2.0)),
         ];
         for (position, scale) in debris {
             scene.add(textured_cube(position, scale, pile, TEXTURE_METAL, 0.35));
@@ -1308,6 +1647,42 @@ impl Scene {
         ] {
             scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
         }
+
+        // Укрепление и фонарь у перехода на Кордон (x = 43, z = 0):
+        scene.add(textured_cube(
+            Vec3::new(39.0, 1.0, -3.5),
+            Vec3::new(2.0, 2.0, 4.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+        scene.add(textured_cube(
+            Vec3::new(39.0, 1.0, 3.5),
+            Vec3::new(2.0, 2.0, 4.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(39.0, 2.5, 0.0),
+            Vec3::new(1.1, 0.9, 0.5),
+            1.6,
+        ));
+
+        // Мачта маяка аварийной эвакуации на Свалке (у границы круга эвакуации (-30, -38)):
+        // Высокий зелёный спасательный маяк, заметный сквозь рыжую пыльную мглу:
+        scene.add(textured_cube(
+            Vec3::new(-32.5, 3.0, -40.0),
+            Vec3::new(0.4, 6.0, 0.4),
+            pile,
+            TEXTURE_METAL,
+            0.2,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(-32.5, 6.2, -40.0),
+            Vec3::new(0.25, 1.6, 0.35),
+            2.5,
+        ));
 
         // Ящики: лут по всей карте.
         let crates = [
@@ -1417,8 +1792,39 @@ impl Scene {
             scene.add(textured_cube(position, scale, inner, TEXTURE_CONCRETE, 0.5));
         }
 
-        // Лампы (M4g): светящиеся плафоны на стенах коридоров — emissive.
-        // Источниками света пока не являются (динамический свет — позже).
+        // Опорные пилоны центрального зала и машинного отсека:
+        for position in [
+            Vec3::new(-4.0, 2.0, 0.0),
+            Vec3::new(4.0, 2.0, 0.0),
+            Vec3::new(-14.0, 2.0, 8.0),
+            Vec3::new(14.0, 2.0, -8.0),
+        ] {
+            scene.add(textured_cube(
+                position,
+                Vec3::new(1.2, 4.0, 1.2),
+                inner,
+                TEXTURE_CONCRETE,
+                0.5,
+            ));
+        }
+
+        // Техническое оборудование: распределительные шкафы и вентиляция:
+        scene.add(textured_cube(
+            Vec3::new(14.0, 1.5, -4.0),
+            Vec3::new(2.0, 3.0, 3.6),
+            Vec4::new(0.3, 0.32, 0.35, 1.0),
+            TEXTURE_METAL,
+            0.4,
+        ));
+        scene.add(textured_cube(
+            Vec3::new(0.0, 3.7, 0.0),
+            Vec3::new(1.2, 0.6, 26.0),
+            Vec4::new(0.4, 0.4, 0.42, 1.0),
+            TEXTURE_METAL,
+            0.3,
+        ));
+
+        // Лампы (M4g, G5): светящиеся плафоны и аварийные маркеры.
         for (position, scale) in [
             (Vec3::new(-7.35, 2.6, -9.0), Vec3::new(0.3, 0.5, 0.3)),
             (Vec3::new(7.35, 2.6, 9.0), Vec3::new(0.3, 0.5, 0.3)),
@@ -1431,6 +1837,26 @@ impl Scene {
                     .with_emissive(Vec3::new(1.1, 0.85, 0.45)),
             );
         }
+
+        // Аварийные маркеры и указатели:
+        // 1. Зелёный фонарь «Выход» над переходом на Кордон:
+        scene.add(lamp_object(
+            Vec3::new(-19.5, 2.6, 0.0),
+            Vec3::new(0.25, 1.5, 0.35),
+            2.2,
+        ));
+        // 2. Тревожный красный фонарь в опасном секторе аномалии:
+        scene.add(lamp_object(
+            Vec3::new(16.0, 2.8, 12.0),
+            Vec3::new(1.5, 0.2, 0.1),
+            2.0,
+        ));
+        // 3. Янтарный маяк эвакуации в техническом тупике:
+        scene.add(lamp_object(
+            Vec3::new(18.0, 2.6, -18.0),
+            Vec3::new(1.4, 0.9, 0.2),
+            2.2,
+        ));
 
         let crates = [
             crate_object(-16.0, 20.0, &[("medkit", 1), ("bandage", 2)]),
@@ -1473,6 +1899,239 @@ impl Scene {
         scene
     }
 
+    /// Полигон (G5): тестовая локация 64×64 «все системы в одном месте».
+    /// Включает стрельбище с мишенями на 10/15/20 м, аномальный сектор
+    /// с Жгучей и Гравитационной аномалиями, тестовые станции базы,
+    /// пространственный пузырь, круг эвакуации (90%) и ящики со всеми предметами.
+    pub fn polygon() -> Self {
+        let mut scene = Scene::new("polygon");
+        scene.spawn = Vec3::new(0.0, 0.0, 20.0);
+        scene.spawn_yaw = std::f32::consts::PI;
+
+        scene.environment = SceneEnvironment {
+            sun_direction: Vec3::new(-0.4, 0.7, 0.4),
+            sun_color: Vec3::new(1.0, 0.96, 0.90),
+            sun_intensity: 1.05,
+            ambient_color: Vec3::new(0.26, 0.28, 0.32),
+            ambient_intensity: 1.0,
+            fog_color: Vec3::new(0.65, 0.70, 0.78),
+            fog_density: 0.005,
+            sky_top: Vec3::new(0.14, 0.28, 0.58),
+            sky_horizon: Vec3::new(0.62, 0.72, 0.82),
+        };
+
+        let ground = Vec4::new(0.62, 0.64, 0.60, 1.0);
+        let wall = Vec4::new(0.45, 0.46, 0.45, 1.0);
+        let target_red = Vec4::new(0.85, 0.20, 0.15, 1.0);
+
+        // Периметр полигона 64×64:
+        scene.add(textured_cube(
+            Vec3::new(0.0, -0.5, 0.0),
+            Vec3::new(64.0, 0.5, 64.0),
+            ground,
+            TEXTURE_CONCRETE,
+            0.25,
+        ));
+        for (position, scale) in [
+            (Vec3::new(0.0, 2.5, -32.0), Vec3::new(65.0, 3.0, 1.0)),
+            (Vec3::new(0.0, 2.5, 32.0), Vec3::new(65.0, 3.0, 1.0)),
+            (Vec3::new(-32.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 65.0)),
+            (Vec3::new(32.0, 2.5, 0.0), Vec3::new(1.0, 3.0, 65.0)),
+        ] {
+            scene.add(textured_cube(position, scale, wall, TEXTURE_CONCRETE, 0.5));
+        }
+
+        // 1. СТРЕЛЬБИЩЕ (Северный сектор: z < 0):
+        // Огневой рубеж:
+        scene.add(textured_cube(
+            Vec3::new(0.0, -0.47, -10.0),
+            Vec3::new(20.0, 0.5, 4.0),
+            Vec4::new(0.35, 0.35, 0.36, 1.0),
+            TEXTURE_ASPHALT,
+            0.3,
+        ));
+        scene.add(textured_cube(
+            Vec3::new(0.0, 0.5, -8.0),
+            Vec3::new(18.0, 1.0, 0.8),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+
+        // Пулеулавливатель за мишенями:
+        scene.add(textured_cube(
+            Vec3::new(0.0, 2.0, -30.0),
+            Vec3::new(24.0, 4.0, 2.0),
+            Vec4::new(0.5, 0.45, 0.35, 1.0),
+            TEXTURE_DIRT,
+            0.5,
+        ));
+
+        // Мишени на рубежах 10м (z = -18), 15м (z = -23), 20м (z = -28):
+        // Мишень 10м (бокс ростовой):
+        scene.add(
+            SceneObject::new(
+                Vec3::new(-5.0, 1.0, -18.0),
+                Vec3::new(0.5, 1.8, 0.3),
+                target_red,
+            )
+            .with_collider(ColliderShape::Box),
+        );
+        // Мишень 10м (сфера в голове):
+        scene.add(
+            SceneObject::new(Vec3::new(-5.0, 2.1, -18.0), Vec3::splat(0.35), target_red)
+                .with_asset(BUILTIN_SPHERE)
+                .with_collider(ColliderShape::Sphere),
+        );
+
+        // Мишень 15м (цилиндр):
+        scene.add(
+            SceneObject::new(
+                Vec3::new(0.0, 1.0, -23.0),
+                Vec3::new(0.6, 1.8, 0.6),
+                target_red,
+            )
+            .with_collider(ColliderShape::Cylinder),
+        );
+
+        // Мишень 20м (дальняя стойка):
+        scene.add(
+            SceneObject::new(
+                Vec3::new(5.0, 1.0, -28.0),
+                Vec3::new(0.5, 1.8, 0.3),
+                target_red,
+            )
+            .with_collider(ColliderShape::Box),
+        );
+
+        // Освещение стрельбища:
+        scene.add(lamp_object(
+            Vec3::new(-8.0, 3.5, -8.0),
+            Vec3::new(1.2, 1.0, 0.7),
+            1.8,
+        ));
+        scene.add(lamp_object(
+            Vec3::new(8.0, 3.5, -8.0),
+            Vec3::new(1.2, 1.0, 0.7),
+            1.8,
+        ));
+
+        // 2. АНОМАЛЬНЫЙ СЕКТОР (Восточный сектор: x > 10, z > -5):
+        // Ограждение аномального загона:
+        scene.add(textured_cube(
+            Vec3::new(10.0, 1.0, 5.0),
+            Vec3::new(1.0, 2.0, 22.0),
+            wall,
+            TEXTURE_CONCRETE,
+            0.5,
+        ));
+        // Жгучая аномалия с Жар-камнем:
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(20.0, 0.0, 0.0), 3.0, AnomalyKind::Heat)
+                .with_artifact("artifact_heat"),
+        );
+        // Гравитационная аномалия с Тягуном:
+        scene.add_anomaly(
+            SceneAnomaly::new(Vec3::new(20.0, 0.0, 10.0), 3.5, AnomalyKind::Gravity)
+                .with_artifact("artifact_gravity"),
+        );
+        // Предупредительный фонарь над аномалиями:
+        scene.add(lamp_object(
+            Vec3::new(10.0, 2.6, 5.0),
+            Vec3::new(1.4, 0.3, 0.1),
+            2.0,
+        ));
+
+        // 3. ПЕРЕДВИЖЕНИЕ И ЭВАКУАЦИЯ (Западный сектор: x < -10):
+        // Пространственный пузырь:
+        scene.add_bubble(SceneBubble::new(Vec3::new(-20.0, 0.0, 4.0), 1.2));
+        scene.add_bubble_arrival(Vec3::new(-14.0, 0.0, 4.0));
+        // Круг эвакуации (90% сейв для тестирования экстракции):
+        scene.add_extraction(
+            SceneExtraction::new(Vec3::new(-20.0, 0.0, -4.0), 3.0, 0.90)
+                .with_label("Тестовая экстракция (90%)"),
+        );
+        scene.add(lamp_object(
+            Vec3::new(-20.0, 3.5, -4.0),
+            Vec3::new(0.2, 1.5, 0.4),
+            2.2,
+        ));
+
+        // 4. ТЕСТОВЫЙ ХАБ И СТАНЦИИ (Южный сектор: z > 10):
+        scene.add_station(
+            SceneStation::new(Vec3::new(-6.0, 0.0, 16.0), 2.0, StationKind::Trader)
+                .with_label("Тест: Торговец")
+                .with_offers(vec![
+                    SceneOffer {
+                        item: "medkit".into(),
+                        count: 2,
+                    },
+                    SceneOffer {
+                        item: "ammo_545".into(),
+                        count: 60,
+                    },
+                    SceneOffer {
+                        item: "bolt".into(),
+                        count: 30,
+                    },
+                ]),
+        );
+        scene.add_station(
+            SceneStation::new(Vec3::new(6.0, 0.0, 16.0), 2.0, StationKind::Medpost)
+                .with_label("Тест: Медпункт"),
+        );
+        scene.add_station(
+            SceneStation::new(Vec3::new(-6.0, 0.0, 24.0), 2.0, StationKind::Workbench)
+                .with_label("Тест: Верстак"),
+        );
+        scene.add_station(
+            SceneStation::new(Vec3::new(6.0, 0.0, 24.0), 2.0, StationKind::Safe)
+                .with_label("Тест: Сейф"),
+        );
+
+        // Ящики со ВСЕМИ предметами игры:
+        let crates = [
+            crate_object(
+                -2.0,
+                14.0,
+                &[
+                    ("ammo_545", 120),
+                    ("bolt", 40),
+                    ("medkit", 3),
+                    ("bandage", 4),
+                ],
+            ),
+            crate_object(
+                2.0,
+                14.0,
+                &[
+                    ("canned_food", 4),
+                    ("vodka", 3),
+                    ("artifact_heat", 1),
+                    ("artifact_gravity", 1),
+                ],
+            ),
+        ];
+        for object in crates {
+            scene.add(object);
+        }
+
+        // Переход обратно на Базу:
+        scene.add(pad(0.0, 28.0, 5.0, Vec4::new(0.20, 0.55, 0.25, 1.0)));
+        scene.add_transition(
+            SceneTransition::new(
+                Vec3::new(0.0, 0.0, 28.0),
+                2.5,
+                LOCATION_BASE,
+                Vec3::new(-16.0, 0.0, 0.0),
+            )
+            .with_yaw(0.0)
+            .with_label("База"),
+        );
+
+        scene
+    }
+
     /// Встроенный мир цикла M4d: сцены локаций `LocationRegistry::builtin()`.
     pub fn builtin_world() -> Vec<(LocationId, Scene)> {
         vec![
@@ -1480,6 +2139,7 @@ impl Scene {
             (LOCATION_KORDON, Scene::kordon()),
             (LOCATION_SVALKA, Scene::svalka()),
             (LOCATION_PODZEMKA, Scene::podzemka()),
+            (LOCATION_POLYGON, Scene::polygon()),
         ]
     }
 }

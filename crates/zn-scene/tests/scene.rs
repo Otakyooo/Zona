@@ -6,7 +6,7 @@ mod tests {
         LocationRegistry, LootEntry, Scene, SceneAnomaly, SceneBubble, SceneEnvironment,
         SceneExtraction, SceneObject, SceneOffer, SceneStation, SceneTransition, StationKind,
         BUILTIN_CUBE, BUILTIN_SPHERE, LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA,
-        LOCATION_SVALKA,
+        LOCATION_POLYGON, LOCATION_SVALKA,
     };
 
     #[test]
@@ -471,13 +471,14 @@ mod tests {
             assert_eq!(scene.name, info.scene, "имя сцены совпадает с файлом");
         }
 
-        // База безопасна: без аномалий и пузырей, один переход — на Кордон.
+        // База безопасна: без аномалий и пузырей, переходы — на Кордон и Полигон.
         let base = &world[0].1;
         assert!(base.anomalies.is_empty());
         assert!(base.bubbles.is_empty());
         assert!(base.bubble_arrivals.is_empty());
-        assert_eq!(base.transitions.len(), 1);
+        assert_eq!(base.transitions.len(), 2);
         assert_eq!(base.transitions[0].target, LOCATION_KORDON);
+        assert_eq!(base.transitions[1].target, LOCATION_POLYGON);
     }
 
     #[test]
@@ -520,10 +521,9 @@ mod tests {
     fn kordon_extends_demo_zone_with_transitions_and_bubbles() {
         let demo = Scene::demo_zone();
         let kordon = Scene::kordon();
-        assert_eq!(
-            kordon.objects.len(),
-            demo.objects.len() + 3,
-            "плюс три плиты переходов"
+        assert!(
+            kordon.objects.len() > demo.objects.len(),
+            "Кордон дополнен окружением, дорогами и КПП"
         );
         assert_eq!(kordon.anomalies.len(), demo.anomalies.len());
         assert_eq!(kordon.transitions.len(), 3);
@@ -545,6 +545,7 @@ mod tests {
         let distances = distances_to_base(&registry, &refs);
         assert_eq!(distances.get(&LOCATION_BASE), Some(&0));
         assert_eq!(distances.get(&LOCATION_KORDON), Some(&1));
+        assert_eq!(distances.get(&LOCATION_POLYGON), Some(&1));
         assert_eq!(distances.get(&LOCATION_SVALKA), Some(&2));
         assert_eq!(distances.get(&LOCATION_PODZEMKA), Some(&2));
     }
