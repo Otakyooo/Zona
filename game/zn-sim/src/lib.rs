@@ -6,7 +6,7 @@ use zn_content::{Item, ItemCatalog};
 use zn_core::{Entity, FixedStep, Schedule, World, SIMULATION_HZ, SIMULATION_STEP};
 use zn_net::{
     quantize_pos, quantize_yaw, BoltNet, CorpseNet, GameEvent, GroundItemNet, InventoryAction,
-    ItemStackNet,
+    ItemStackNet, MutantNet,
 };
 pub use zn_net::{ClientInput, PlayerNetState, FLAG_FIRE, FLAG_GROUNDED, FLAG_SPRINTING};
 use zn_physics::{PhysicsWorld, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
@@ -18,6 +18,18 @@ pub const JUMP_SPEED: f32 = 6.5;
 pub const GRAVITY: f32 = 18.0;
 pub const MAX_FALL_SPEED: f32 = 45.0;
 pub const MAX_PITCH: f32 = 89.0f32.to_radians();
+
+// ── Мутанты (PvE) ────────────────────────────────────────────────────────
+pub const MUTANT_MAX_HEALTH: u8 = 60;
+pub const MUTANT_DOG_SPEED: f32 = 7.0;
+pub const MUTANT_AGGRO_RADIUS: f32 = 18.0;
+pub const MUTANT_ATTACK_RADIUS: f32 = 1.8;
+pub const MUTANT_ATTACK_DAMAGE: u16 = 15;
+pub const MUTANT_ATTACK_INTERVAL_TICKS: u64 = 60;
+pub const MUTANT_LEASH_RADIUS: f32 = 35.0;
+pub const MUTANT_RADIUS: f32 = 0.45;
+pub const MUTANT_HALF_HEIGHT: f32 = 0.25;
+pub const MUTANT_DROP_ITEM_KEY: &str = "dog_tail";
 
 // ── Бой (M4a) ───────────────────────────────────────────────────────────
 /// Полное здоровье игрока.
@@ -346,6 +358,23 @@ impl Bolts {
     }
 }
 
+/// Мутанты уровня (PvE).
+#[derive(Clone, Debug, Default)]
+pub struct Mutants(pub Vec<MutantState>);
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MutantState {
+    pub id: u32,
+    pub kind: u8,
+    pub position: Vec3,
+    pub yaw: f32,
+    pub health: u8,
+    pub state: u8, // 0 = Idle, 1 = Chase, 2 = Attack, 3 = Dead
+    pub target_player: Option<u64>,
+    pub next_attack_tick: u64,
+    pub home: Vec3,
+}
+
 /// Клиентское действие вне инпутов; сервер уже отфильтровал дубли по tick.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PlayerAction {
@@ -532,6 +561,7 @@ impl Simulation {
         }
         simulation.rebuild_static(scene);
         simulation.spawn_artifacts(scene);
+        simulation.spawn_mutants(scene);
         simulation
     }
 
@@ -557,6 +587,47 @@ impl Simulation {
             .get_resource_mut::<PhysicsWorld>()
             .expect("physics resource initialized in build()");
         physics.rebuild_static(&scene.objects);
+        self.spawn_mutants(scene);
+    }
+
+    /// Мутанты из точек спавна сцены (PvE).
+    fn spawn_mutants(&mut self, scene: &Scene) {
+        let mut list = Vec::new();
+        for (i, spawn) in scene.mutant_spawns.iter().enumerate() {
+            list.push(MutantState {
+                id: (i + 1) as u32,
+                kind: spawn.kind,
+                position: spawn.position,
+                yaw: 0.0,
+                health: MUTANT_MAX_HEALTH,
+                state: 0,
+                target_player: None,
+                next_attack_tick: 0,
+                home: spawn.position,
+            });
+        }
+        if let Some(mutants) = self.world.get_resource_mut::<Mutants>() {
+            mutants.0 = list;
+        }
+    }
+
+    /// Сетевой снапшот мутантов для рассылки клиентам.
+    pub fn snapshot_mutants(&self) -> Vec<MutantNet> {
+        self.world
+            .get_resource::<Mutants>()
+            .map(|m| {
+                m.0.iter()
+                    .map(|mutant| MutantNet {
+                        id: mutant.id,
+                        kind: mutant.kind,
+                        pos: quantize_pos(mutant.position.to_array()),
+                        yaw: quantize_yaw(mutant.yaw),
+                        health: mutant.health,
+                        state: mutant.state,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Артефакты из аномалий сцены: предмет лежит на полу в якоре с начала
@@ -590,6 +661,7 @@ impl Simulation {
         world.insert_resource(GroundItems::default());
         world.insert_resource(Anomalies::default());
         world.insert_resource(Bolts::default());
+        world.insert_resource(Mutants::default());
         world.insert_resource(ActionQueue::default());
         world.insert_resource(NetUpdates::default());
 
@@ -1045,6 +1117,7 @@ fn build_schedule() -> Schedule {
     schedule.add("player_apply_input", apply_input);
     schedule.add("anomaly_effects", anomaly_effects);
     schedule.add("player_move", move_players);
+    schedule.add("mutants_step", step_mutants);
     schedule.add("player_combat", player_combat);
     schedule.add("player_actions", player_actions);
     schedule.add("player_bolts", bolts_update);
@@ -1198,13 +1271,17 @@ pub fn zone_damage(hit_height: f32) -> u16 {
     (RIFLE_DAMAGE * multiplier).round() as u16
 }
 
-/// Пересечение луча с вертикальной капсулой игрока (радиус `PLAYER_RADIUS`,
-/// ядро — отрезок на высотах r..2·half_height+r от ступней). Возвращает
-/// параметр `t` ближайшего входа или `None`, если попадания в `max_t` нет.
-fn ray_capsule(feet: Vec3, origin: Vec3, dir: Vec3, max_t: f32) -> Option<f32> {
-    let radius = PLAYER_RADIUS;
+/// Пересечение луча с вертикальной капсулой заданного радиуса и полувысоты.
+fn ray_capsule_sized(
+    feet: Vec3,
+    origin: Vec3,
+    dir: Vec3,
+    max_t: f32,
+    radius: f32,
+    half_height: f32,
+) -> Option<f32> {
     let core_low = feet.y + radius;
-    let core_high = feet.y + 2.0 * PLAYER_HALF_HEIGHT + radius;
+    let core_high = feet.y + 2.0 * half_height + radius;
     let ox = origin.x - feet.x;
     let oz = origin.z - feet.z;
     let mut best = f32::INFINITY;
@@ -1249,6 +1326,150 @@ fn ray_capsule(feet: Vec3, origin: Vec3, dir: Vec3, max_t: f32) -> Option<f32> {
     }
 
     (best <= max_t).then_some(best)
+}
+
+/// Пересечение луча с вертикальной капсулой игрока (радиус `PLAYER_RADIUS`,
+/// ядро — отрезок на высотах r..2·half_height+r от ступней). Возвращает
+/// параметр `t` ближайшего входа или `None`, если попадания в `max_t` нет.
+fn ray_capsule(feet: Vec3, origin: Vec3, dir: Vec3, max_t: f32) -> Option<f32> {
+    ray_capsule_sized(feet, origin, dir, max_t, PLAYER_RADIUS, PLAYER_HALF_HEIGHT)
+}
+
+/// ИИ мутантов уровня (PvE): патруль/возврат к дому, погоня за ближайшим
+/// игроком при сближении, ближняя атака укусом и синхронизация состояния.
+fn step_mutants(world: &mut World) {
+    let dt = tick_dt(world);
+    let tick = tick_now(world);
+
+    let players: Vec<(u64, Vec3)> = world
+        .query::<&PlayerState>()
+        .iter()
+        .filter(|s| s.health > 0)
+        .map(|s| (s.id, s.position))
+        .collect();
+
+    let mut attacks: Vec<(u64, u16)> = Vec::new();
+
+    if let Some(mutants) = world.get_resource_mut::<Mutants>() {
+        for mutant in &mut mutants.0 {
+            if mutant.health == 0 || mutant.state == 3 {
+                mutant.state = 3;
+                continue;
+            }
+
+            let dist_to_home = mutant.position.distance(mutant.home);
+            if dist_to_home > MUTANT_LEASH_RADIUS {
+                let delta = mutant.home - mutant.position;
+                let xz = Vec3::new(delta.x, 0.0, delta.z);
+                let len = xz.length();
+                if len > 0.1 {
+                    mutant.yaw = xz.z.atan2(xz.x);
+                    mutant.position += (xz / len) * (MUTANT_DOG_SPEED * 0.7 * dt);
+                }
+                mutant.target_player = None;
+                mutant.state = 0;
+                continue;
+            }
+
+            let mut nearest: Option<(u64, Vec3, f32)> = None;
+            for (pid, ppos) in &players {
+                let dist = mutant.position.distance(*ppos);
+                if dist <= MUTANT_AGGRO_RADIUS && nearest.is_none_or(|(_, _, best)| dist < best) {
+                    nearest = Some((*pid, *ppos, dist));
+                }
+            }
+
+            if let Some((target_id, target_pos, dist)) = nearest {
+                mutant.target_player = Some(target_id);
+                let delta = target_pos - mutant.position;
+                let xz = Vec3::new(delta.x, 0.0, delta.z);
+                let len = xz.length();
+                if len > 1e-4 {
+                    mutant.yaw = xz.z.atan2(xz.x);
+                }
+
+                if dist <= MUTANT_ATTACK_RADIUS {
+                    mutant.state = 2; // Attack
+                    if tick >= mutant.next_attack_tick {
+                        mutant.next_attack_tick = tick + MUTANT_ATTACK_INTERVAL_TICKS;
+                        attacks.push((target_id, MUTANT_ATTACK_DAMAGE));
+                    }
+                } else {
+                    mutant.state = 1; // Chase
+                    if len > 1e-4 {
+                        mutant.position += (xz / len) * (MUTANT_DOG_SPEED * dt);
+                    }
+                }
+            } else {
+                if dist_to_home > 1.0 {
+                    let delta = mutant.home - mutant.position;
+                    let xz = Vec3::new(delta.x, 0.0, delta.z);
+                    let len = xz.length();
+                    if len > 0.1 {
+                        mutant.yaw = xz.z.atan2(xz.x);
+                        mutant.position += (xz / len) * (MUTANT_DOG_SPEED * 0.4 * dt);
+                    }
+                }
+                mutant.target_player = None;
+                mutant.state = 0;
+            }
+        }
+    }
+
+    if attacks.is_empty() {
+        return;
+    }
+
+    let mut deaths: Vec<(u64, u64, Vec<Stack>, Vec3, f32)> = Vec::new();
+    let mut downed: Vec<u64> = Vec::new();
+    let mut events: Vec<GameEvent> = Vec::new();
+
+    {
+        let mut query = world.query::<&mut PlayerState>();
+        for state in query.iter() {
+            let id = state.id;
+            for (_victim, damage) in attacks.iter().filter(|(v, _)| *v == id) {
+                if state.health == 0 {
+                    continue;
+                }
+                let was_downed = is_downed(state, tick);
+                if damage_player(state, tick, *damage) {
+                    let items = kill_player(state, tick);
+                    deaths.push((state.id, 0, items, state.position, state.yaw));
+                } else if !was_downed && is_downed(state, tick) {
+                    downed.push(id);
+                }
+                events.push(GameEvent::Hit {
+                    shooter: 0,
+                    victim: id,
+                    damage: *damage,
+                    headshot: false,
+                });
+            }
+        }
+    }
+
+    for victim in downed {
+        events.push(GameEvent::KnockedDown {
+            player: victim,
+            player_name: String::new(),
+            ticks: KNOCKDOWN_TICKS as u16,
+        });
+    }
+
+    for (victim, killer, items, position, yaw) in deaths {
+        events.push(GameEvent::Death {
+            victim,
+            victim_name: String::new(),
+            killer,
+            killer_name: "Слепой пёс".to_string(),
+        });
+        spawn_corpse(world, victim, position, yaw, items, tick);
+    }
+
+    if let Some(queue) = world.get_resource_mut::<CombatEvents>() {
+        queue.0.extend(events);
+    }
 }
 
 /// Бой: выстрелы живых игроков с `FLAG_FIRE` не чаще `FIRE_INTERVAL_TICKS`,
@@ -1302,9 +1523,20 @@ fn player_combat(world: &mut World) {
         .map(|state| (state.id, state.position))
         .collect();
 
+    let mutant_targets: Vec<(u32, Vec3)> = world
+        .get_resource::<Mutants>()
+        .map(|m| {
+            m.0.iter()
+                .filter(|mutant| mutant.health > 0 && mutant.state != 3)
+                .map(|mutant| (mutant.id, mutant.position))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut events: Vec<GameEvent> = Vec::new();
     let mut fired: Vec<u64> = Vec::new();
-    let mut hits: Vec<(u64, u64, u16)> = Vec::new(); // (жертва, стрелок, урон)
+    let mut hits: Vec<(u64, u64, u16, bool)> = Vec::new(); // (жертва, стрелок, урон, headshot)
+    let mut mutant_hits: Vec<(u32, u64, u8)> = Vec::new(); // (мутант, стрелок, урон)
 
     {
         let physics = world.get_resource::<PhysicsWorld>();
@@ -1318,29 +1550,63 @@ fn player_combat(world: &mut World) {
 
             let wall =
                 physics.and_then(|physics| physics.cast_ray_glam(*origin, *dir, RIFLE_RANGE));
-            let mut closest: Option<(f32, u64, Vec3)> = None;
+            let mut closest_player: Option<(f32, u64, Vec3)> = None;
             for (victim, feet) in &targets {
                 if victim == shooter {
                     continue;
                 }
                 if let Some(t) = ray_capsule(*feet, *origin, *dir, RIFLE_RANGE) {
-                    if closest.is_none_or(|(best, _, _)| t < best) {
-                        closest = Some((t, *victim, *feet));
+                    if closest_player.is_none_or(|(best, _, _)| t < best) {
+                        closest_player = Some((t, *victim, *feet));
                     }
                 }
             }
 
-            // Стена ближе цели — выстрел уходит в неё.
-            let blocked = match (closest, wall) {
-                (Some((t, _, _)), Some(wall_toi)) => wall_toi <= t,
+            let mut closest_mutant: Option<(f32, u32, Vec3)> = None;
+            for (mid, pos) in &mutant_targets {
+                if let Some(t) = ray_capsule_sized(
+                    *pos,
+                    *origin,
+                    *dir,
+                    RIFLE_RANGE,
+                    MUTANT_RADIUS,
+                    MUTANT_HALF_HEIGHT,
+                ) {
+                    if closest_mutant.is_none_or(|(best, _, _)| t < best) {
+                        closest_mutant = Some((t, *mid, *pos));
+                    }
+                }
+            }
+
+            let t_player = closest_player.map(|(t, _, _)| t);
+            let t_mutant = closest_mutant.map(|(t, _, _)| t);
+
+            let blocked = match (t_player, t_mutant, wall) {
+                (Some(tp), None, Some(w)) => w <= tp,
+                (None, Some(tm), Some(w)) => w <= tm,
+                (Some(tp), Some(tm), Some(w)) => w <= tp.min(tm),
+                (None, None, _) => true,
                 _ => false,
             };
             if blocked {
                 continue;
             }
-            if let Some((t, victim, feet)) = closest {
-                let hit_point = *origin + *dir * t;
-                hits.push((victim, *shooter, zone_damage(hit_point.y - feet.y)));
+
+            match (closest_player, closest_mutant) {
+                (Some((tp, _, _)), Some((tm, mid, _))) if tm < tp => {
+                    mutant_hits.push((mid, *shooter, RIFLE_DAMAGE.round() as u8));
+                }
+                (Some((t, victim, feet)), _) => {
+                    let hit_point = *origin + *dir * t;
+                    let height = hit_point.y - feet.y;
+                    let dmg = zone_damage(height);
+                    let headshot = height >= ZONE_HEAD_MIN;
+                    hits.push((victim, *shooter, dmg, headshot));
+                }
+                (None, Some((_, mid, _))) => {
+                    mutant_hits.push((mid, *shooter, RIFLE_DAMAGE.round() as u8));
+                }
+                (None, None) => {}
             }
         }
     }
@@ -1349,6 +1615,47 @@ fn player_combat(world: &mut World) {
     if let Some(item) = ammo_item {
         for shooter in &fired {
             consume_item(world, *shooter, item);
+        }
+    }
+
+    // Урон по мутантам и выпадение трофеев (хвост слепого пса)
+    let mut dead_mutants: Vec<(u32, Vec3)> = Vec::new();
+    if !mutant_hits.is_empty() {
+        if let Some(mutants) = world.get_resource_mut::<Mutants>() {
+            for mutant in &mut mutants.0 {
+                for (mid, shooter, dmg) in &mutant_hits {
+                    if mutant.id == *mid && mutant.health > 0 {
+                        events.push(GameEvent::Hit {
+                            shooter: *shooter,
+                            victim: 1_000_000 + mutant.id as u64,
+                            damage: u16::from(*dmg),
+                            headshot: false,
+                        });
+                        if mutant.health <= *dmg {
+                            mutant.health = 0;
+                            mutant.state = 3;
+                            dead_mutants.push((mutant.id, mutant.position));
+                        } else {
+                            mutant.health -= *dmg;
+                            mutant.target_player = Some(*shooter);
+                            mutant.state = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (_mid, pos) in dead_mutants {
+        if let Some(tail) = catalog_of(world).index_of(MUTANT_DROP_ITEM_KEY) {
+            spawn_ground_item(
+                world,
+                Stack {
+                    item: tail,
+                    count: 1,
+                },
+                pos,
+            );
         }
     }
 
@@ -1365,11 +1672,19 @@ fn player_combat(world: &mut World) {
             // id — в локальную копию: фильтр не должен держать заимствование
             // `state`, иначе `kill_player` не возьмёт `&mut PlayerState`.
             let id = state.id;
-            for (_, killer, damage) in hits.iter().filter(|(victim, _, _)| *victim == id) {
+            for (_, killer, damage, headshot) in
+                hits.iter().filter(|(victim, _, _, _)| *victim == id)
+            {
                 if state.health == 0 {
                     // Добивание в том же тике смертью не считается.
                     continue;
                 }
+                events.push(GameEvent::Hit {
+                    shooter: *killer,
+                    victim: id,
+                    damage: *damage,
+                    headshot: *headshot,
+                });
                 let was_downed = is_downed(state, tick);
                 if damage_player(state, tick, *damage) {
                     let items = kill_player(state, tick);
@@ -2661,6 +2976,7 @@ fn build_containers(scene: &Scene, catalog: &ItemCatalog) -> Vec<ContainerState>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zn_scene::{SceneMutantSpawn, SceneObject};
 
     fn input(tick: u64) -> ClientInput {
         ClientInput::new(tick)
@@ -2858,5 +3174,92 @@ mod tests {
         // Доля 1 — весь лут в стэш, труп пустеет.
         assert_eq!(sim.salvage_corpse(corpse, 1.0), vec![Stack::new(0, 4)]);
         assert_eq!(sim.container_items(corpse), Some(Vec::new()));
+    }
+
+    // ── Мутанты (PvE) и боевой отклик ──────────────────────────────────
+
+    fn combat_catalog() -> ItemCatalog {
+        ItemCatalog::from_ron(
+            r#"(
+                items: [
+                    (key: "ammo_545", display_name: "Патроны", weight_kg: 0.015, stack_max: 60),
+                    (key: "dog_tail", display_name: "Хвост", weight_kg: 0.25, stack_max: 5, value_rub: 250),
+                ],
+            )"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn mutants_aggro_and_attack_player() {
+        let mut scene = Scene::new("test");
+        // Добавляем пол, чтобы игрок и пёс стояли на земле
+        scene.add(SceneObject::new(
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::new(100.0, 2.0, 100.0),
+            glam::Vec4::ONE,
+        ));
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(5.0, 0.0, 0.0), 0));
+        let mut sim = Simulation::with_scene_and_catalog(&scene, combat_catalog());
+        let player = sim.spawn_player(Vec3::ZERO);
+
+        let initial_mutants = sim.snapshot_mutants();
+        assert_eq!(initial_mutants.len(), 1);
+        assert_eq!(initial_mutants[0].state, 0); // Idle
+
+        // Шагаем симуляцию — пёс должен увидеть игрока (в пределах 18м) и побежать к нему
+        for _ in 0..60 {
+            sim.step_once();
+        }
+
+        let mutants = sim.snapshot_mutants();
+        assert_eq!(mutants.len(), 1);
+        // Пёс приблизился к игроку
+        assert!(mutants[0].state == 1 || mutants[0].state == 2);
+        // За 60 тиков (1 сек) со скоростью 7 м/с пёс добегает и кусает
+        assert!(sim.player_state(player).unwrap().health < MAX_HEALTH);
+    }
+
+    #[test]
+    fn shooting_mutant_kills_and_drops_tail() {
+        let mut scene = Scene::new("test");
+        scene.add(SceneObject::new(
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::new(100.0, 2.0, 100.0),
+            glam::Vec4::ONE,
+        ));
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(3.0, 0.0, 0.0), 0));
+        let mut sim = Simulation::with_scene_and_catalog(&scene, combat_catalog());
+        let player = sim.spawn_player(Vec3::ZERO);
+        let ammo = sim.catalog().index_of("ammo_545").unwrap();
+        sim.give_stack(player, Stack::new(ammo, 30));
+
+        let mut input = ClientInput::new(0);
+        input.buttons = FLAG_FIRE;
+        input.pitch_delta = -0.3; // Прицеливание чуть вниз на собаку (рост собаки ниже уровня глаз)
+        sim.queue_input(player, input);
+        sim.step_once();
+
+        // Проверяем событие попадания
+        let events = sim.take_events();
+        assert!(events.iter().any(|e| matches!(e, GameEvent::Hit { .. })));
+
+        // Добиваем мутанта (60 HP / 25 урон за выстрел = 3 выстрела с интервалом 6 тиков)
+        for tick in 1..30 {
+            let mut input = ClientInput::new(tick);
+            input.buttons = FLAG_FIRE;
+            input.pitch_delta = 0.0;
+            sim.queue_input(player, input);
+            sim.step_once();
+        }
+
+        let mutants = sim.snapshot_mutants();
+        assert_eq!(mutants[0].health, 0);
+        assert_eq!(mutants[0].state, 3); // Dead
+
+        // На земле должен появиться хвост слепого пса
+        let loot = sim.snapshot_loot();
+        let tail_idx = sim.catalog().index_of("dog_tail").unwrap();
+        assert!(loot.iter().any(|item| item.item == tail_idx));
     }
 }

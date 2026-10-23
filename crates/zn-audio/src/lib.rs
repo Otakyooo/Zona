@@ -33,6 +33,8 @@ pub enum SoundId {
     Shot,
     /// Попадание по игроку.
     Hit,
+    /// Подтверждение попадания (звонкий щелчок хитмаркера).
+    HitConfirm,
     /// Подбор/выброс предмета.
     Pickup,
     /// Бросок болта.
@@ -49,13 +51,28 @@ pub enum SoundId {
     Panel,
     /// Переход между локациями.
     Transition,
+    /// Шаг по бетону.
+    StepConcrete,
+    /// Шаг по земле/траве.
+    StepDirt,
+    /// Шаг по металлу.
+    StepMetal,
+    /// Шаг по асфальту.
+    StepAsphalt,
+    /// Рычание мутанта (агро).
+    MutantGrowl,
+    /// Укус мутанта (атака).
+    MutantBite,
+    /// Визг / получение урона мутантом.
+    MutantPain,
 }
 
 impl SoundId {
     /// Все звуки — для тестов и отладки.
-    pub const ALL: [SoundId; 10] = [
+    pub const ALL: [SoundId; 18] = [
         SoundId::Shot,
         SoundId::Hit,
+        SoundId::HitConfirm,
         SoundId::Pickup,
         SoundId::Throw,
         SoundId::BoltAnomaly,
@@ -64,6 +81,13 @@ impl SoundId {
         SoundId::Extract,
         SoundId::Panel,
         SoundId::Transition,
+        SoundId::StepConcrete,
+        SoundId::StepDirt,
+        SoundId::StepMetal,
+        SoundId::StepAsphalt,
+        SoundId::MutantGrowl,
+        SoundId::MutantBite,
+        SoundId::MutantPain,
     ];
 
     /// Ключ для логов и настроек.
@@ -71,6 +95,7 @@ impl SoundId {
         match self {
             SoundId::Shot => "shot",
             SoundId::Hit => "hit",
+            SoundId::HitConfirm => "hit_confirm",
             SoundId::Pickup => "pickup",
             SoundId::Throw => "throw",
             SoundId::BoltAnomaly => "bolt_anomaly",
@@ -79,6 +104,13 @@ impl SoundId {
             SoundId::Extract => "extract",
             SoundId::Panel => "panel",
             SoundId::Transition => "transition",
+            SoundId::StepConcrete => "step_concrete",
+            SoundId::StepDirt => "step_dirt",
+            SoundId::StepMetal => "step_metal",
+            SoundId::StepAsphalt => "step_asphalt",
+            SoundId::MutantGrowl => "mutant_growl",
+            SoundId::MutantBite => "mutant_bite",
+            SoundId::MutantPain => "mutant_pain",
         }
     }
 }

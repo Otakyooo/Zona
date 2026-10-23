@@ -12,8 +12,8 @@ use zn_content::ItemCatalog;
 use zn_net::{
     check_client_hello, decode_message, encode_message, AuthHello, BaseActionKind, BoltNet,
     ClientInput, CorpseNet, GameEvent, GroundItemNet, InventoryAction, ItemStackNet, Message,
-    PlayerNetState, RejectReason, StashAction, INPUT_REDUNDANCY, MAX_NAME_LEN, SERVER_TIMEOUT,
-    SIMULATION_HZ, SNAPSHOT_HZ,
+    MutantNet, PlayerNetState, RejectReason, StashAction, INPUT_REDUNDANCY, MAX_NAME_LEN,
+    SERVER_TIMEOUT, SIMULATION_HZ, SNAPSHOT_HZ,
 };
 use zn_scene::{
     distances_to_base, world_content_hash, LocationId, LocationInfo, LocationRegistry, Scene,
@@ -956,6 +956,7 @@ struct LocationSnapshot {
     bolts: Vec<BoltNet>,
     /// Активные пузыри этой локации (квантованные якоря).
     bubbles: Vec<[i16; 3]>,
+    mutants: Vec<MutantNet>,
     events: Vec<GameEvent>,
 }
 
@@ -2523,6 +2524,7 @@ impl Session {
                 }
             }
             let bolts = runtime.simulation.snapshot_bolts();
+            let mutants = runtime.simulation.snapshot_mutants();
             let events = enrich_events(runtime.simulation.take_events(), &self.names);
             net_updates.push(runtime.simulation.take_net_updates());
             per_location.push((
@@ -2533,6 +2535,7 @@ impl Session {
                     corpses,
                     bolts,
                     bubbles,
+                    mutants,
                     events,
                 },
             ));
@@ -2567,6 +2570,7 @@ impl Session {
                     corpses: snapshot.corpses.clone(),
                     bolts: snapshot.bolts.clone(),
                     bubbles: snapshot.bubbles.clone(),
+                    mutants: snapshot.mutants.clone(),
                     events: snapshot.events.clone(),
                 },
             );

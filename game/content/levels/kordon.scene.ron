@@ -1653,6 +1653,16 @@
         ),
     ],
     stations: [],
+    mutant_spawns: [
+        (
+            position: (16.0, 0.0, -12.0),
+            kind: 0,
+        ),
+        (
+            position: (20.0, 0.0, -10.0),
+            kind: 0,
+        ),
+    ],
     environment: (
         sun_direction: (0.4, 0.8, 0.3),
         sun_color: (1.0, 0.95, 0.85),

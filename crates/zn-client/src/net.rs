@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use zn_net::{
     decode_message, encode_message, AuthHello, BaseActionKind, BoltNet, ClientInput, CorpseNet,
-    GameEvent, GroundItemNet, InventoryAction, ItemStackNet, Message, PlayerNetState, RejectReason,
-    StashAction, CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL,
-    PROTOCOL_VERSION,
+    GameEvent, GroundItemNet, InventoryAction, ItemStackNet, Message, MutantNet, PlayerNetState,
+    RejectReason, StashAction, CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY,
+    PING_INTERVAL, PROTOCOL_VERSION,
 };
 
 /// Сколько ждать ответа на Hello: сервер выключен или туннель лёг — без
@@ -43,6 +43,8 @@ pub enum NetEvent {
         bolts: Vec<BoltNet>,
         /// Активные пузыри локации игрока (M4d, квантованные якоря).
         bubbles: Vec<[i16; 3]>,
+        /// Мутанты на локации (PvE).
+        mutants: Vec<MutantNet>,
         /// События боя с прошлого снапшота (трейсеры, килл-фид).
         events: Vec<GameEvent>,
     },
@@ -394,6 +396,7 @@ impl NetClient {
                 corpses,
                 bolts,
                 bubbles,
+                mutants,
                 events,
             } => {
                 if self.status != NetStatus::Connected {
@@ -408,6 +411,7 @@ impl NetClient {
                     corpses,
                     bolts,
                     bubbles,
+                    mutants,
                     events,
                 })
             }
@@ -869,6 +873,7 @@ mod tests {
                     pos: [150, 30, 150],
                 }],
                 bubbles: vec![[160, 0, 190]],
+                mutants: vec![],
                 events: vec![],
             },
         );
@@ -887,6 +892,7 @@ mod tests {
                     pos: [150, 30, 150],
                 }],
                 bubbles: vec![[160, 0, 190]],
+                mutants: vec![],
                 events: vec![],
             }]
         );

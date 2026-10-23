@@ -415,9 +415,10 @@ mod tests {
     fn shipped_catalog_loads_and_validates() {
         let catalog = ItemCatalog::load_ron("../content/items/items.ron")
             .expect("game/content/items/items.ron должен загружаться");
-        assert_eq!(catalog.len(), 8);
+        assert_eq!(catalog.len(), 9);
         assert!(catalog.index_of("medkit").is_some());
         assert!(catalog.index_of("bandage").is_some());
+        assert!(catalog.index_of("dog_tail").is_some());
         assert!(catalog.get_by_key("medkit").unwrap().use_effect.is_some());
         let artifact = catalog
             .get_by_key("artifact_heat")

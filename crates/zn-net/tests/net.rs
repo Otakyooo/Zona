@@ -179,11 +179,25 @@ fn all_message_variants_roundtrip_through_bincode() {
                 pos: [150, 30, 150],
             }],
             bubbles: vec![[300, 0, -300], [120, 0, 180]],
+            mutants: vec![MutantNet {
+                id: 1,
+                kind: 0,
+                pos: [100, 0, 100],
+                yaw: 128,
+                health: 60,
+                state: 1,
+            }],
             events: vec![
                 GameEvent::Shot {
                     shooter: 1,
                     origin: [0.0, 1.62, 0.0],
                     dir: [1.0, 0.0, 0.0],
+                },
+                GameEvent::Hit {
+                    shooter: 1,
+                    victim: 2,
+                    damage: 50,
+                    headshot: true,
                 },
                 GameEvent::UseStarted {
                     player: 2,
@@ -301,7 +315,7 @@ fn full_snapshot_fits_udp_mtu() {
         players,
         // Худший реалистичный случай: лимит предметов на земле, трупы и
         // события; имена — кириллица.
-        loot: (0..32)
+        loot: (0..24)
             .map(|i| GroundItemNet {
                 item: i as u16,
                 count: 60,
@@ -327,6 +341,17 @@ fn full_snapshot_fits_udp_mtu() {
             .collect(),
         // Максимум активных пузырей на локацию (`BUBBLE_COUNT_MAX`) — 3.
         bubbles: vec![[120, 0, 300], [-300, 0, -40], [260, 0, -340]],
+        // Стая мутантов на локации (до 4 особей).
+        mutants: (0..4)
+            .map(|i| MutantNet {
+                id: i,
+                kind: 0,
+                pos: [i as i16 * 15, 0, 100],
+                yaw: 120,
+                health: 50,
+                state: 1,
+            })
+            .collect(),
         events: vec![
             GameEvent::Shot {
                 shooter: 3,
@@ -383,7 +408,7 @@ fn position_and_yaw_quantization_roundtrip() {
 
 #[test]
 fn protocol_constants_are_sane() {
-    assert_eq!(PROTOCOL_VERSION, 9);
+    assert_eq!(PROTOCOL_VERSION, 10);
     assert_eq!(SIMULATION_HZ, 60);
     assert_eq!(SNAPSHOT_HZ, 30);
     assert_eq!(MAX_PLAYERS_PER_SESSION, 10);

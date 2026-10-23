@@ -370,6 +370,20 @@ impl SceneStation {
     }
 }
 
+/// Точка спавна мутантов на локации (PvE).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SceneMutantSpawn {
+    pub position: Vec3,
+    #[serde(default)]
+    pub kind: u8, // 0 = Слепой пёс
+}
+
+impl SceneMutantSpawn {
+    pub fn new(position: Vec3, kind: u8) -> Self {
+        Self { position, kind }
+    }
+}
+
 /// Запись реестра локаций: название для UI и файл сцены без расширения
 /// (`levels/<scene>.scene.ron`).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -796,6 +810,9 @@ pub struct Scene {
     /// Станции базы (M5-2): торговец, верстак, медпункт, сейф.
     #[serde(default)]
     pub stations: Vec<SceneStation>,
+    /// Точки спавна мутантов на локации (PvE).
+    #[serde(default)]
+    pub mutant_spawns: Vec<SceneMutantSpawn>,
     /// Атмосфера локации (M4g): солнце, ambient, туман, небо.
     #[serde(default)]
     pub environment: SceneEnvironment,
@@ -814,6 +831,7 @@ impl Scene {
             bubble_arrivals: Vec::new(),
             extractions: Vec::new(),
             stations: Vec::new(),
+            mutant_spawns: Vec::new(),
             environment: SceneEnvironment::default(),
         }
     }
@@ -856,6 +874,11 @@ impl Scene {
 
     pub fn add_station(&mut self, station: SceneStation) -> &mut Self {
         self.stations.push(station);
+        self
+    }
+
+    pub fn add_mutant_spawn(&mut self, spawn: SceneMutantSpawn) -> &mut Self {
+        self.mutant_spawns.push(spawn);
         self
     }
 
@@ -1551,6 +1574,10 @@ impl Scene {
                 .with_label("Аварийная эвакуация"),
         );
 
+        // Стая слепых псов у восточных холмов (в секторе перехода в Подземку):
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(16.0, 0.0, -12.0), 0));
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(20.0, 0.0, -10.0), 0));
+
         scene
     }
 
@@ -1736,6 +1763,11 @@ impl Scene {
             SceneExtraction::new(Vec3::new(-30.0, 0.0, -38.0), 3.0, 0.75)
                 .with_label("Аварийная эвакуация"),
         );
+
+        // Стая слепых псов среди ржавых завалов:
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(-15.0, 0.0, 16.0), 0));
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(10.0, 0.0, -20.0), 0));
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(20.0, 0.0, 18.0), 0));
 
         scene
     }
@@ -2128,6 +2160,9 @@ impl Scene {
             .with_yaw(0.0)
             .with_label("База"),
         );
+
+        // Испытательный загон для мутантов (отработка боя и хитмаркеров):
+        scene.add_mutant_spawn(SceneMutantSpawn::new(Vec3::new(20.0, 0.0, -20.0), 0));
 
         scene
     }

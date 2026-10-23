@@ -515,6 +515,7 @@
         ),
     ],
     stations: [],
+    mutant_spawns: [],
     environment: (
         sun_direction: (0.0, 1.0, 0.0),
         sun_color: (0.7, 0.78, 0.95),

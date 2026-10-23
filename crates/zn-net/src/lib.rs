@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 /// локации (переходы/пузыри), склад базы; v7 — экстракция (M4d-2): профиль
 /// игрока в Hello, событие эвакуации; v8 — выживание (M4d-3b): нокдаун и
 /// выброс (события в снапшоте); v9 — аккаунты (M5): дайджест пароля в Hello
-/// вместо профиля, отказ `AuthFailed`, признак создания аккаунта в Welcome.
+/// вместо профиля, отказ `AuthFailed`, признак создания аккаунта в Welcome;
+/// v10 — боевой отклик (Combat Feel: Hit с хитмаркером) и PvE-мутанты (MutantNet).
 /// Несовпадение версий отвергается.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 pub const SIMULATION_HZ: u32 = 60;
 pub const SNAPSHOT_HZ: u32 = 30;
 pub const MAX_PLAYERS_PER_SESSION: usize = 10;
@@ -182,6 +183,17 @@ pub struct CorpseNet {
     pub yaw: u8,
 }
 
+/// Сетевое состояние мутанта в снапшоте мира (M4h, PvE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutantNet {
+    pub id: u32,
+    pub kind: u8,
+    pub pos: [i16; 3],
+    pub yaw: u8,
+    pub health: u8,
+    pub state: u8, // 0 = Idle, 1 = Chase, 2 = Attack, 3 = Dead
+}
+
 /// Квант позиции предметов и трупов: 0.1 м в `i16` (диапазон ±3276 м).
 pub const POS_QUANTUM: f32 = 0.1;
 /// Квант поворота трупов: 2π/256 (полный диапазон одного байта).
@@ -219,6 +231,13 @@ pub enum GameEvent {
         shooter: u64,
         origin: [f32; 3],
         dir: [f32; 3],
+    },
+    /// Подтверждение попадания (Combat Feel): стрелок видит хитмаркер и слышит щелчок.
+    Hit {
+        shooter: u64,
+        victim: u64,
+        damage: u16,
+        headshot: bool,
     },
     /// Смерть игрока (имена заполняет серверная сессия).
     Death {
@@ -355,7 +374,9 @@ pub enum Message {
         /// Активные пузыри локации игрока (M4d): якоря на полу, квантованы
         /// `POS_QUANTUM`. Набор меняется при использовании и респавне.
         bubbles: Vec<[i16; 3]>,
-        /// События с прошлого снапшота (выстрелы, смерти, лечение) — всем клиентам.
+        /// Мутанты на локации игрока (PvE).
+        mutants: Vec<MutantNet>,
+        /// События с прошлого снапшота (выстрелы, попадания, смерти, лечение) — всем клиентам.
         events: Vec<GameEvent>,
     },
     Pong {

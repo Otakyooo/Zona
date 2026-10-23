@@ -63,6 +63,14 @@
             color: (0.35, 0.6, 0.3),
         ),
         (
+            key: "dog_tail",
+            display_name: "Хвост слепого пса",
+            value_rub: 250,
+            weight_kg: 0.25,
+            stack_max: 5,
+            color: (0.65, 0.50, 0.35),
+        ),
+        (
             key: "medkit",
             display_name: "Аптечка",
             value_rub: 250,

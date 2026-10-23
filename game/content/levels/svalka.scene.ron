@@ -728,6 +728,20 @@
         ),
     ],
     stations: [],
+    mutant_spawns: [
+        (
+            position: (-15.0, 0.0, 16.0),
+            kind: 0,
+        ),
+        (
+            position: (10.0, 0.0, -20.0),
+            kind: 0,
+        ),
+        (
+            position: (20.0, 0.0, 18.0),
+            kind: 0,
+        ),
+    ],
     environment: (
         sun_direction: (-0.25, 0.62, 0.5),
         sun_color: (1.0, 0.88, 0.68),

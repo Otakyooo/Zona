@@ -16,8 +16,8 @@ use zn_core::{FixedStep, SIMULATION_HZ};
 use zn_input::InputState;
 use zn_net::{
     dequantize_pos, dequantize_yaw, AuthHello, BaseActionKind, BoltNet, CorpseNet, GameEvent,
-    GroundItemNet, InventoryAction, ItemStackNet, PlayerNetState, RejectReason, StashAction,
-    CLIENT_TIMEOUT, INPUT_REDUNDANCY,
+    GroundItemNet, InventoryAction, ItemStackNet, MutantNet, PlayerNetState, RejectReason,
+    StashAction, CLIENT_TIMEOUT, INPUT_REDUNDANCY,
 };
 use zn_physics::{PLAYER_EYE_HEIGHT, PLAYER_HALF_HEIGHT, PLAYER_RADIUS};
 use zn_render::{
@@ -107,6 +107,14 @@ const ANOMALY_HDR_GAIN: f32 = 3.2;
 const BOLT_THICKNESS: f32 = 0.05;
 const BOLT_LENGTH: f32 = 0.34;
 const BOLT_COLOR: Vec4 = Vec4::new(0.85, 0.86, 0.8, 1.0);
+
+/// Боевой отклик (Combat Feel): подтверждение попадания и вспышка ранения.
+const HITMARKER_TTL: Duration = Duration::from_millis(150);
+const DAMAGE_FLASH_TTL: Duration = Duration::from_millis(250);
+/// Мутанты уровня: габариты и цвета (PvE).
+const MUTANT_MODEL_SIZE: Vec3 = Vec3::new(0.45, 0.5, 0.8);
+const MUTANT_COLOR: Vec4 = Vec4::new(0.35, 0.25, 0.20, 1.0);
+const MUTANT_DEAD_COLOR: Vec4 = Vec4::new(0.25, 0.15, 0.12, 1.0);
 
 /// Мир локаций (M4d): вспышка при смене локации и вид активных пузырей.
 const TP_FLASH_TTL: Duration = Duration::from_millis(260);
@@ -438,6 +446,10 @@ struct HudData {
     knockdown: Option<f32>,
     /// Выброс (M4d-3b): (активен, секунд до конца фазы).
     blowout: Option<(bool, f32)>,
+    /// Подтверждение попадания: Some(headshot).
+    hitmarker: Option<bool>,
+    /// Вспышка урона / ранения (доля оставшегося времени).
+    damage_flash: Option<f32>,
 }
 
 pub struct ClientApp {
@@ -509,6 +521,8 @@ pub struct ClientApp {
     world_loot: Vec<GroundItemNet>,
     /// Трупы: снапшоты сервера (offline — локальная симуляция).
     world_corpses: Vec<CorpseNet>,
+    /// Мутанты на локации: снапшоты сервера (offline — локальная симуляция).
+    world_mutants: Vec<MutantNet>,
     /// Болты в полёте: снапшоты сервера (offline — локальная симуляция);
     /// позиции интерполируются между кадрами.
     world_bolts: Vec<BoltView>,
@@ -518,6 +532,14 @@ pub struct ClientApp {
     anomaly_flashes: Vec<AnomalyFlash>,
     /// Полупрозрачный материал аномалий (blend); появляется с renderer.
     anomaly_material: Option<MaterialId>,
+    /// Хитмаркер: до какого Instant светится.
+    hitmarker_until: Option<Instant>,
+    /// Хитмаркер: попадание в голову / критический урон (красный цвет).
+    hitmarker_headshot: bool,
+    /// Вспышка урона по локальному игроку: до какого Instant.
+    damage_flash_until: Option<Instant>,
+    /// Накопленная дистанция шагов для звуков ходьбы.
+    step_distance_accum: f32,
     /// Уведомление о своей экстракции (M4d-2): панель результата.
     extraction_flash: Option<ExtractionNotice>,
     /// Уведомление аккаунта/отказа (M5-1): текст и до какого мгновения живо.
@@ -747,10 +769,15 @@ impl ClientApp {
             catalog,
             world_loot: Vec::new(),
             world_corpses: Vec::new(),
+            world_mutants: Vec::new(),
             world_bolts: Vec::new(),
             revealed: HashMap::new(),
             anomaly_flashes: Vec::new(),
             anomaly_material: None,
+            hitmarker_until: None,
+            hitmarker_headshot: false,
+            damage_flash_until: None,
+            step_distance_accum: 0.0,
             extraction_flash: None,
             notice: None,
             knockdown_until: None,
@@ -906,6 +933,7 @@ impl ClientApp {
         self.remote.clear();
         self.world_loot.clear();
         self.world_corpses.clear();
+        self.world_mutants.clear();
         self.world_bolts.clear();
         self.world_bubbles.clear();
         self.revealed.clear();
@@ -1222,6 +1250,29 @@ impl ClientApp {
                 },
             );
         }
+        // Мутанты (PvE): слепые псы
+        for mutant in &self.world_mutants {
+            let [x, y, z] = dequantize_pos(mutant.pos);
+            let yaw = dequantize_yaw(mutant.yaw);
+            let (scale, color) = if mutant.state == 3 {
+                (Vec3::new(0.6, 0.2, 0.4), MUTANT_DEAD_COLOR)
+            } else {
+                (MUTANT_MODEL_SIZE, MUTANT_COLOR)
+            };
+            let model = Mat4::from_scale_rotation_translation(
+                scale,
+                Quat::from_rotation_y(yaw),
+                Vec3::new(x, y + scale.y * 0.5, z),
+            );
+            list.push(
+                cube,
+                material,
+                InstanceRaw {
+                    model: model.to_cols_array(),
+                    color: color.into(),
+                },
+            );
+        }
 
         // Эффекты: трейсеры, вспышки выстрелов, аномалии и болты — живут доли
         // секунд (кроме подсветки аномалий); просроченные отбрасываются.
@@ -1531,11 +1582,28 @@ impl ClientApp {
                         self.knockdown_until = None;
                         self.audio.play(SoundId::Heal);
                     }
+                    GameEvent::Hit {
+                        shooter,
+                        victim,
+                        damage: _,
+                        headshot,
+                    } => {
+                        if *shooter == self.player_id {
+                            self.hitmarker_until = Some(now + HITMARKER_TTL);
+                            self.hitmarker_headshot = *headshot;
+                            self.audio.play(SoundId::HitConfirm);
+                        }
+                        if *victim == self.player_id {
+                            self.damage_flash_until = Some(now + DAMAGE_FLASH_TTL);
+                            self.audio.play(SoundId::Hit);
+                        }
+                    }
                     _ => {}
                 }
             }
             self.world_loot = self.simulation.snapshot_loot();
             self.world_corpses = self.simulation.snapshot_corpses();
+            self.world_mutants = self.simulation.snapshot_mutants();
             self.world_bolts = self
                 .simulation
                 .snapshot_bolts()
@@ -1557,7 +1625,47 @@ impl ClientApp {
             // Online: локальные апдейты предсказания не нужны — истина в сети.
             let _ = self.simulation.take_net_updates();
         }
+        // Шаги (Combat Feel): звук шагов по поверхности при передвижении
+        if let Some(state) = self.simulation.player_state(self.player_id) {
+            let h_vel = glam::Vec2::new(state.velocity.x, state.velocity.z);
+            let speed = h_vel.length();
+            if state.grounded && speed > 0.5 {
+                let dt = frame_delta.as_secs_f32();
+                self.step_distance_accum += speed * dt;
+                let stride = if state.sprinting { 2.2 } else { 1.5 };
+                if self.step_distance_accum >= stride {
+                    self.step_distance_accum = 0.0;
+                    let sound = self.detect_step_sound(state.position);
+                    self.audio.play(sound);
+                }
+            } else {
+                self.step_distance_accum = 0.0;
+            }
+        }
         self.update_interact_hint();
+    }
+
+    /// Определение звука шага по типу поверхности под ногами.
+    fn detect_step_sound(&self, pos: Vec3) -> SoundId {
+        match self.location {
+            LOCATION_BASE => SoundId::StepAsphalt,
+            zn_scene::LOCATION_KORDON => {
+                if pos.x.abs() <= 3.5 {
+                    SoundId::StepAsphalt
+                } else {
+                    SoundId::StepDirt
+                }
+            }
+            zn_scene::LOCATION_SVALKA => {
+                if pos.x.abs() > 15.0 || pos.z.abs() > 15.0 {
+                    SoundId::StepMetal
+                } else {
+                    SoundId::StepDirt
+                }
+            }
+            zn_scene::LOCATION_PODZEMKA => SoundId::StepConcrete,
+            _ => SoundId::StepConcrete,
+        }
     }
 
     /// Сильнейший эффект ношения в инвентаре (M4d-3a) — строка для HUD.
@@ -1797,6 +1905,23 @@ impl ClientApp {
                     } else {
                         None
                     };
+                }
+                // Подтверждение попадания (Combat Feel): щелчок и хитмаркер
+                GameEvent::Hit {
+                    shooter,
+                    victim,
+                    damage: _,
+                    headshot,
+                } => {
+                    if Some(*shooter) == self.net_player_id {
+                        self.hitmarker_until = Some(now + HITMARKER_TTL);
+                        self.hitmarker_headshot = *headshot;
+                        self.audio.play(SoundId::HitConfirm);
+                    }
+                    if Some(*victim) == self.net_player_id {
+                        self.damage_flash_until = Some(now + DAMAGE_FLASH_TTL);
+                        self.audio.play(SoundId::Hit);
+                    }
                 }
             }
         }
@@ -2396,12 +2521,14 @@ impl ClientApp {
                     corpses,
                     bolts,
                     bubbles,
+                    mutants,
                     events,
                 } => {
-                    // Мировые списки лута/трупов — прямое замещение снапшотом,
+                    // Мировые списки лута/трупов/мутантов — прямое замещение снапшотом,
                     // болты — с позициями прошлого кадра (для интерполяции).
                     self.world_loot = loot;
                     self.world_corpses = corpses;
+                    self.world_mutants = mutants;
                     self.apply_snapshot_bolts(&bolts, server_tick);
                     self.apply_snapshot_bubbles(&bubbles);
                     self.apply_snapshot(server_tick, acked_input_tick, &players, &events, now);
@@ -2479,6 +2606,7 @@ impl ClientApp {
         // Сетевая истина лута теряется — offline продолжится с локальной.
         self.world_loot.clear();
         self.world_corpses.clear();
+        self.world_mutants.clear();
         self.world_bolts.clear();
         self.world_bubbles.clear();
         self.revealed.clear();
@@ -2843,6 +2971,24 @@ impl ClientApp {
         }
         let blowout = self.blowout;
 
+        let hitmarker = if self
+            .hitmarker_until
+            .as_ref()
+            .is_some_and(|until| *until > now)
+        {
+            Some(self.hitmarker_headshot)
+        } else {
+            None
+        };
+        let damage_flash = self.damage_flash_until.as_ref().and_then(|until| {
+            if *until > now {
+                let left = until.saturating_duration_since(now).as_secs_f32();
+                Some((left / DAMAGE_FLASH_TTL.as_secs_f32()).clamp(0.0, 1.0))
+            } else {
+                None
+            }
+        });
+
         HudData {
             health,
             max_health: MAX_HEALTH,
@@ -2864,6 +3010,8 @@ impl ClientApp {
             carry,
             knockdown,
             blowout,
+            hitmarker,
+            damage_flash,
             time: self.started.elapsed().as_secs_f64(),
             hint,
             inventory,
@@ -3155,6 +3303,21 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
     ));
     let screen = ctx.viewport_rect();
 
+    // Кровавая виньетка / вспышка урона (Combat Feel):
+    let vignette_alpha = if hud.health > 0 && hud.health < 30 {
+        let pulse = (hud.time * 4.0).sin().abs() as f32;
+        let base = (30 - hud.health) as f32 / 30.0;
+        ((base * 0.35 + pulse * 0.25) * 255.0) as u8
+    } else if let Some(flash) = hud.damage_flash {
+        (flash * 150.0) as u8
+    } else {
+        0
+    };
+    if vignette_alpha > 0 {
+        let red = egui::Color32::from_rgba_unmultiplied(220, 20, 20, vignette_alpha);
+        painter.rect_stroke(screen, 0.0, (10.0, red), egui::StrokeKind::Inside);
+    }
+
     // Прицел — только живому.
     if hud.health > 0 {
         let center = screen.center();
@@ -3179,6 +3342,37 @@ fn draw_hud(ctx: &egui::Context, hud: &HudData) {
             ),
         ] {
             painter.line_segment([from, to], stroke);
+        }
+
+        // Хитмаркер (Combat Feel): подтверждение попадания — белый/красный диагональный крестик
+        if let Some(headshot) = hud.hitmarker {
+            let color = if headshot {
+                egui::Color32::from_rgb(255, 60, 60)
+            } else {
+                egui::Color32::from_white_alpha(240)
+            };
+            let hm_stroke = (2.0, color);
+            let (hm_gap, hm_len) = (5.0, 6.0);
+            for (from, to) in [
+                (
+                    center + egui::vec2(-hm_gap, -hm_gap),
+                    center + egui::vec2(-(hm_gap + hm_len), -(hm_gap + hm_len)),
+                ),
+                (
+                    center + egui::vec2(hm_gap, -hm_gap),
+                    center + egui::vec2(hm_gap + hm_len, -(hm_gap + hm_len)),
+                ),
+                (
+                    center + egui::vec2(-hm_gap, hm_gap),
+                    center + egui::vec2(-(hm_gap + hm_len), hm_gap + hm_len),
+                ),
+                (
+                    center + egui::vec2(hm_gap, hm_gap),
+                    center + egui::vec2(hm_gap + hm_len, hm_gap + hm_len),
+                ),
+            ] {
+                painter.line_segment([from, to], hm_stroke);
+            }
         }
 
         // Подсказка взаимодействия — под прицелом.
@@ -5490,5 +5684,59 @@ mod tests {
             app.collect_hud_data().wallet_rub.is_none(),
             "вне базы кошелёк не показываем"
         );
+    }
+
+    // ── Боевой отклик и мутанты ──────────────────────────────────────────
+
+    #[test]
+    fn hit_event_triggers_hitmarker_and_damage_flash() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        app.net_player_id = Some(7);
+        let now = Instant::now();
+
+        // Свой выстрел попал во врага (headshot)
+        app.handle_combat_events(
+            &[GameEvent::Hit {
+                shooter: 7,
+                victim: 8,
+                damage: 50,
+                headshot: true,
+            }],
+            now,
+        );
+        let hud = app.collect_hud_data();
+        assert_eq!(hud.hitmarker, Some(true), "красный хитмаркер в голову");
+
+        // Враг попал в локального игрока
+        app.handle_combat_events(
+            &[GameEvent::Hit {
+                shooter: 8,
+                victim: 7,
+                damage: 25,
+                headshot: false,
+            }],
+            now,
+        );
+        let hud = app.collect_hud_data();
+        assert!(hud.damage_flash.is_some(), "вспышка урона видна в HUD");
+    }
+
+    #[test]
+    fn mutants_in_snapshot_populate_world_mutants() {
+        let content = concat!(env!("CARGO_MANIFEST_DIR"), "/../../game/content");
+        let mut app = ClientApp::with_content(content, "demo_zone");
+        let mutant = zn_net::MutantNet {
+            id: 1,
+            kind: 0,
+            pos: [100, 0, 200],
+            yaw: 64,
+            health: 60,
+            state: 1,
+        };
+        app.world_mutants = vec![mutant];
+        assert_eq!(app.world_mutants.len(), 1);
+        assert_eq!(app.world_mutants[0].health, 60);
+        assert_eq!(app.world_mutants[0].state, 1);
     }
 }
