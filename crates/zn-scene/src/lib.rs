@@ -12,6 +12,8 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Ключ ассета по умолчанию: встроенный процедурный куб.
 pub const BUILTIN_CUBE: &str = "builtin://cube";
+/// Встроенная процедурная сфера (маркеры, лампы, аномалии).
+pub const BUILTIN_SPHERE: &str = "builtin://sphere";
 
 /// Встроенные текстуры поверхностей (M4g): ключи совпадают с zn-assets.
 pub const TEXTURE_CONCRETE: &str = "builtin://concrete";
@@ -593,6 +595,18 @@ fn crate_object(x: f32, z: f32, loot: &[(&str, u32)]) -> SceneObject {
 /// Плоская плита-маркер (переход/зона): лежит на полу, не мешает движению.
 fn pad(x: f32, z: f32, size: f32, color: Vec4) -> SceneObject {
     SceneObject::new(Vec3::new(x, 0.06, z), Vec3::new(size, 0.12, size), color).invulnerable()
+}
+
+/// Светящаяся лампа-маркер: небольшая сфера с emissive без коллизии.
+pub fn lamp_object(position: Vec3, color: Vec3, intensity: f32) -> SceneObject {
+    SceneObject::new(
+        position,
+        Vec3::splat(0.25),
+        Vec4::new(color.x, color.y, color.z, 1.0),
+    )
+    .with_asset(BUILTIN_SPHERE)
+    .with_emissive(color * intensity)
+    .invulnerable()
 }
 
 impl SceneObject {

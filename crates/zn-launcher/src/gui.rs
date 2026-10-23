@@ -279,13 +279,27 @@ impl LauncherApp {
             return;
         };
         let client = run::resolve_client_exe(&exe, true);
+        if !guest {
+            self.save_config();
+        }
+        let server = server_choice(
+            &self.server_field,
+            self.manifest
+                .as_ref()
+                .and_then(|m| m.server_addr.as_deref())
+                .or(Some("127.0.0.1:7700")),
+        );
+        if let Some(warning) = run::server_warning(&server) {
+            self.error = Some(warning);
+        } else {
+            self.error = None;
+        }
         let credentials = if guest {
             run::Credentials::default()
         } else {
             self.credentials()
         };
-        match run::client_command(&client, &content, &ServerChoice::default(), &credentials).spawn()
-        {
+        match run::client_command(&client, &content, &server, &credentials).spawn() {
             Ok(_) => {
                 self.status = if guest {
                     "dev-клиент запущен (гость)".to_string()
@@ -576,6 +590,8 @@ impl LauncherApp {
                 .and_then(|m| m.server_addr.as_deref())
             {
                 ui.small(format!("Сервер из манифеста: {addr}"));
+            } else if self.dev_mode {
+                ui.small("Dev-режим: сервер 127.0.0.1:7700");
             }
 
             // Аккаунт (M5-1): логин + пароль. Без пароля клиент — гость:

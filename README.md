@@ -48,9 +48,10 @@
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo run -p zn-client                            # offline: demo_zone
+cargo run -p zn-client                            # онлайн по умолчанию: локальный сервер (мир локаций)
+cargo run -p zn-client -- --offline              # offline: demo_zone
 cargo run -p zn-client -- --level kordon          # offline: одиночная сцена
-cargo run -p zn-client -- --server 127.0.0.1:7700 # мир локаций (M4d)
+cargo run -p zn-client -- --server 127.0.0.1:7700 # явный адрес сервера (мир локаций)
 cargo run -p zn-server -- --port 7700 --max-players 10   # мир локаций
 cargo run -p zn-server -- --level demo_zone               # одиночная сцена
 cargo run -p zn-server -- --sim-latency-ms 120 --sim-loss-pct 10
@@ -153,16 +154,18 @@ Zstd-суперкомпрессией) — транскод в RGBA8 на CPU ч
 
 ## Сеть (M3–M4d)
 
-Dedicated-сервер и клиент общаются по UDP (bincode, протокол v8; одна датаграмма —
+Dedicated-сервер и клиент общаются по UDP (bincode, протокол v9; одна датаграмма —
 одно сообщение; бюджет 1400 Б, фрагментация не реализована). Один процесс
 сервера — один матч, до 10 игроков. С M4d сервер без `--level` ведёт мир
 локаций (одна симуляция на локацию), с `--level <имя>` — одиночную сцену.
 
-- **Клиент**: `--server host:port`. Handshake `ClientHello` (версия протокола +
-  `content_hash` уровня + `items_hash` каталога + имя) с повтором каждые 500 мс;
-  `ServerReject` (версия/контент/нет слотов) → offline. Дальше — `InputPacket`
-  (последние 4 инпута: потеря датаграммы не превращается в потерю движения),
-  `Ping` раз в секунду (RTT — в заголовке окна), `ClientBye` при выходе.
+- **Клиент**: по умолчанию подключается к 127.0.0.1:7700 (или `ZN_SERVER_ADDR`);
+  `--offline` — запуск без сети; `--server host:port` — явный адрес. При отсутствии
+  ответа на Hello за 10 с клиент переходит в offline. Handshake `ClientHello`
+  (версия протокола + `content_hash` уровня + `items_hash` каталога + имя) с повтором
+  каждые 500 мс; `ServerReject` (версия/контент/нет слотов) → offline. Дальше —
+  `InputPacket` (последние 4 инпута: потеря датаграммы не превращается в потерю
+  движения), `Ping` раз в секунду (RTT — в заголовке окна), `ClientBye` при выходе.
 - **Симуляция** 60 Гц — общая кинематика `zn-sim` у клиента и сервера; снапшоты
   30 Гц с персональным `acked_input_tick`. Клиент предсказывает движение локально
   и сверяет со снапшотом: reconcile = восстановление состояния → реплей

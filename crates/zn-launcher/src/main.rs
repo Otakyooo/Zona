@@ -275,14 +275,13 @@ fn launch_dev(launcher_exe: &Path, keep_console: bool) -> Result<()> {
             client.display()
         )));
     }
-    let status = run::client_command(
-        &client,
-        &content,
-        &ServerChoice::default(),
-        &run::Credentials::default(),
-    )
-    .status()
-    .map_err(|e| Error::Install(format!("не удалось запустить dev-клиента: {e}")))?;
+    let server = ServerChoice {
+        manual: None,
+        manifest: Some("127.0.0.1:7700"),
+    };
+    let status = run::client_command(&client, &content, &server, &run::Credentials::default())
+        .status()
+        .map_err(|e| Error::Install(format!("не удалось запустить dev-клиента: {e}")))?;
     if !status.success() {
         eprintln!("dev-клиент завершился с кодом {:?}", status.code());
     }

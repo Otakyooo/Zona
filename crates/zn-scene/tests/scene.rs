@@ -2,10 +2,11 @@
 mod tests {
     use glam::Vec3;
     use zn_scene::{
-        distances_to_base, world_content_hash, AnomalyKind, ColliderShape, LocationRegistry,
-        LootEntry, Scene, SceneAnomaly, SceneBubble, SceneEnvironment, SceneExtraction,
-        SceneObject, SceneOffer, SceneStation, SceneTransition, StationKind, BUILTIN_CUBE,
-        LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA, LOCATION_SVALKA,
+        distances_to_base, lamp_object, world_content_hash, AnomalyKind, ColliderShape,
+        LocationRegistry, LootEntry, Scene, SceneAnomaly, SceneBubble, SceneEnvironment,
+        SceneExtraction, SceneObject, SceneOffer, SceneStation, SceneTransition, StationKind,
+        BUILTIN_CUBE, BUILTIN_SPHERE, LOCATION_BASE, LOCATION_KORDON, LOCATION_PODZEMKA,
+        LOCATION_SVALKA,
     };
 
     #[test]
@@ -261,6 +262,19 @@ mod tests {
 
         let default_box = SceneObject::new(Vec3::ZERO, Vec3::ONE, glam::Vec4::ONE);
         assert_eq!(default_box.effective_collider(), Some(ColliderShape::Box));
+    }
+
+    #[test]
+    fn lamp_object_creates_emissive_sphere_marker() {
+        let pos = Vec3::new(1.0, 2.5, 3.0);
+        let color = Vec3::new(1.0, 0.8, 0.5);
+        let lamp = lamp_object(pos, color, 2.0);
+        assert_eq!(lamp.position, pos);
+        assert_eq!(lamp.scale, Vec3::splat(0.25));
+        assert_eq!(lamp.asset.as_deref(), Some(BUILTIN_SPHERE));
+        assert_eq!(lamp.emissive, Some(color * 2.0));
+        assert!(!lamp.solid, "лампа-маркер не должна иметь коллизии");
+        assert_eq!(lamp.effective_collider(), None);
     }
 
     #[test]

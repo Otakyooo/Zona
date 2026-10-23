@@ -5,7 +5,7 @@
 
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use zn_net::{
     decode_message, encode_message, AuthHello, BaseActionKind, BoltNet, ClientInput, CorpseNet,
@@ -13,6 +13,10 @@ use zn_net::{
     StashAction, CLIENT_TIMEOUT, HELLO_RESEND_INTERVAL, INPUT_REDUNDANCY, PING_INTERVAL,
     PROTOCOL_VERSION,
 };
+
+/// Сколько ждать ответа на Hello: сервер выключен или туннель лёг — без
+/// этого клиент вечно висел бы в «подключение…» вместо offline.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// События для приложения, извлечённые из входящих пакетов.
 #[derive(Clone, Debug, PartialEq)]
@@ -96,6 +100,8 @@ pub struct NetClient {
     auth: Option<AuthHello>,
     status: NetStatus,
     last_hello: Option<Instant>,
+    /// Момент первого Hello — отсчёт `CONNECT_TIMEOUT`.
+    first_hello: Option<Instant>,
     last_ping: Option<Instant>,
     last_snapshot: Option<Instant>,
     pending_ping: Option<(u32, Instant)>,
@@ -131,6 +137,7 @@ impl NetClient {
             auth,
             status: NetStatus::Connecting,
             last_hello: None,
+            first_hello: None,
             last_ping: None,
             last_snapshot: None,
             pending_ping: None,
@@ -154,12 +161,18 @@ impl NetClient {
         self.rtt_ms
     }
 
-    /// Снапшотов не было дольше `CLIENT_TIMEOUT` — связь потеряна.
+    /// Снапшотов не было дольше `CLIENT_TIMEOUT` — связь потеряна; либо
+    /// сервер так и не ответил на Hello за `CONNECT_TIMEOUT`.
     pub fn timed_out(&self, now: Instant) -> bool {
-        self.status == NetStatus::Connected
-            && self
+        match self.status {
+            NetStatus::Connected => self
                 .last_snapshot
-                .is_some_and(|last| now.duration_since(last) > CLIENT_TIMEOUT)
+                .is_some_and(|last| now.duration_since(last) > CLIENT_TIMEOUT),
+            NetStatus::Connecting => self
+                .first_hello
+                .is_some_and(|first| now.duration_since(first) > CONNECT_TIMEOUT),
+            NetStatus::Rejected(_) => false,
+        }
     }
 
     /// Прощается с сервером (best-effort при выходе из игры).
@@ -266,6 +279,7 @@ impl NetClient {
                     .is_none_or(|last| now.duration_since(last) >= HELLO_RESEND_INTERVAL);
                 if due {
                     self.last_hello = Some(now);
+                    self.first_hello.get_or_insert(now);
                     let hello = Message::ClientHello {
                         protocol_version: PROTOCOL_VERSION,
                         content_hash: self.content_hash,
@@ -487,8 +501,6 @@ impl NetClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
     /// Сокет «сервера»: тесты играют за обе стороны в одном потоке.
     fn loopback_server() -> UdpSocket {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -801,6 +813,31 @@ mod tests {
         assert!(client.poll(pong_at).is_empty());
         let rtt = client.rtt_ms().expect("RTT должен быть измерен");
         assert!((rtt - 40.0).abs() < 0.5, "rtt = {rtt}");
+    }
+
+    #[test]
+    fn connect_times_out_when_server_never_answers() {
+        let server = loopback_server();
+        let mut client = NetClient::connect(
+            &server.local_addr().unwrap().to_string(),
+            0xAB,
+            0xCD,
+            "Тест",
+            None,
+        )
+        .unwrap();
+        let start = Instant::now();
+        assert!(!client.timed_out(start), "до первого Hello отсчёта нет");
+        client.poll(start);
+        assert_eq!(client.status(), NetStatus::Connecting);
+        let almost = start + CONNECT_TIMEOUT - Duration::from_millis(100);
+        assert!(!client.timed_out(almost), "сервер ещё может ответить");
+        // Повторные Hello не сдвигают отсчёт.
+        client.poll(start + Duration::from_secs(5));
+        assert!(
+            client.timed_out(start + CONNECT_TIMEOUT + Duration::from_secs(1)),
+            "нет ответа на Hello дольше CONNECT_TIMEOUT — offline"
+        );
     }
 
     #[test]

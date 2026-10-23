@@ -58,6 +58,9 @@ pub fn client_command(
     command.arg("--content-root").arg(content_dir);
     if let Some(addr) = server.resolve() {
         command.arg("--server").arg(addr);
+    } else {
+        // Клиент без флагов идёт на локальный сервер — offline задаём явно.
+        command.arg("--offline");
     }
     let account = credentials
         .account
@@ -281,7 +284,8 @@ mod tests {
             args,
             vec![
                 "--content-root".to_string(),
-                "/opt/zona/game/content".to_string()
+                "/opt/zona/game/content".to_string(),
+                "--offline".to_string()
             ]
         );
         assert!(!args.iter().any(|arg| arg == "--server"));

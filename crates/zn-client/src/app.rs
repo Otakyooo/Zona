@@ -2438,11 +2438,18 @@ impl ClientApp {
             }
         }
 
-        if self.net.as_ref().is_some_and(|net| net.timed_out(now)) {
-            log::warn!(
-                "сервер молчит дольше {} с — переход в offline",
-                CLIENT_TIMEOUT.as_secs()
-            );
+        if let Some(net) = self.net.as_ref().filter(|net| net.timed_out(now)) {
+            if net.status() == NetStatus::Connecting {
+                log::warn!(
+                    "сервер не ответил за {} с — переход в offline",
+                    crate::net::CONNECT_TIMEOUT.as_secs()
+                );
+            } else {
+                log::warn!(
+                    "сервер молчит дольше {} с — переход в offline",
+                    CLIENT_TIMEOUT.as_secs()
+                );
+            }
             self.connection_lost = true;
             self.drop_connection();
         }
